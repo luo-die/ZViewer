@@ -336,19 +336,34 @@ export function clearAuthCookies(req: Request, res: Response): void {
   res.clearCookie('refresh_token', { path: '/', sameSite, secure });
 }
 
-/** 从 cookie、Authorization Header 或查询参数读取 access token。 */
-export function extractAccessToken(req: Request): string | undefined {
-  // 从查询参数读取（用于 hls.js 等无法设置 header 的场景）
-  const queryToken = req.query?.token;
-  if (typeof queryToken === 'string' && queryToken) return queryToken;
-  // 优先从 cookie 读取（前端 fetch credentials: 'include' 自动携带）
-  const cookieToken = req.cookies?.access_token;
-  if (typeof cookieToken === 'string' && cookieToken) return cookieToken;
+/**
+ * 收集请求中携带的全部候选 access token（去重，顺序：query → cookie → header）。
+ *
+ * 为什么要收集而不是只取第一个：媒体 URL（<video src>、hls.js 等无法设置
+ * 请求头的场景）会把 access token 拼进 query，而那个 token 在 URL 生成时就被
+ * 固定住了——1 小时后就过期。若只认 query token，即使浏览器带着有效的
+ * access_token cookie，请求也会 403（表现为「新加入的成员看不了视频」）。
+ * 因此这里逐个校验，任意一个有效即通过。
+ */
+export function collectAccessTokens(req: Request): string[] {
+  const out: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === 'string' && value && !out.includes(value)) {
+      out.push(value);
+    }
+  };
+  // 查询参数（hls.js / <video src> 场景）
+  push(req.query?.token);
+  // cookie（前端 fetch credentials: 'include' 自动携带）
+  push(req.cookies?.access_token);
   // 兼容旧 Authorization: Bearer <token> 头
-  const authHeader = req.headers.authorization;
-  const headerToken = authHeader?.split(' ')[1];
-  if (headerToken) return headerToken;
-  return undefined;
+  push(req.headers.authorization?.split(' ')[1]);
+  return out;
+}
+
+/** 从 cookie、Authorization Header 或查询参数读取 access token（取第一个）。 */
+export function extractAccessToken(req: Request): string | undefined {
+  return collectAccessTokens(req)[0];
 }
 
 export function authenticateToken(
@@ -356,36 +371,46 @@ export function authenticateToken(
   res: Response,
   next: NextFunction,
 ) {
-  const token = extractAccessToken(req);
+  const tokens = collectAccessTokens(req);
 
-  if (!token) {
+  if (tokens.length === 0) {
     res.status(401).json({ success: false, message: '未提供认证令牌' });
     return;
   }
 
-  try {
-    const payload = verifyAccessToken(token);
+  // 逐个尝试：URL 里过期 token + 浏览器有效 cookie 的组合也能通过
+  let payload: JwtPayload | null = null;
+  for (const token of tokens) {
+    try {
+      payload = verifyAccessToken(token);
+      break;
+    } catch {
+      /* 该来源的 token 无效/过期 → 试下一个 */
+    }
+  }
 
-    // Token 失效检查（V4/V5）：改密/管理操作会使此前签发的 token 全部失效。
-    // guest（userId=0）无 User 行，跳过。使用 60s TTL 缓存避免每请求查库。
-    if (payload.userId !== 0) {
-      const invalidBefore = getTokenInvalidBefore(payload.userId);
-      if (invalidBefore !== null) {
-        const iat = payload.iat;
-        if (typeof iat === 'number' && iat * 1000 < invalidBefore) {
-          res
-            .status(401)
-            .json({ success: false, message: '令牌已失效，请重新登录' });
-          return;
-        }
+  if (!payload) {
+    res.status(403).json({ success: false, message: '认证令牌无效或已过期' });
+    return;
+  }
+
+  // Token 失效检查（V4/V5）：改密/管理操作会使此前签发的 token 全部失效。
+  // guest（userId=0）无 User 行，跳过。使用 60s TTL 缓存避免每请求查库。
+  if (payload.userId !== 0) {
+    const invalidBefore = getTokenInvalidBefore(payload.userId);
+    if (invalidBefore !== null) {
+      const iat = payload.iat;
+      if (typeof iat === 'number' && iat * 1000 < invalidBefore) {
+        res
+          .status(401)
+          .json({ success: false, message: '令牌已失效，请重新登录' });
+        return;
       }
     }
-
-    req.user = payload;
-    next();
-  } catch (err) {
-    res.status(403).json({ success: false, message: '认证令牌无效或已过期' });
   }
+
+  req.user = payload;
+  next();
 }
 
 /** 仅允许 root 超级管理员访问的路由中间件。 */

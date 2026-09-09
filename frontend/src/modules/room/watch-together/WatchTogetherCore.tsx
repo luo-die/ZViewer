@@ -708,9 +708,11 @@ export function WatchTogetherCore({
   // 加载 B站 官方弹幕：缓存后通过 DanmakuLayer 时间轴弹幕接口加载
   useEffect(() => {
     const cid = watchTogether.cid
+    // 弹幕轨道接口仅 root/房主可写：观众端只从 danmaku-tracks-updated 同步，
+    // 不再尝试写入（否则每次切源都打一串 403「无权限」）
     if (!cid || watchTogether.sourceType !== 'bilibili') {
       danmakuItemsRef.current = []
-      setDefaultTrack([])
+      if (isHost) setDefaultTrack([])
       danmakuLayerRef.current?.loadDanmakuTrack('default', [])
       danmakuLayerRef.current?.clear()
       return
@@ -722,14 +724,14 @@ export function WatchTogetherCore({
     fetchBilibiliDanmakuByCid(cid)
       .then((items) => {
         danmakuItemsRef.current = items
-        setDefaultTrack(items)
+        if (isHost) setDefaultTrack(items)
         danmakuLayerRef.current?.loadDanmakuTrack('default', items, 0)
         danmakuLayerRef.current?.seek(videoRef.current?.currentTime ?? 0)
       })
       .catch((err) => {
         console.error('[WatchTogether] load danmaku error:', err)
       })
-  }, [watchTogether.cid, watchTogether.sourceType, setDefaultTrack, videoRef])
+  }, [watchTogether.cid, watchTogether.sourceType, setDefaultTrack, videoRef, isHost])
 
   // 弹幕开关重新开启时，重新加载当前时间轴弹幕并 seek 到当前时间
   useEffect(() => {

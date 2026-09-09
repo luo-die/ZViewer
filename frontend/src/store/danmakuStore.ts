@@ -343,6 +343,9 @@ export const useDanmakuStore = create<DanmakuState>()(
 
       removeTrack: async (trackId) => {
         const roomId = get().roomId
+        // 本地没有这条轨道时无需请求后端：观众端 setDefaultTrack([]) 清空时
+        // 本地往往本就没有 default 轨道，DELETE 只会换来一串 403「无权限」
+        if (!get().tracks.some((t) => t.trackId === trackId)) return
         set((state) => ({
           tracks: state.tracks.filter((t) => t.trackId !== trackId),
           // 删除整条轨道后同步触发刷新信号，让播放器立即清屏并按当前时间
@@ -359,7 +362,8 @@ export const useDanmakuStore = create<DanmakuState>()(
             success: boolean
             message?: string
           }>(res, { success: false })
-          if (!data.success) {
+          // 403 = 非房主（观众端属预期）：本地已移除即可，不打错误日志
+          if (!data.success && res.status !== 403) {
             console.error('[danmakuStore] remove track failed:', data.message)
           }
         } catch (err) {
