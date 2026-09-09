@@ -450,10 +450,42 @@ export function usePlayerSource(
             return
           }
           if (engine.type === 'playsvideo') {
-            // playsvideo 引擎失败（容器不支持 / 探测超时 / 媒体流不可达
-            // 等）：不再静默回退原生播放——回退原生会造成无声（DTS 等编
-            // 码）或再次解码失败的困惑体验，直接抛错由调用方提示，用户
-            // 可选择重载影片或关闭引擎改用原生。
+            // 兜底一：转码管线失败但容器本身浏览器原生可开（mkv/mp4/webm/mov）
+            // → 尝试原生直连。宁可「能看但可能缺音轨」也不留永久黑屏；
+            // 原生也失败时再抛原始错误。
+            if (
+              !source.forcePlaysVideo &&
+              source.format &&
+              isBrowserPlayableFormat(source.format)
+            ) {
+              try {
+                const directEngine = selectEngine({
+                  ...source,
+                  playsvideoEnabled: false,
+                  forcePlaysVideo: false,
+                  mkvFastPath: true,
+                })
+                if (directEngine.type === 'direct') {
+                  cleanup()
+                  resetVideoElement(video)
+                  appliedSourceUrlRef.current = source.url
+                  const directResult = await directEngine.attach(video, source)
+                  if (applyAttachResult(directResult)) {
+                    console.warn(
+                      '[usePlayerSource] 浏览器转码管线失败，已回退原生直连播放（音频可能不受支持）'
+                    )
+                    registerPlaybackErrorWatch(video, source, 'direct')
+                    return
+                  }
+                }
+              } catch (directErr) {
+                console.warn(
+                  '[usePlayerSource] 原生直连兜底同样失败:',
+                  directErr
+                )
+              }
+            }
+            // 兜底二：无可用回退 → 抛错由调用方提示
             throw new Error(
               `浏览器转码引擎（playsvideo）播放失败：${
                 err instanceof Error ? err.message : String(err)
