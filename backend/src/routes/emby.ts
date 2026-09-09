@@ -583,9 +583,12 @@ router.get('/stream', async (req: AuthenticatedRequest, res: Response): Promise<
     //   中转模式据此转发到 Emby 转码播放列表（main.m3u8），与前端 hls-engine 匹配；
     // - 不能依赖 movie.url 是否带 at=1：代理模式下 createMovie 会把 url 重写为
     //   /api/emby/stream?movieId=N，at=1 标记在重写时丢失。
+    // static=1：强制直推原始文件。浏览器端解容器取字幕（内嵌 ASS/SRT）需要原始
+    // 容器，而转码模式返回的是 HLS 播放列表——这条参数让字幕提取不受播放模式影响。
+    const forceStatic = req.query.static === '1';
     const audioTranscode =
-      req.query.at === '1' ||
-      (movie.format ?? '').toLowerCase() === 'hls';
+      !forceStatic &&
+      (req.query.at === '1' || (movie.format ?? '').toLowerCase() === 'hls');
     const upstreamUrl = audioTranscode
       ? `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/main.m3u8?api_key=${session.token}&AudioCodec=aac&TranscodingMaxAudioChannels=2&VideoBitrate=8000000&AudioBitrate=192000`
       : `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/stream?static=true&api_key=${session.token}`;

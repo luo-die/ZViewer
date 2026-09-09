@@ -455,9 +455,11 @@ router.get('/stream', async (req: AuthenticatedRequest, res: Response): Promise<
     const session = await resolveJellyfinSession(mount);
     const itemId = movie.path!;
     // 转码判定：与 emby.ts 一致，resolve 阶段检测到音轨编码不兼容时 format 持久化为 'hls'
+    // static=1：强制直推原始文件（浏览器端解容器取字幕用，与 emby.ts 一致）
+    const forceStatic = req.query.static === '1';
     const audioTranscode =
-      req.query.at === '1' ||
-      (movie.format ?? '').toLowerCase() === 'hls';
+      !forceStatic &&
+      (req.query.at === '1' || (movie.format ?? '').toLowerCase() === 'hls');
     const upstreamUrl = audioTranscode
       ? `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/main.m3u8?api_key=${session.token}&AudioCodec=aac&TranscodingMaxAudioChannels=2&VideoBitrate=8000000&AudioBitrate=192000`
       : `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/stream?static=true&api_key=${session.token}`;

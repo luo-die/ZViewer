@@ -309,15 +309,23 @@ export function WatchTogetherCore({
       const kind = currentMovieSourceType as 'emby' | 'jellyfin'
       const movieId = currentMovieId
       const sourceUrl = watchTogether.sourceUrl
+      // 解容器取字幕必须拿到「原始文件」：转码模式下播放地址是 HLS 播放列表，
+      // 因此用 static=1 让后端强制直推原文件（与播放本身互不影响）。
+      const demuxUrl =
+        kind === 'emby'
+          ? `/api/emby/stream?movieId=${movieId}&static=1`
+          : `/api/jellyfin/stream?movieId=${movieId}&static=1`
       embeddedTimer = setTimeout(() => {
         void (async () => {
-          const started = await subtitles.autoLoadEmbeddedTracks({ kind, movieId })
+          const started = await subtitles.autoLoadEmbeddedTracks({
+            kind,
+            movieId,
+          })
           if (started > 0) return
-          if (!sourceUrl) return
-          // 直推流才可解容器；HLS 播放列表会探测失败并静默跳过
+          // 优先用原文件直推流；探测失败（非 MKV / 直链 CORS）则静默跳过
           await subtitles.loadEmbeddedSubtitles(
             currentMoviePath ?? '',
-            sourceUrl,
+            demuxUrl || sourceUrl,
             () => videoRef.current?.currentTime ?? null
           )
         })()
