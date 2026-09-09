@@ -423,10 +423,13 @@ export function useViewerHeartbeat({
   isHostRef,
   videoRef,
   suppressEventsRef,
+  reloadVideo,
 }: {
   isHostRef: MutableRefObject<boolean>
   videoRef: RefObject<HTMLVideoElement | null>
   suppressEventsRef: MutableRefObject<boolean>
+  /** 画面卡死时用于重载视频源 */
+  reloadVideo: (video: HTMLVideoElement) => Promise<void>
 }): void {
   const { socket } = useSocket()
   // seek 并发锁
@@ -437,6 +440,8 @@ export function useViewerHeartbeat({
   // P2-Opt#9：软同步追赶状态
   const catchUpActiveRef = useRef(false)
   const catchUpBaseRateRef = useRef(1)
+  // 画面卡死检测：播放中但 currentTime 连续多个心跳不前进时自动重载
+  const stallRef = useRef({ time: -1, count: 0, lastReloadAt: 0 })
 
   useEffect(() => {
     if (!socket || isHostRef.current) return
@@ -476,6 +481,31 @@ export function useViewerHeartbeat({
         // play，ref 已为 true 就再也不会重试 —— 观众于是永远停在暂停态。
         // 心跳兜底重试一次。
         void safePlay(video)
+      }
+
+      // 画面卡死检测：房主在播、本地也处于播放态，但 currentTime 连续 3 次
+      // 心跳（约 15s）没有前进 —— 典型表现是「声音还在、画面卡住」
+      // （视频轨拉流中断而音频缓冲还在播）。自动重载一次，60s 冷却。
+      const now = Date.now()
+      const stall = stallRef.current
+      if (payload.isPlaying && !video.paused) {
+        if (Math.abs(video.currentTime - stall.time) < 0.05) {
+          stall.count += 1
+        } else {
+          stall.count = 0
+          stall.time = video.currentTime
+        }
+        if (stall.count >= 3 && now - stall.lastReloadAt > 60_000) {
+          stall.count = 0
+          stall.lastReloadAt = now
+          console.warn(
+            "[useViewerStateSync] 画面卡住（进度长时间不前进），自动重载视频源"
+          )
+          void reloadVideo(video)
+        }
+      } else {
+        stall.count = 0
+        stall.time = video.currentTime
       }
 
       // 进度校正：软同步 + 硬 seek 两阶段策略（P2-Opt#9）

@@ -545,7 +545,8 @@ export function useSubtitles({
         subtitleTracks: [],
         subtitleEnabled: false,
         activeTrackIndex: -1,
-        subtitleOffset: 0,
+        // 时间偏移属于个人偏好，切影片不该被重置（用户可能刚调好）
+        subtitleOffset: prev.subtitleOffset,
         subtitleMovieId: null,
         secondaryTrackIndex: -1,
       }

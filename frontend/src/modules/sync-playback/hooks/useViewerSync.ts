@@ -96,6 +96,7 @@ export function useViewerSync({
     isHostRef,
     videoRef,
     suppressEventsRef,
+    reloadVideo,
   })
 
   // 3. 从服务器请求初始状态（加入房间时，ack 直返）

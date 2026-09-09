@@ -33,6 +33,15 @@ export function safePlay(
     if (err?.name === 'NotAllowedError' && !video.muted) {
       video.muted = true
       options?.onAutoMuted?.()
+      // 自动静音只是绕过策略的临时手段：用户第一次交互后立即恢复声音，
+      // 否则观众会一直「有画面没声音」却不知道原因
+      const restore = (): void => {
+        window.removeEventListener('pointerdown', restore, true)
+        window.removeEventListener('keydown', restore, true)
+        video.muted = false
+      }
+      window.addEventListener('pointerdown', restore, true)
+      window.addEventListener('keydown', restore, true)
       return video.play().catch((retryErr: DOMException) => {
         console.warn(
           '[safePlay] muted play retry also failed:',
