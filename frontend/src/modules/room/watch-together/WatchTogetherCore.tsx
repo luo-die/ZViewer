@@ -297,41 +297,48 @@ export function WatchTogetherCore({
     // 此前只能手动点「内嵌字幕轨道」逐条提取，导致"播放 Emby 资源无字幕"。
     // 延迟 1.5s：让起播请求先占住连接，避免 PlaybackInfo 探测与首帧竞争。
     //
-    // 顺序：**先服务端解容器，失败才用浏览器解容器**。
-    // 浏览器端解容器（mkv-embedded）会对同一地址发起数百次 Range 请求，
-    // 实测会把媒体服务器的限流额度打满（429 → 连播放本身都被限流），
-    // 所以只在服务端路径不可用（非 MKV / 无文本字幕轨 / 提取失败）时才启用。
+    // 顺序：**只由房主在服务端提取，观众端不做任何取字幕请求**。
+    //
+    // 为什么彻底去掉浏览器端解容器兜底（emby/jellyfin）：它会对同一个播放地址
+    // 发起数百次 Range 请求，与 <video> 自身的取流争抢带宽和同源连接
+    // （HTTP/1.1 每源 6 条），实测表现为「视频流在下载但迟迟不播 / 黑屏」，
+    // 还会把媒体服务器的限流额度打满（429）。服务端路径只发 1~2 个请求、
+    // 结果落盘缓存，并由 socket 广播给全体观众，无需观众本地再取一次。
     if (
       (currentMovieSourceType === 'emby' ||
         currentMovieSourceType === 'jellyfin') &&
-      currentMovieId != null
+      currentMovieId != null &&
+      isHost
     ) {
       const kind = currentMovieSourceType as 'emby' | 'jellyfin'
       const movieId = currentMovieId
-      const sourceUrl = watchTogether.sourceUrl
-      // 解容器取字幕必须拿到「原始文件」：转码模式下播放地址是 HLS 播放列表，
-      // 因此用 static=1 让后端强制直推原文件（与播放本身互不影响）。
-      const demuxUrl =
-        kind === 'emby'
-          ? `/api/emby/stream?movieId=${movieId}&static=1`
-          : `/api/jellyfin/stream?movieId=${movieId}&static=1`
+      // 延迟 1.5s：让起播请求先占住连接，避免探测与首帧竞争
       embeddedTimer = setTimeout(() => {
-        void (async () => {
-          // 1) 服务端优先：服务端 MKV 解容器 / 第三方原生 API 字幕。
-          //    只发 1~2 个请求，且提取结果落盘缓存——房主（或第一个观看者）
-          //    提取一次后，全体观看者与后续播放直接命中缓存。
-          const serverTracks = await subtitles.autoLoadEmbeddedTracks({
-            kind,
-            movieId,
-          })
-          if (serverTracks > 0) return
-          // 2) 兜底：浏览器端解容器（渐进式，首段到达即出字幕）
-          await subtitles.loadEmbeddedSubtitles(
-            currentMoviePath ?? '',
-            demuxUrl || sourceUrl,
-            () => videoRef.current?.currentTime ?? null
-          )
-        })()
+        const video = videoRef.current
+        const startExtract = (): void => {
+          void subtitles.autoLoadEmbeddedTracks({ kind, movieId })
+        }
+        // 服务端解容器要顺序读完整集（约 1~2 分钟），会占用服务器到媒体源的
+        // 带宽。等首帧真正播起来再提取，避免和起播抢带宽导致卡顿/黑屏；
+        // 20s 兜底（用户可能一直暂停，或视频迟迟起不来）。
+        if (!video || (!video.paused && video.readyState >= 2)) {
+          startExtract()
+          return
+        }
+        let started = false
+        const onPlaying = (): void => {
+          if (started) return
+          started = true
+          video.removeEventListener('playing', onPlaying)
+          startExtract()
+        }
+        video.addEventListener('playing', onPlaying)
+        embeddedTimer = setTimeout(() => {
+          if (started) return
+          started = true
+          video.removeEventListener('playing', onPlaying)
+          startExtract()
+        }, 20_000)
       }, 1500)
     }
     return () => clearTimeout(embeddedTimer)

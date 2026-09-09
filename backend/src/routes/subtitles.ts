@@ -1515,6 +1515,25 @@ router.get(
             });
             return;
           }
+          // 启动前先校验轨道确实存在：解容器要把整集顺序读一遍（约 1GB），
+          // 不能为一个无效 index（前端轨道列表过期、误请求等）白跑一遍
+          const known = await listServerMkvTracks(movie);
+          if (!known) {
+            res.status(400).json({
+              success: false,
+              message: '未能从容器中读到内嵌字幕轨（可能不是 MKV，或探测被上游限流）',
+            });
+            return;
+          }
+          if (!known.tracks.some((t) => t.trackNumber === streamIndex)) {
+            res.status(400).json({
+              success: false,
+              message: `未找到字幕轨 ${streamIndex}（容器内文本字幕轨：${known.tracks
+                .map((t) => t.trackNumber)
+                .join('/')}）`,
+            });
+            return;
+          }
           // 未命中缓存 → 启动后台提取并立即返回 202，前端轮询等待结果。
           // 这样长耗时任务不会占住 HTTP 连接（避免反向代理 504），
           // 且多个观看者共享同一次提取。
