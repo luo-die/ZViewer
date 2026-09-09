@@ -879,6 +879,13 @@ async function listNativeSubtitleTracks(
  * 会白白多等 1~2s；命中缓存则字幕请求几乎立刻发出。
  * 失败结果只缓存 60s（可能是上游限流/网络抖动，不宜长期钉死）。
  */
+/** /embedded-tracks 响应缓存（按影片 + updatedAt 版本，见路由内说明） */
+const embeddedTracksCache = new Map<
+  number,
+  { at: number; updatedAt: number; payload: Record<string, unknown> }
+>();
+const EMBEDDED_TRACKS_TTL_MS = 5 * 60 * 1000;
+
 const mkvProbeCache = new Map<
   number,
   { at: number; value: { tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null }
@@ -1107,17 +1114,39 @@ router.get(
       const source = (movie.source || '').toLowerCase();
 
       if (source === 'emby' || source === 'jellyfin') {
+        // 探测结果按影片缓存：本函数最多要向上游发若干个请求（原生 API + 容器
+        // 探测），每次切影片/重播都重跑会白等 0.5~2s。缓存以影片 updatedAt 为
+        // 版本号，元数据变化自动失效。
+        const movieVersion = movie.updatedAt ? new Date(movie.updatedAt).getTime() : 0;
+        const cachedTracks = embeddedTracksCache.get(movie.id);
+        if (
+          cachedTracks &&
+          cachedTracks.updatedAt === movieVersion &&
+          Date.now() - cachedTracks.at < EMBEDDED_TRACKS_TTL_MS
+        ) {
+          res.json(cachedTracks.payload);
+          return;
+        }
+        const respond = (payload: Record<string, unknown>): void => {
+          embeddedTracksCache.set(movie.id, {
+            at: Date.now(),
+            updatedAt: movieVersion,
+            payload,
+          });
+          res.json(payload);
+        };
+
         // 1) 第三方兼容服务的原生 API：外挂字幕以独立文件下发
         const nativeTracks = await listNativeSubtitleTracks(movie);
         if (nativeTracks && nativeTracks.length > 0) {
-          res.json({ success: true, tracks: nativeTracks, native: true });
+          respond({ success: true, tracks: nativeTracks, native: true });
           return;
         }
 
         // 2) 服务端解容器：MKV 内嵌字幕（媒体服务器没有字幕端点时的可靠路径）
         const mkvProbe = await listServerMkvTracks(movie);
         if (mkvProbe) {
-          res.json({
+          respond({
             success: true,
             mkv: true,
             rangeSupported: mkvProbe.rangeSupported,
