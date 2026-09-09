@@ -68,6 +68,14 @@ export function useViewerSync({
   // 避免 useViewerStateSync 在 usePlaybackStateRequest 进行中误判 source 变化，
   // 并发触发第二个 attach（两个并发 attach 互相 reset → 黑屏）。
   const lastAppliedSourceUrlRef = useRef<string | null>(null)
+  /**
+   * 共享 attach 世代号：每次真正要换源时 +1。
+   * 观众刚进房时的初始 attach（usePlaybackStateRequest）与随后的房主广播
+   * （useViewerStateSync）可能并发：初始 attach 拿到的是「进房那一刻」的影片，
+   * 若它比新广播晚完成，就会把画面拉回旧影片——表现为「房主在第一部、
+   * 观众却还在第二部」。两个 hook 共用这个世代号，旧世代在应用前后都会让位。
+   */
+  const attachSeqRef = useRef(0)
 
   // 1. 接收房主实时状态（房主在线时）
   useViewerStateSync({
@@ -80,6 +88,7 @@ export function useViewerSync({
     seekTo,
     reloadVideo,
     lastAppliedSourceUrlRef,
+    attachSeqRef,
   })
 
   // 2. 订阅房主心跳（房主在线时，每 5s 校正进度漂移）
@@ -98,6 +107,7 @@ export function useViewerSync({
     setWatchTogether,
     applySourceToVideo,
     lastAppliedSourceUrlRef,
+    attachSeqRef,
   })
 
   // 4. 订阅服务器心跳（房主离线时服务器接管广播，观众继续播放）

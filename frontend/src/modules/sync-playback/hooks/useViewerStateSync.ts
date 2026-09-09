@@ -49,6 +49,8 @@ export interface UseViewerStateSyncOptions {
    * 重复触发 applySourceToVideo 覆盖已缓冲的 blob 源。
    */
   lastAppliedSourceUrlRef: MutableRefObject<string | null>
+  /** 共享 attach 世代号（见 useViewerSync）：旧世代的 attach 结果直接作废 */
+  attachSeqRef: MutableRefObject<number>
 }
 
 export type UseViewerStateSyncReturn = void
@@ -90,6 +92,7 @@ export function useViewerStateSync({
   seekTo,
   reloadVideo,
   lastAppliedSourceUrlRef,
+  attachSeqRef,
 }: UseViewerStateSyncOptions): UseViewerStateSyncReturn {
   const { socket } = useSocket()
 
@@ -126,6 +129,10 @@ export function useViewerStateSync({
 
       // 1. sourceUrl 变化 → applySourceToVideo（含完整同步）
       if (isSourceChange) {
+        // 本次 attach 的世代号：期间若又有更新的换源（房主再次切片，或观众
+        // 初始 attach 正在跑），本世代在应用前后都会让位，避免旧影片的
+        // attach 最后完成把画面拉回去
+        const attachSeq = ++attachSeqRef.current
         // 缓冲模式：先下载完整 m4s 到 IndexedDB，再用 blob URL 播放
         // 避免播放过程中 B站 URL 过期或网络波动导致卡顿
         let blobs: { videoBlob: Blob; audioBlob: Blob } | undefined
@@ -182,7 +189,11 @@ export function useViewerStateSync({
         // 传入 state.currentTime 作为 startTime：引擎（DashPlayer）从该时间对应
         // 的字节位置开始下载，而非从文件头顺序下载到目标位置才播放
         // （房主切清晰度/换片时观众从房主当前进度起播，避免长缓冲）。
+        // 已被更新的 attach 取代：不再应用旧源
+        if (attachSeqRef.current !== attachSeq) return
         await applySourceToVideo(video, state, state.currentTime || undefined, blobs)
+        // 应用期间又来了更新的换源：本次结果作废（不写缓存、不调进度/播放）
+        if (attachSeqRef.current !== attachSeq) return
         // applySourceToVideo 后视频元素可能已替换，重新获取
         const currentVideo = videoRef.current
         if (!currentVideo) return
@@ -313,6 +324,12 @@ export function useViewerStateSync({
       suppressEventsRef.current = true
       void processState(state).then(() => {
         suppressEventsRef.current = false
+        // 处理期间若收到 source 变化（被缓存进 pendingStateRef），这里补一次
+        // drain；否则该状态会一直滞留，直到下一次换源才被应用
+        if (pendingStateRef.current) {
+          suppressEventsRef.current = true
+          void drain()
+        }
       })
     }
 

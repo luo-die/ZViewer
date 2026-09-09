@@ -44,6 +44,8 @@ export interface UsePlaybackStateRequestOptions {
    * 误判为 source 变化，重复触发 applySourceToVideo 覆盖已缓冲的 blob 源。
    */
   lastAppliedSourceUrlRef: MutableRefObject<string | null>
+  /** 共享 attach 世代号（见 useViewerSync）：被更新的换源取代时本次 attach 作废 */
+  attachSeqRef: MutableRefObject<number>
 }
 
 export type UsePlaybackStateRequestReturn = void
@@ -56,6 +58,7 @@ export function usePlaybackStateRequest({
   setWatchTogether,
   applySourceToVideo,
   lastAppliedSourceUrlRef,
+  attachSeqRef,
 }: UsePlaybackStateRequestOptions): UsePlaybackStateRequestReturn {
   const { socket } = useSocket()
   const requestedRef = useRef(false)
@@ -109,6 +112,10 @@ export function usePlaybackStateRequest({
           // 失败时回滚，允许下一次重试。
           const previousAppliedUrl = lastAppliedSourceUrlRef.current
           lastAppliedSourceUrlRef.current = state.sourceUrl
+          // 本次初始 attach 的世代号：若期间房主又切片并广播了更新的源，
+          // useViewerStateSync 会递增该世代号，本次 attach 随即让位
+          // （否则它晚一步完成就会把画面拉回「进房那一刻」的旧影片）
+          const attachSeq = ++attachSeqRef.current
 
           suppressEventsRef.current = true
           setWatchTogether(state)
@@ -156,10 +163,14 @@ export function usePlaybackStateRequest({
             const blobs = await fetchBlobsIfNeeded()
             if (blobs === null) {
               // 缓冲失败：不应用源，回滚 sourceUrl 标记，等待房主重新广播
-              lastAppliedSourceUrlRef.current = previousAppliedUrl
+              if (attachSeqRef.current === attachSeq) {
+                lastAppliedSourceUrlRef.current = previousAppliedUrl
+              }
               suppressEventsRef.current = false
               return
             }
+            // 已被更新的换源取代：放弃本次 attach（新世代会自己 attach）
+            if (attachSeqRef.current !== attachSeq) return
             // 直接以房主当前进度作为起始位置加载（引擎支持 startTime），
             // 首帧即对齐房主位置，省去 attach 完成后再 seek 的等待
             const startTime =
@@ -170,6 +181,8 @@ export function usePlaybackStateRequest({
               startTime,
               blobs ?? undefined
             )
+            // 应用期间房主切了片：本次结果作废，不再设置进度/播放态
+            if (attachSeqRef.current !== attachSeq) return
             const currentVideo = videoRef.current
             if (!currentVideo) return
 
@@ -200,7 +213,10 @@ export function usePlaybackStateRequest({
           })().catch((err: unknown) => {
             console.error('[usePlaybackStateRequest] 恢复状态失败:', err)
             // attach 失败：回滚 sourceUrl 标记，允许下一次重试
-            lastAppliedSourceUrlRef.current = previousAppliedUrl
+            // （若期间已被更新的换源取代，则不能回滚——那会覆盖新世代的标记）
+            if (attachSeqRef.current === attachSeq) {
+              lastAppliedSourceUrlRef.current = previousAppliedUrl
+            }
             suppressEventsRef.current = false
             message.error(err instanceof Error ? err.message : '状态恢复失败')
           })
