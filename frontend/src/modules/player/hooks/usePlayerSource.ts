@@ -43,11 +43,44 @@ import type {
 } from '@/modules/player'
 import { refreshAccessToken } from '@/lib/api'
 import { formatVideoLoadError } from '@/modules/player/utils'
+import { markPlaysVideoFailure } from '@/modules/player/playsvideo-preference'
 
 import {
   isBrowserPlayableFormat,
   getUnsupportedFormatMessage,
 } from '@/lib/mediaFormat'
+
+/**
+ * playsvideo attach 超时：引擎卡在探测/索引阶段时的兜底。
+ * 超过该时长按失败处理，回退原生直连。
+ */
+const PLAYSVIDEO_ATTACH_TIMEOUT_MS = 25_000
+
+/** 与超时竞速：超时后返回 rejected Promise（原 Promise 的结果被忽略） */
+function raceWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout: () => Error
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(onTimeout()), timeoutMs)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      }
+    )
+  })
+}
+/**
+ * playsvideo 首帧看门狗超时：12s 内既没有可渲染数据也没有解出帧，
+ * 判定为「该编码浏览器解不了」，回退原生直连。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 12_000
 
 /**
  * 判断引擎错误是否为本站 API 媒体地址的鉴权失效（401/403）。
@@ -174,6 +207,11 @@ export function usePlayerSource(
   // 会在卸载后继续完成。没有该标记时，attach 会把引擎挂到已被 React
   // 移除的游离 video 上，其声音持续输出（每切一次片泄漏一个声音源）。
   const mountedRef = useRef(true)
+  // 首帧看门狗（playsvideo 挂上但不出画时回退原生直连）
+  const firstFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const firstFrameWatchCleanupRef = useRef<(() => void) | null>(null)
+  // attach 世代：cleanup / 超时放弃后，迟到的 attach 结果不得落地
+  const attachEpochRef = useRef(0)
 
   useEffect(() => {
     onPlaybackErrorRef.current = options.onPlaybackError
@@ -190,9 +228,16 @@ export function usePlayerSource(
   }, [])
 
   const cleanup = useCallback(() => {
+    // 作废进行中的 attach（其迟到结果不得再落地）
+    attachEpochRef.current++
     if (blobUrlRef.current) {
       URL.revokeObjectURL(blobUrlRef.current)
       blobUrlRef.current = null
+    }
+    // 停掉首帧看门狗（换源/清理后旧的判定不再适用）
+    if (firstFrameWatchCleanupRef.current) {
+      firstFrameWatchCleanupRef.current()
+      firstFrameWatchCleanupRef.current = null
     }
     // 移除播放期 error 监听器（换源/清理时不再需要）
     if (playbackErrorCleanupRef.current) {
@@ -383,6 +428,119 @@ export function usePlayerSource(
   }, [attachPlaysVideoFallback])
 
   /**
+   * 管线失败后的原生直连兜底（attach 期异常 / 首帧看门狗共用）。
+   *
+   * 条件：容器本身浏览器可开（mkv/mp4/webm/mov），且本次不是「管线强制回退」
+   * （forcePlaysVideo，说明直连已经失败过一次，再回退会来回打转）。
+   * 通过 noPlaysVideo 标记强制选中 direct 引擎——本机「浏览器转码引擎」偏好
+   * 为开启时也不会再被选回管线。
+   * @returns 是否已成功挂载原生直连
+   */
+  const attachDirectFallback = useCallback(
+    async (
+      video: HTMLVideoElement,
+      source: PlayerSource,
+      reason: string
+    ): Promise<boolean> => {
+      if (source.forcePlaysVideo) return false
+      if (!source.format || !isBrowserPlayableFormat(source.format))
+        return false
+      try {
+        const directEngine = selectEngine({
+          ...source,
+          playsvideoEnabled: false,
+          forcePlaysVideo: false,
+          mkvFastPath: true,
+          noPlaysVideo: true,
+        })
+        if (directEngine.type !== 'direct') return false
+        cleanup()
+        resetVideoElement(video)
+        appliedSourceUrlRef.current = source.url
+        const directResult = await directEngine.attach(video, source)
+        if (!applyAttachResult(directResult)) return false
+        // 记住「该源管线播不了」：本次会话内重载/切回不再重复黑屏
+        markPlaysVideoFailure(source.url)
+        console.warn(
+          `[usePlayerSource] ${reason}，已回退原生直连播放（音频可能不受支持）`
+        )
+        registerPlaybackErrorWatch(video, source, 'direct')
+        return true
+      } catch (err) {
+        console.warn('[usePlayerSource] 原生直连兜底同样失败:', err)
+        return false
+      }
+    },
+    [cleanup, applyAttachResult, registerPlaybackErrorWatch]
+  )
+  /**
+   * playsvideo 首帧看门狗。
+   *
+   * 背景：浏览器不支持该视频编码（如 HEVC 无硬解）时，MSE 管线能正常 attach、
+   * 分片也在下，但解码器始终不出帧——表现为「一直黑屏、无报错、字幕却正常」。
+   * 此时没有 error 事件可依赖，只能按「多久没出画」判定失败，回退原生直连。
+   *
+   * 判定：readyState >= 2（有可渲染数据）且 videoWidth > 0（已解出帧）即算成功。
+   */
+  const armFirstFrameWatch = useCallback(
+    (video: HTMLVideoElement, source: PlayerSource): void => {
+      const url = source.url
+      const mark = (): boolean => video.readyState >= 2 && video.videoWidth > 0
+      const onProgress = (): void => {
+        if (appliedSourceUrlRef.current !== url) {
+          stop()
+          return
+        }
+        if (mark()) {
+          console.info('[usePlayerSource] playsvideo 已出画')
+          stop()
+        }
+      }
+      const stop = (): void => {
+        video.removeEventListener('loadeddata', onProgress)
+        video.removeEventListener('canplay', onProgress)
+        video.removeEventListener('timeupdate', onProgress)
+        if (firstFrameTimerRef.current) {
+          clearTimeout(firstFrameTimerRef.current)
+          firstFrameTimerRef.current = null
+        }
+        if (firstFrameWatchCleanupRef.current === stop) {
+          firstFrameWatchCleanupRef.current = null
+        }
+      }
+      firstFrameWatchCleanupRef.current?.()
+      firstFrameWatchCleanupRef.current = stop
+      video.addEventListener('loadeddata', onProgress)
+      video.addEventListener('canplay', onProgress)
+      video.addEventListener('timeupdate', onProgress)
+      firstFrameTimerRef.current = setTimeout(() => {
+        stop()
+        if (appliedSourceUrlRef.current !== url) return
+        if (!mountedRef.current) return
+        if (mark()) return
+        console.warn(
+          '[usePlayerSource] playsvideo 管线 12s 内未出画（可能是不支持的视频编码），回退原生直连'
+        )
+        void enqueue(async () => {
+          if (appliedSourceUrlRef.current !== url || !mountedRef.current) return
+          const fellBack = await attachDirectFallback(
+            video,
+            source,
+            '浏览器转码引擎未出画'
+          )
+          if (!fellBack) {
+            onPlaybackErrorRef.current?.(
+              new Error(
+                '浏览器转码引擎无法解码该视频（可能是不支持的视频编码），原生直连也未能播放。可在播放列表关闭「浏览器转码引擎」后重试'
+              )
+            )
+          }
+        })
+      }, FIRST_FRAME_TIMEOUT_MS)
+    },
+    [enqueue, attachDirectFallback]
+  )
+  /**
    * attach 的内部实现（不入队）。调用方必须已处于串行上下文中。
    * 切换顺序：先 cleanup 旧引擎（中断其下载），再 reset video，最后 attach 新引擎。
    */
@@ -403,8 +561,24 @@ export function usePlayerSource(
         // 能力决定，不受任何开关门控（自研引擎已移除，playsvideo 是唯一
         // 的浏览器端重封装与转码路径）。
         const engine = selectEngine(source)
+        // attach 世代：超时放弃 / cleanup 后，迟到的 attach 结果不得落地
+        const attachEpoch = ++attachEpochRef.current
         try {
-          const result = await engine.attach(video, source)
+          // 管线启动超时：引擎可能在探测/索引阶段卡住（大文件 + 慢源），
+          // 表现为「一直加载中、无报错」。超时后按失败处理，走下面的直连兜底。
+          const result = await (engine.type === 'playsvideo'
+            ? raceWithTimeout(
+                engine.attach(video, source),
+                PLAYSVIDEO_ATTACH_TIMEOUT_MS,
+                () =>
+                  new Error(
+                    `浏览器转码引擎启动超时（${Math.round(
+                      PLAYSVIDEO_ATTACH_TIMEOUT_MS / 1000
+                    )}s 内未就绪）`
+                  )
+              )
+            : engine.attach(video, source))
+          if (attachEpoch !== attachEpochRef.current) return
           if (!applyAttachResult(result)) return
         } catch (err) {
           // 鉴权失效：媒体 URL（appendAuthToken）嵌入的 access token 过期，
@@ -450,42 +624,16 @@ export function usePlayerSource(
             return
           }
           if (engine.type === 'playsvideo') {
-            // 兜底一：转码管线失败但容器本身浏览器原生可开（mkv/mp4/webm/mov）
+            // 兜底：转码管线失败但容器本身浏览器原生可开（mkv/mp4/webm/mov）
             // → 尝试原生直连。宁可「能看但可能缺音轨」也不留永久黑屏；
             // 原生也失败时再抛原始错误。
-            if (
-              !source.forcePlaysVideo &&
-              source.format &&
-              isBrowserPlayableFormat(source.format)
-            ) {
-              try {
-                const directEngine = selectEngine({
-                  ...source,
-                  playsvideoEnabled: false,
-                  forcePlaysVideo: false,
-                  mkvFastPath: true,
-                })
-                if (directEngine.type === 'direct') {
-                  cleanup()
-                  resetVideoElement(video)
-                  appliedSourceUrlRef.current = source.url
-                  const directResult = await directEngine.attach(video, source)
-                  if (applyAttachResult(directResult)) {
-                    console.warn(
-                      '[usePlayerSource] 浏览器转码管线失败，已回退原生直连播放（音频可能不受支持）'
-                    )
-                    registerPlaybackErrorWatch(video, source, 'direct')
-                    return
-                  }
-                }
-              } catch (directErr) {
-                console.warn(
-                  '[usePlayerSource] 原生直连兜底同样失败:',
-                  directErr
-                )
-              }
-            }
-            // 兜底二：无可用回退 → 抛错由调用方提示
+            const fellBack = await attachDirectFallback(
+              video,
+              source,
+              '浏览器转码管线失败'
+            )
+            if (fellBack) return
+            // 无可用回退 → 抛错由调用方提示
             throw new Error(
               `浏览器转码引擎（playsvideo）播放失败：${
                 err instanceof Error ? err.message : String(err)
@@ -498,6 +646,12 @@ export function usePlayerSource(
 
         // attach 成功：注册播放期 error 监听（回退 / 提示的统一入口）
         registerPlaybackErrorWatch(video, source, engine.type)
+        // 管线「挂上了但不出画」的兜底：浏览器解不了该视频编码（如 HEVC）时
+        // MSE 会一直停在 readyState<2 / videoWidth=0，既没有 error 事件，
+        // 也不会有画面。这里起一个首帧看门狗，超时自动回退原生直连。
+        if (engine.type === 'playsvideo' && !source.forcePlaysVideo) {
+          armFirstFrameWatch(video, source)
+        }
       } catch (err) {
         // 加载失败时回滚 appliedSourceUrlRef，允许下次重试
         appliedSourceUrlRef.current = previousUrl
@@ -508,7 +662,9 @@ export function usePlayerSource(
       cleanup,
       applyAttachResult,
       attachPlaysVideoFallback,
+      attachDirectFallback,
       registerPlaybackErrorWatch,
+      armFirstFrameWatch,
     ]
   )
   // 更新稳定自引用（commit 后同步，供 token 刷新重试递归调用；

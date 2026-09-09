@@ -127,6 +127,12 @@ export interface PlayerSource {
    */
   forcePlaysVideo?: boolean
   /**
+   * 内部标记：本次 attach 必须走原生直连，任何开关（含本机「浏览器转码引擎」
+   * 偏好）都不得再选中 playsvideo 管线。用于管线失败后的兜底重挂载——
+   * 否则本机偏好为「开启」时兜底会被再次判成需要管线，形成死循环/黑屏。
+   */
+  noPlaysVideo?: boolean
+  /**
    * 影片级浏览器播放引擎（playsvideo）开关（添加影片时设置）。
    * - true（默认）：允许 playsvideo 管线
    * - false：强制原生直连播放（mkvFastPath 一并失效）

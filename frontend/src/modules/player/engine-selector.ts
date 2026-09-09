@@ -25,7 +25,10 @@ import {
 } from './engines/playsvideo-engine'
 import { needsBrowserTranscode } from '@/lib/audioCodecs'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
-import { getPlaysvideoLocalOverride } from './playsvideo-preference'
+import {
+  getPlaysvideoLocalOverride,
+  hasPlaysVideoFailure,
+} from './playsvideo-preference'
 
 /** 所有引擎实例（单例，无需重复创建） */
 const ENGINES: Record<string, PlayerEngine> = {
@@ -68,6 +71,10 @@ const REMUX_ONLY_FORMATS = ['avi', 'ts', 'wmv']
  */
 export function shouldUsePlaysVideo(source: PlayerSource): boolean {
   if (!isPlaysVideoSupported()) return false
+  // 兜底重挂载标记：管线已判定失败，必须直连（优先级高于所有开关）
+  if (source.noPlaysVideo) return false
+  // 本会话内该源已确认管线播不了：直接走原生，避免重复黑屏
+  if (hasPlaysVideoFailure(source.url)) return false
   // 本机偏好（播放列表的「浏览器转码引擎」开关，仅本机生效、不同步）：
   // 关闭时无条件强制原生直连（含 forcePlaysVideo 回退路径）；开启时
   // 忽略影片级开关，但仍受系统级开关与浏览器能力限制。

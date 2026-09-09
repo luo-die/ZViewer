@@ -56,6 +56,27 @@ export function setPlaysvideoLocalOverride(
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event(CHANGE_EVENT))
   }
+  // 用户重新拨动开关 → 清掉「该源管线播不了」的会话内标记，允许再次尝试
+  playsVideoFailedUrls.clear()
+}
+
+/**
+ * 本次会话内「管线已确认播不了」的源地址。
+ *
+ * 管线失败后已回退直连，但用户重载影片 / 切回同一集时再走一遍管线只会又黑屏
+ * 一次（体感就是「开关一开视频就不加载」）。失败过的源在本次会话内直接跳过管线；
+ * 用户重新拨动「浏览器转码引擎」开关时清空重试。
+ */
+const playsVideoFailedUrls = new Set<string>()
+
+/** 标记某源地址的管线播放失败（回退原生直连时调用） */
+export function markPlaysVideoFailure(url: string): void {
+  if (url) playsVideoFailedUrls.add(url)
+}
+
+/** 该源是否已在本次会话中确认「管线播不了」 */
+export function hasPlaysVideoFailure(url: string | undefined): boolean {
+  return !!url && playsVideoFailedUrls.has(url)
 }
 
 function subscribe(callback: () => void): () => void {
