@@ -67,6 +67,16 @@ import {
   extractMkvSubtitleTrack,
   type MkvSubtitleTrackInfo,
 } from '../services/mkv-subtitles';
+// 在线字幕（射手网 assrt）：媒体服务器没有字幕时的保底来源
+import {
+  searchAssrt,
+  listAssrtFiles,
+  fetchAssrtSubtitle,
+  pickFileForEpisode,
+  extractEpisodeNumber,
+  extractSeasonNumber,
+  buildSearchKeyword,
+} from '../services/online-subtitles';
 
 const router = Router();
 
@@ -1651,6 +1661,203 @@ router.get(
         ? `${raw}（媒体服务器限流，稍等 1~2 分钟再试即可）`
         : raw;
       res.status(400).json({ success: false, message });
+    }
+  },
+);
+
+// ==================== 在线字幕（射手网 assrt） ====================
+
+/** 归一化标题：去掉标点/空格，便于相似度比较 */
+function normalizeTitle(text: string): string {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[\(\)\[\]【】{}<>《》「」!！?？,，.。:：;；\-—_"\'\s]/g, "");
+}
+
+/** 计算候选条目与影片标题的相似度（0~1，按 2-gram 覆盖率） */
+function titleSimilarity(query: string, candidate: string): number {
+  const a = normalizeTitle(query);
+  const b = normalizeTitle(candidate);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (b.includes(a) || a.includes(b)) return 0.9;
+  const grams = new Set<string>();
+  for (let i = 0; i + 2 <= a.length; i++) grams.add(a.slice(i, i + 2));
+  if (grams.size === 0) return a.includes(b) ? 0.8 : 0;
+  let hit = 0;
+  for (const g of grams) if (b.includes(g)) hit++;
+  return hit / grams.size;
+}
+
+async function findMovieById(movieId: number): Promise<Movie | null> {
+  if (!Number.isFinite(movieId)) return null;
+  return AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
+}
+
+/** 搜索在线字幕：q 省略时用影片标题自动构造关键词 */
+router.get(
+  "/online/search",
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const movie = await findMovieById(Number(req.query.movieId));
+      if (!movie) {
+        res.status(400).json({ success: false, message: "影片不存在" });
+        return;
+      }
+      const manual = typeof req.query.q === "string" ? req.query.q.trim() : "";
+      const keyword = manual || buildSearchKeyword(movie.title, movie.path);
+      const candidates = await searchAssrt(keyword, { limit: 15 });
+      res.json({ success: true, keyword, candidates });
+    } catch (err) {
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "在线字幕搜索失败",
+      });
+    }
+  },
+);
+
+/** 列出某条在线字幕包含的文件 */
+router.get(
+  "/online/files",
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const id = Number(req.query.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ success: false, message: "缺少或无效的 id 参数" });
+        return;
+      }
+      const result = await listAssrtFiles(id);
+      // 不把带签名的直链暴露给前端：加载走 /online/load
+      res.json({
+        success: true,
+        title: result.title,
+        files: result.files.map((f) => ({
+          index: f.index,
+          name: f.name,
+          size: f.size,
+        })),
+      });
+    } catch (err) {
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "获取字幕文件列表失败",
+      });
+    }
+  },
+);
+
+/** 下载指定文件并返回字幕内容 */
+router.get(
+  "/online/load",
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const id = Number(req.query.id);
+      const index = Number(req.query.index);
+      if (!Number.isFinite(id) || id <= 0 || !Number.isFinite(index) || index < 0) {
+        res.status(400).json({ success: false, message: "缺少或无效的 id/index 参数" });
+        return;
+      }
+      const result = await fetchAssrtSubtitle(id, index);
+      res.json({
+        success: true,
+        content: result.content,
+        format: result.format,
+        label: result.name.replace(/\.[a-z0-9]+$/i, ""),
+        language: null,
+      });
+    } catch (err) {
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "下载在线字幕失败",
+      });
+    }
+  },
+);
+
+/**
+ * 自动匹配（保底）：媒体服务器没有可用字幕时，按标题搜索射手网，
+ * 选相似度最高的条目、再按集数选文件，直接返回字幕内容。
+ */
+router.get(
+  "/online/auto",
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const movie = await findMovieById(Number(req.query.movieId));
+      if (!movie) {
+        res.status(400).json({ success: false, message: "影片不存在" });
+        return;
+      }
+      const keyword = buildSearchKeyword(movie.title, movie.path);
+      if (!keyword) {
+        res.status(400).json({ success: false, message: "影片标题为空，无法在线搜索" });
+        return;
+      }
+      const episode = extractEpisodeNumber(movie.title, movie.path);
+      const season = extractSeasonNumber(movie.title, movie.path);
+      const candidates = await searchAssrt(keyword, { limit: 15 });
+      if (candidates.length === 0) {
+        res.status(404).json({ success: false, message: "射手网没有找到匹配字幕" });
+        return;
+      }
+      const ranked = candidates
+        .map((c) => ({
+          candidate: c,
+          score:
+            titleSimilarity(keyword, c.title) * 100 +
+            titleSimilarity(keyword, c.videoName ?? "") * 40 +
+            (c.score ?? 0) / 20 +
+            (/简/.test(c.language ?? "") ? 10 : 0) +
+            // 季数不符时重罚：避免把「第二季」的字幕套到第一季上
+            (() => {
+              const candSeason = extractSeasonNumber(c.title, c.videoName ?? "");
+              if (season != null && candSeason != null && season !== candSeason) {
+                return -200;
+              }
+              if (season != null && candSeason == null) return -20;
+              return 0;
+            })(),
+        }))
+        .sort((a, b) => b.score - a.score);
+      const best = ranked[0]!;
+      // 相似度过低时不自动套用（宁可让用户手动搜），避免张冠李戴
+      if (titleSimilarity(keyword, best.candidate.title) < 0.35 && titleSimilarity(keyword, best.candidate.videoName ?? "") < 0.5) {
+        res.status(404).json({
+          success: false,
+          message: "没有足够接近的在线字幕（可手动搜索选择）",
+          candidates: ranked.slice(0, 8).map((r) => r.candidate),
+        });
+        return;
+      }
+      const files = await listAssrtFiles(best.candidate.id);
+      const picked = pickFileForEpisode(files.files, episode);
+      if (!picked) {
+        res.status(404).json({ success: false, message: "该字幕条目没有可用文件" });
+        return;
+      }
+      const content = await fetchAssrtSubtitle(best.candidate.id, picked.index, {
+        directUrl: picked.url,
+        directName: picked.name,
+      });
+      res.json({
+        success: true,
+        content: content.content,
+        format: content.format,
+        label: content.name.replace(/\.[a-z0-9]+$/i, ""),
+        language: best.candidate.language ?? null,
+        source: {
+          provider: "assrt",
+          id: best.candidate.id,
+          title: best.candidate.title,
+          episode,
+          file: content.name,
+        },
+      });
+    } catch (err) {
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "在线字幕自动匹配失败",
+      });
     }
   },
 );

@@ -1128,6 +1128,141 @@ export function useSubtitles({
     [broadcast, isHost]
   )
 
+  // ==================== 在线字幕（射手网 assrt） ====================
+
+  /** 搜索在线字幕条目（q 为空时后端按影片标题自动构造关键词） */
+  const searchOnlineSubtitles = useCallback(
+    async (
+      movieId: number,
+      query?: string
+    ): Promise<{
+      keyword: string
+      candidates: {
+        id: number
+        title: string
+        language?: string
+        format?: string
+        score?: number
+        uploadTime?: string
+      }[]
+    }> => {
+      const q = query?.trim() ? `&q=${encodeURIComponent(query.trim())}` : ""
+      const res = await apiFetch(
+        `/api/subtitles/online/search?movieId=${movieId}${q}`
+      )
+      const data = (await res.json()) as {
+        success: boolean
+        keyword?: string
+        candidates?: {
+          id: number
+          title: string
+          language?: string
+          format?: string
+          score?: number
+          uploadTime?: string
+        }[]
+        message?: string
+      }
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || "在线字幕搜索失败")
+      }
+      return { keyword: data.keyword ?? "", candidates: data.candidates ?? [] }
+    },
+    []
+  )
+
+  /** 列出某条在线字幕的文件 */
+  const listOnlineSubtitleFiles = useCallback(
+    async (
+      id: number
+    ): Promise<{ index: number; name: string; size?: string }[]> => {
+      const res = await apiFetch(`/api/subtitles/online/files?id=${id}`)
+      const data = (await res.json()) as {
+        success: boolean
+        files?: { index: number; name: string; size?: string }[]
+        message?: string
+      }
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || "获取字幕文件列表失败")
+      }
+      return data.files ?? []
+    },
+    []
+  )
+
+  /** 下载在线字幕文件并加入轨道 */
+  const loadOnlineSubtitle = useCallback(
+    async (id: number, index: number): Promise<number> => {
+      if (!isHost) return 0
+      const res = await apiFetch(
+        `/api/subtitles/online/load?id=${id}&index=${index}`
+      )
+      const data = (await res.json()) as {
+        success: boolean
+        content?: string
+        format?: string
+        label?: string
+        language?: string | null
+        message?: string
+      }
+      if (!res.ok || !data.success || !data.content) {
+        throw new Error(data.message || "下载在线字幕失败")
+      }
+      addParsedTrack(
+        data.content,
+        data.label || "在线字幕",
+        mapOutputFormat(data.format || "srt"),
+        data.label,
+        data.language ?? undefined
+      )
+      return 1
+    },
+    [addParsedTrack, isHost]
+  )
+
+  /**
+   * 保底自动匹配：媒体服务器没有任何可用字幕时，按影片标题到射手网自动
+   * 匹配并加载（季数/集数都会校验，相似度不足则不套用）。
+   */
+  const autoLoadOnlineSubtitle = useCallback(
+    async (movieId: number): Promise<number> => {
+      if (!isHost) return 0
+      try {
+        const res = await apiFetch(
+          `/api/subtitles/online/auto?movieId=${movieId}`
+        )
+        const data = (await res.json()) as {
+          success: boolean
+          content?: string
+          format?: string
+          label?: string
+          language?: string | null
+          message?: string
+        }
+        if (!res.ok || !data.success || !data.content) {
+          console.info(
+            "[useSubtitles] 在线字幕自动匹配未命中:",
+            data.message || res.status
+          )
+          return 0
+        }
+        addParsedTrack(
+          data.content,
+          data.label || "在线字幕",
+          mapOutputFormat(data.format || "srt"),
+          data.label,
+          data.language ?? undefined
+        )
+        console.info("[useSubtitles] 已自动套用在线字幕:", data.label)
+        return 1
+      } catch (err) {
+        console.info("[useSubtitles] 在线字幕自动匹配失败:", err)
+        return 0
+      }
+    },
+    [addParsedTrack, isHost]
+  )
+
   const setFontSize = useCallback(
     (size: number) => applySubtitleStyle({ subtitleFontSize: size }),
     [applySubtitleStyle]
@@ -1275,5 +1410,9 @@ export function useSubtitles({
     setShadowBlur,
     setFontFamily,
     resetSubtitleStyle,
+    searchOnlineSubtitles,
+    listOnlineSubtitleFiles,
+    loadOnlineSubtitle,
+    autoLoadOnlineSubtitle,
   }
 }

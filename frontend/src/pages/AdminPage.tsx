@@ -111,6 +111,8 @@ interface AdminSettings {
   betaFeaturesEnabled: boolean
   dashDisabled: boolean
   playsvideoEnabled: boolean
+  /** 在线字幕（射手网）API Token，空串表示未配置 */
+  assrtToken: string
   cdnAccelerate: boolean
   cdnProxyUrl: string
   dataSourceConfig?: {
@@ -144,6 +146,7 @@ export default function AdminPage() {
     betaFeaturesEnabled: false,
     dashDisabled: false,
     playsvideoEnabled: true,
+  assrtToken: '',
     cdnAccelerate: false,
     cdnProxyUrl: 'https://gh-proxy.com',
   })
@@ -766,6 +769,7 @@ export default function AdminPage() {
         playsvideoEnabled: settings.playsvideoEnabled,
         cdnAccelerate: settings.cdnAccelerate,
         cdnProxyUrl: settings.cdnProxyUrl,
+        assrtToken: settings.assrtToken ?? '',
       }
       if (settings.dataSourceConfig) {
         payload.dataSourceConfig = settings.dataSourceConfig
@@ -1534,6 +1538,31 @@ export default function AdminPage() {
                     等音轨由浏览器端重封装/转码播放（兼容性最佳）。
                     关闭后全部原生直连播放，不兼容的编码将无声或无法播放。
                     影片级开关（添加影片时）需同时开启才会启用。
+                  </p>
+                </div>
+
+                <Title level={5} className="mb-4 mt-6">
+                  在线字幕（射手网 assrt）
+                </Title>
+                <div className="mb-6">
+                  <label className="mb-1.5 block text-sm font-medium text-[var(--md-sys-color-on-surface)]">
+                    API Token
+                  </label>
+                  <Input
+                    type="password"
+                    value={settings.assrtToken ?? ""}
+                    onChange={(e) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        assrtToken: e.target.value,
+                      }))
+                    }
+                    placeholder="留空表示不启用在线字幕保底"
+                  />
+                  <p className="mt-1.5 text-xs text-[var(--md-sys-color-on-surface-variant)]">
+                    在 assrt.net 用户中心获取免费 API Token。填写后，媒体服务器没有内嵌/外挂字幕时，
+                    房主端会按影片标题自动到射手网匹配字幕（也可在播放器「字幕 → 在线字幕」手动搜索）。
+                    Token 仅保存在本机数据库，不会写入版本库。
                   </p>
                 </div>
 
