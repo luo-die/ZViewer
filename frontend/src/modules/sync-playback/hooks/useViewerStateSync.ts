@@ -11,6 +11,7 @@ import type {
 } from '../types'
 import { SOCKET_EVENT } from '../constants'
 import { safePlay } from '../safePlay'
+import { wasUserPaused } from '@/modules/player/services/pause-intent'
 import {
   executeSeek,
   mergeStateDiff,
@@ -469,6 +470,12 @@ export function useViewerHeartbeat({
         }
         lastAppliedIsPlayingRef.current = payload.isPlaying
         suppressEventsRef.current = false
+      } else if (payload.isPlaying && video.paused && !wasUserPaused(video)) {
+        // 房主在播、本地却是暂停态：起播被浏览器自动播放策略拦下，或 play()
+        // 被一次 pause() 打断（AbortError）。此前只在 isPlaying 变化时才补
+        // play，ref 已为 true 就再也不会重试 —— 观众于是永远停在暂停态。
+        // 心跳兜底重试一次。
+        void safePlay(video)
       }
 
       // 进度校正：软同步 + 硬 seek 两阶段策略（P2-Opt#9）

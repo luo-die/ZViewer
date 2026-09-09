@@ -879,6 +879,33 @@ export function WatchTogetherCore({
       ? (subtitles.subtitleTracks[subtitles.secondaryTrackIndex]?.cues ?? [])
       : []
 
+  // 当前影片被删除 / 被清空（currentMovieId → null）时立即停止播放并清空源：
+  // 此前只清空 currentMovieId，媒体元素仍在继续出声（画面停在最后一帧），
+  // 字幕却随影片一起清空了 —— 表现为「影片没了但还在播放、画面卡住、字幕消失」。
+  // 房主删除后后端会广播 current-movie: null，观众端同样命中此 effect。
+  useEffect(() => {
+    if (currentMovieId != null) return
+    const video = videoRef.current
+    if (video && !video.paused) {
+      try {
+        video.pause()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!watchTogether.sourceUrl) return
+    setWatchTogether({
+      ...watchTogether,
+      sourceUrl: '',
+      audioUrl: undefined,
+      isPlaying: false,
+      currentTime: 0,
+      duration: 0,
+    })
+    if (isHost) subtitles.clearTracks()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentMovieId])
+
   // ── 观众申请处理（socket 逻辑与重构前一致）─────────────────
   useEffect(() => {
     if (!socket || !isHost) return
