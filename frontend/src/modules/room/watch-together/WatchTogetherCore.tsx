@@ -134,11 +134,6 @@ export function WatchTogetherCore({
     (state) =>
       state.movies.find((m) => m.id === state.currentMovieId)?.path ?? null
   )
-  // 当前影片标题：在线字幕（射手网）搜索关键词的来源
-  const currentMovieTitle = useRoomStore(
-    (state) =>
-      state.movies.find((m) => m.id === state.currentMovieId)?.title ?? ''
-  )
   const {
     watchTogether,
     setWatchTogether,
@@ -321,19 +316,7 @@ export function WatchTogetherCore({
       embeddedTimer = setTimeout(() => {
         const video = videoRef.current
         const startExtract = (): void => {
-          void (async () => {
-            const loaded = await subtitles.autoLoadEmbeddedTracks({
-              kind,
-              movieId,
-            })
-            if (loaded > 0) return
-            // 保底：媒体服务器既没有内嵌也没有外挂字幕 → 射手网在线匹配
-            await subtitles.autoLoadOnlineSubtitle(
-              movieId,
-              currentMovieTitle,
-              currentMoviePath ?? undefined
-            )
-          })()
+          void subtitles.autoLoadEmbeddedTracks({ kind, movieId })
         }
         // 服务端解容器要顺序读完整集（约 1~2 分钟），会占用服务器到媒体源的
         // 带宽。等首帧真正播起来再提取，避免和起播抢带宽导致卡顿/黑屏；
@@ -1942,15 +1925,6 @@ export function WatchTogetherCore({
               onChangeSubtitleShadowBlur={subtitles.setShadowBlur}
               onChangeSubtitleFontFamily={subtitles.setFontFamily}
         onResetSubtitleStyle={subtitles.resetSubtitleStyle}
-        onSearchOnlineSubtitles={(q) =>
-          subtitles.searchOnlineSubtitles(
-            currentMovieId ?? 0,
-            q,
-            currentMovieTitle
-          )
-        }
-        onListOnlineSubtitleFiles={subtitles.listOnlineSubtitleFiles}
-        onLoadOnlineSubtitle={subtitles.loadOnlineSubtitle}
               onAutoSearchSubtitles={
                 currentMovieId != null && isHost
                   ? () => subtitles.searchAutoSubtitles(currentMovieId)

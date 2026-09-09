@@ -77,13 +77,6 @@ export class SystemSettings {
   @Column({ type: 'text', default: 'https://gh-proxy.com' })
   cdnProxyUrl!: string;
 
-  /**
-   * 射手网（assrt.net）API Token——在线字幕搜索的保底来源。
-   * 仅存于数据库 / 环境变量，**不写入源码或版本库**。
-   */
-  @Column({ type: 'text', nullable: true })
-  assrtToken!: string | null;
-
   @CreateDateColumn()
   createdAt!: Date;
 

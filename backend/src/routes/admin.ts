@@ -457,8 +457,6 @@ router.get(
           cdnAccelerate: settings.cdnAccelerate,
           cdnProxyUrl: settings.cdnProxyUrl,
           playsvideoEnabled: settings.playsvideoEnabled,
-          // 在线字幕（射手网）token：仅管理员可见，用于后台填写
-          assrtToken: settings.assrtToken ?? '',
         },
       });
     } catch (err) {
@@ -476,7 +474,7 @@ router.put(
     res: import('express').Response,
   ): Promise<void> => {
     try {
-      const { autoDeleteInactiveRooms, autoDeleteAfterHours, dataSourceConfig, registrationMode, roomCreationMode, betaFeaturesEnabled, dashDisabled, cdnAccelerate, cdnProxyUrl, playsvideoEnabled, assrtToken } = req.body;
+      const { autoDeleteInactiveRooms, autoDeleteAfterHours, dataSourceConfig, registrationMode, roomCreationMode, betaFeaturesEnabled, dashDisabled, cdnAccelerate, cdnProxyUrl, playsvideoEnabled } = req.body;
 
       if (typeof autoDeleteInactiveRooms !== 'boolean') {
         res.status(400).json({
@@ -557,13 +555,6 @@ router.put(
         });
         return;
       }
-      if (assrtToken !== undefined && assrtToken !== null && typeof assrtToken !== 'string') {
-        res.status(400).json({
-          success: false,
-          message: 'assrtToken 必须是字符串',
-        });
-        return;
-      }
       const settingsRepo = AppDataSource.getRepository(SystemSettings);
       const settings = await getSystemSettings();
       settings.autoDeleteInactiveRooms = autoDeleteInactiveRooms;
@@ -595,13 +586,6 @@ router.put(
       if (cdnProxyUrl !== undefined) {
         settings.cdnProxyUrl = cdnProxyUrl.trim();
       }
-      if (assrtToken !== undefined) {
-        // 在线字幕（射手网）token：允许留空表示未配置；长度上限防御异常输入
-        settings.assrtToken =
-          typeof assrtToken === 'string' && assrtToken.trim()
-            ? assrtToken.trim().slice(0, 200)
-            : null;
-      }
       await settingsRepo.save(settings);
 
       res.json({
@@ -617,7 +601,6 @@ router.put(
           cdnAccelerate: settings.cdnAccelerate,
           cdnProxyUrl: settings.cdnProxyUrl,
           playsvideoEnabled: settings.playsvideoEnabled,
-          assrtToken: settings.assrtToken ?? '',
         },
       });
     } catch (err) {

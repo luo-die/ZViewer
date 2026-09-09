@@ -79,26 +79,6 @@ interface SettingsPanelProps {
   onChangeSubtitleFontFamily?: (fontFamily: string) => void
   /** 恢复默认字号/位置/描边/阴影/字体 */
   onResetSubtitleStyle?: () => void
-  /** 在线字幕（射手网）搜索：返回候选条目 */
-  onSearchOnlineSubtitles?: (
-    query: string
-  ) => Promise<{
-    keyword: string
-    candidates: {
-      id: number
-      title: string
-      language?: string
-      format?: string
-      score?: number
-      uploadTime?: string
-    }[]
-  }>
-  /** 列出某条在线字幕的文件 */
-  onListOnlineSubtitleFiles?: (
-    id: number
-  ) => Promise<{ index: number; name: string; size?: string }[]>
-  /** 下载并加载在线字幕文件 */
-  onLoadOnlineSubtitle?: (id: number, index: number) => Promise<number>
   onAutoSearchSubtitles?: () => Promise<number>
   canAutoSearchSubtitles?: boolean
   canLoadEmbeddedSubtitles?: boolean
@@ -147,9 +127,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onChangeSubtitleShadowBlur,
     onChangeSubtitleFontFamily,
   onResetSubtitleStyle,
-  onSearchOnlineSubtitles,
-  onListOnlineSubtitleFiles,
-  onLoadOnlineSubtitle,
     onAutoSearchSubtitles,
     canAutoSearchSubtitles,
     canLoadEmbeddedSubtitles,
@@ -168,25 +145,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
   const [fontPanelOpen, setFontPanelOpen] = useState(false)
   const [showSubtitleLoader, setShowSubtitleLoader] = useState(false)
   const [subtitleUrlInput, setSubtitleUrlInput] = useState('')
-  // 在线字幕（射手网）：查询 / 候选 / 文件列表
-  const [onlineQuery, setOnlineQuery] = useState('')
-  const [onlineBusy, setOnlineBusy] = useState(false)
-  const [onlineMsg, setOnlineMsg] = useState('')
-  const [onlineCandidates, setOnlineCandidates] = useState<
-    {
-      id: number
-      title: string
-      language?: string
-      format?: string
-      score?: number
-      uploadTime?: string
-    }[]
-  >([])
-  const [onlineFiles, setOnlineFiles] = useState<{
-    id: number
-    files: { index: number; name: string; size?: string }[]
-  } | null>(null)
-  const [showOnline, setShowOnline] = useState(false)
   const [autoSearching, setAutoSearching] = useState(false)
   const [autoSearchMsg, setAutoSearchMsg] = useState('')
   const [embeddedLoading, setEmbeddedLoading] = useState(false)
@@ -215,60 +173,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
     if (!url) return
     onAddSubtitleUrl?.(url)
     setSubtitleUrlInput('')
-  }
-
-  // ── 在线字幕（射手网） ─────────────────────────────────
-  const handleOnlineSearch = async () => {
-    if (onlineBusy || !onSearchOnlineSubtitles) return
-    setOnlineBusy(true)
-    setOnlineMsg("搜索中…")
-    setOnlineFiles(null)
-    try {
-      const result = await onSearchOnlineSubtitles(onlineQuery)
-      setOnlineCandidates(result.candidates)
-      setOnlineMsg(
-        result.candidates.length > 0
-          ? `关键词「${result.keyword}」：找到 ${result.candidates.length} 条`
-          : `关键词「${result.keyword}」：没有找到字幕`
-      )
-    } catch (err) {
-      setOnlineCandidates([])
-      setOnlineMsg(err instanceof Error ? err.message : "搜索失败")
-    } finally {
-      setOnlineBusy(false)
-    }
-  }
-
-  const handleOnlinePick = async (id: number) => {
-    if (onlineBusy || !onListOnlineSubtitleFiles) return
-    if (onlineFiles?.id === id) {
-      setOnlineFiles(null)
-      return
-    }
-    setOnlineBusy(true)
-    try {
-      const files = await onListOnlineSubtitleFiles(id)
-      setOnlineFiles({ id, files })
-      setOnlineMsg(`该条目包含 ${files.length} 个字幕文件`)
-    } catch (err) {
-      setOnlineMsg(err instanceof Error ? err.message : "获取文件列表失败")
-    } finally {
-      setOnlineBusy(false)
-    }
-  }
-
-  const handleOnlineLoad = async (id: number, index: number) => {
-    if (onlineBusy || !onLoadOnlineSubtitle) return
-    setOnlineBusy(true)
-    setOnlineMsg("下载中…")
-    try {
-      await onLoadOnlineSubtitle(id, index)
-      setOnlineMsg("已加载")
-    } catch (err) {
-      setOnlineMsg(err instanceof Error ? err.message : "加载失败")
-    } finally {
-      setOnlineBusy(false)
-    }
   }
 
   const handleSubtitleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -860,126 +764,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     </div>
                   )}
                 </div>
-                )}
-                {/* 在线字幕（射手网 assrt）：媒体服务器没有字幕时的保底来源 */}
-                {isHost && onSearchOnlineSubtitles && (
-                  <div
-                    className="mt-1 border-t pt-1"
-                    style={{
-                      borderColor:
-                        'color-mix(in srgb, var(--md-sys-color-outline) 30%, transparent)',
-                    }}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowOnline((v) => !v)
-                        setShowSubtitleLoader(false)
-                        setBrowserOpen(false)
-                      }}
-                      className="flex w-full items-center justify-between rounded-md px-1 py-0.5 text-xs transition-colors hover:bg-[var(--md-sys-color-surface-container-highest)]"
-                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                    >
-                      <span>在线字幕（射手网）</span>
-                      <ChevronDown
-                        className={cn(
-                          'h-3 w-3 transition-transform',
-                          showOnline && 'rotate-180'
-                        )}
-                      />
-                    </button>
-                    {showOnline && (
-                      <div className="mt-1 space-y-1">
-                        <div className="flex items-center gap-1">
-                          <Input
-                            size="sm"
-                            value={onlineQuery}
-                            onChange={(e) => setOnlineQuery(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault()
-                                void handleOnlineSearch()
-                              }
-                            }}
-                            placeholder="留空则按影片标题搜索"
-                            className="flex-1"
-                          />
-                          <Button
-                            variant="primary"
-                            size="sm"
-                            className="h-7 shrink-0 px-2 text-xs"
-                            disabled={onlineBusy}
-                            onClick={() => void handleOnlineSearch()}
-                          >
-                            搜索
-                          </Button>
-                        </div>
-                        {onlineMsg && (
-                          <div
-                            className="break-words text-[10px]"
-                            style={{
-                              color: 'var(--md-sys-color-on-surface-variant)',
-                            }}
-                          >
-                            {onlineMsg}
-                          </div>
-                        )}
-                        {onlineCandidates.map((c) => (
-                          <div key={c.id}>
-                            <button
-                              type="button"
-                              disabled={onlineBusy}
-                              onClick={() => void handleOnlinePick(c.id)}
-                              className={cn(
-                                'flex w-full flex-col gap-0.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors',
-                                onlineFiles?.id === c.id
-                                  ? 'bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)]'
-                                  : 'text-[var(--md-sys-color-on-surface)] hover:bg-[var(--md-sys-color-surface-container-highest)]'
-                              )}
-                            >
-                              <span className="truncate">{c.title}</span>
-                              <span
-                                className="text-[10px]"
-                                style={{
-                                  color: 'var(--md-sys-color-on-surface-variant)',
-                                }}
-                              >
-                                {[c.language, c.format, c.uploadTime]
-                                  .filter(Boolean)
-                                  .join(' · ')}
-                              </span>
-                            </button>
-                            {onlineFiles?.id === c.id && (
-                              <div className="mt-0.5 ml-2 flex flex-col gap-0.5">
-                                {onlineFiles.files.map((file) => (
-                                  <button
-                                    key={file.index}
-                                    type="button"
-                                    disabled={onlineBusy}
-                                    onClick={() =>
-                                      void handleOnlineLoad(c.id, file.index)
-                                    }
-                                    className="flex items-center justify-between rounded-md px-2 py-1 text-left text-[11px] text-[var(--md-sys-color-on-surface)] transition-colors hover:bg-[var(--md-sys-color-surface-container-highest)]"
-                                  >
-                                    <span className="truncate">{file.name}</span>
-                                    <span
-                                      className="ml-2 shrink-0 text-[10px]"
-                                      style={{
-                                        color:
-                                          'var(--md-sys-color-on-surface-variant)',
-                                      }}
-                                    >
-                                      {file.size ?? ''}
-                                    </span>
-                                  </button>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
                 )}
                 {/* 高级设置入口（字号 / 时间偏移 / 水平位移 / 字体在延伸面板中） */}
                 {(onChangeSubtitleFontSize ||

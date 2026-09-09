@@ -21,8 +21,6 @@ const DEFAULT_SETTINGS: Partial<SystemSettings> = {
   cdnProxyUrl: 'https://gh-proxy.com',
   embeddedSubtitleEnabled: true,
   playsvideoEnabled: true,
-  // 在线字幕（射手网）token：默认空，由管理员在后台填写或环境变量注入
-  assrtToken: null,
 };
 
 /**
