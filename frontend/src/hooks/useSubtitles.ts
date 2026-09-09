@@ -43,6 +43,11 @@ export interface EmbeddedTrackInfo {
   isText?: boolean
   /** Emby/Jellyfin：外挂字幕文件（与视频同目录） */
   isExternal?: boolean
+  /**
+   * 来自「原生 API」的字幕资源（第三方 Emby 兼容服务，如 uhdnow 系）：
+   * 提取时后端会改用原生接口下载字幕文件，而不是 Emby 兼容层的字幕端点。
+   */
+  native?: boolean
 }
 
 /**
@@ -782,11 +787,13 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         }
       }
 
-      // Emby/Jellyfin：后端调用其自带 Subtitles Stream 端点
+      // Emby/Jellyfin：后端调用其自带 Subtitles Stream 端点；
+      // track.native=true 时改用第三方服务的「原生 API」下载字幕文件
       if (source.kind !== 'emby' && source.kind !== 'jellyfin') return 0
+      const nativeFlag = track.native ? '&native=1' : ''
       try {
         const res = await apiFetch(
-          `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}`
+          `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}${nativeFlag}`
         )
         const data = (await res.json()) as {
           success: boolean

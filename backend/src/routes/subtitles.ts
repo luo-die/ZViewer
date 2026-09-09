@@ -58,6 +58,8 @@ import {
 
 // Emby 字幕（直接调用 Emby 自带的字幕接口）
 import { EmbyClient, createEmbyClientFromMount } from '../services/emby-client';
+// 第三方 Emby 兼容服务的原生 API 字幕兜底（其兼容层常常没有字幕端点）
+import { createNativeApiFromMount } from '../services/emby-native';
 
 const router = Router();
 
@@ -788,6 +790,77 @@ async function resolveEmbyContext(movie: Movie): Promise<{
   return { client, itemId: movie.path, userId };
 }
 
+/**
+ * 取影片对应的挂载（原生 API 兜底需要挂载里的 serverUrl 与凭证）。
+ * 与 resolveEmbyContext 的查找方式一致：serverUrl + type。
+ */
+async function findMountForMovie(
+  movie: Movie,
+): Promise<UserMount | null> {
+  if (!movie.serverUrl) return null;
+  const source = (movie.source || '').toLowerCase();
+  if (source !== 'emby' && source !== 'jellyfin') return null;
+  return AppDataSource.getRepository(UserMount).findOneBy({
+    serverUrl: movie.serverUrl,
+    type: source === 'jellyfin' ? 'jellyfin' : 'emby',
+  });
+}
+
+/**
+ * 第三方兼容服务（uhdnow 系）的原生 API 字幕列表。
+ * Emby 兼容层没有字幕端点时，字幕以独立文件形式存在于原生 API 里。
+ * 返回 null 表示该影片不适用/不可用（调用方回退到 Emby 兼容层）。
+ */
+async function listNativeSubtitleTracks(
+  movie: Movie,
+): Promise<Array<{
+  index: number;
+  codecName: string;
+  language: string | null;
+  title: string | null;
+  label: string;
+  isText: boolean;
+  native: true;
+  asset: { url?: string; play_path?: string; download_path?: string };
+}> | null> {
+  try {
+    const mount = await findMountForMovie(movie);
+    if (!mount || !movie.path) return null;
+    const client = createNativeApiFromMount(mount);
+    if (!client) return null;
+    const assets = await client.subtitleAssets(movie.path);
+    if (assets.subtitles.length === 0) return null;
+    return assets.subtitles.map((sub, i) => {
+      const format = (sub.format || '').trim().toLowerCase();
+      const label =
+        sub.name?.trim() ||
+        [sub.language?.trim(), format].filter(Boolean).join(' · ') ||
+        `字幕 ${i + 1}`;
+      return {
+        index: i,
+        codecName: format || 'unknown',
+        language: sub.language ?? null,
+        title: sub.name ?? null,
+        label,
+        // 原生 API 下发的都是独立文本字幕文件
+        isText: true,
+        native: true as const,
+        asset: {
+          url: sub.url,
+          play_path: sub.play_path,
+          download_path: sub.download_path,
+        },
+      };
+    });
+  } catch (err) {
+    console.warn(
+      '[subtitles] 原生 API 字幕列表不可用:',
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+}
+
 /** Emby 字幕 codec → 提取后缀与前端解析格式。
  *  注意：Emby 的 Subtitles Stream 端点按扩展名路由转封装输出，
  *  裸 `/Stream`（无扩展名）会 404——srt 也必须显式带 `.srt` 后缀。 */
@@ -1089,8 +1162,55 @@ router.get(
         });
       }
 
+      // 原生 API 诊断：第三方兼容服务的字幕文件就在这条链路上
+      const nativeProbe = await (async () => {
+        try {
+          const mount = await findMountForMovie(movie);
+          if (!mount || !movie.path) {
+            return { ok: false, message: '该影片没有对应的挂载配置或缺少路径' };
+          }
+          const nativeClient = createNativeApiFromMount(mount);
+          if (!nativeClient) return { ok: false, message: '无法创建原生 API 客户端' };
+          const assets = await nativeClient.subtitleAssets(movie.path);
+          const subtitles = assets.subtitles.map((s) => ({
+            asset_id: s.asset_id,
+            language: s.language,
+            format: s.format,
+            name: s.name,
+            url: s.url,
+            play_path: s.play_path,
+            resolvedUrl: nativeClient.resolveAssetUrl(s, assets.domain),
+          }));
+          let preview: string | null = null;
+          let fetchError: string | null = null;
+          const first = subtitles[0];
+          if (first?.resolvedUrl) {
+            try {
+              preview = (await nativeClient.fetchSubtitleText(first.resolvedUrl)).slice(0, 300);
+            } catch (err) {
+              fetchError = err instanceof Error ? err.message : String(err);
+            }
+          }
+          return {
+            ok: true,
+            domain: assets.domain ?? null,
+            videoCount: assets.videos.length,
+            subtitleCount: subtitles.length,
+            subtitles,
+            preview,
+            fetchError,
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            message: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })();
+
       res.json({
         success: true,
+        native: nativeProbe,
         server: serverInfo
           ? {
               productName: serverInfo.ProductName ?? null,
@@ -1140,11 +1260,51 @@ router.get(
       const source = (movie.source || '').toLowerCase();
 
       if (source === 'emby' || source === 'jellyfin') {
+        // 原生 API 路径：index 为原生字幕数组下标（embedded-tracks 返回 native=true）
+        if (req.query.native === '1') {
+          const mount = await findMountForMovie(movie);
+          const nativeClient = mount ? createNativeApiFromMount(mount) : null;
+          if (!nativeClient || !movie.path) {
+            res.status(400).json({ success: false, message: '该影片缺少原生 API 挂载配置' });
+            return;
+          }
+          const assets = await nativeClient.subtitleAssets(movie.path);
+          const sub = assets.subtitles[streamIndex];
+          if (!sub) {
+            res.status(400).json({ success: false, message: '未找到指定的字幕资源' });
+            return;
+          }
+          const assetUrl = nativeClient.resolveAssetUrl(sub, assets.domain);
+          if (!assetUrl) {
+            res.status(400).json({ success: false, message: '字幕资源没有可用地址' });
+            return;
+          }
+          const nativeContent = await nativeClient.fetchSubtitleText(assetUrl);
+          const rawFormat = (sub.format || '').trim().toLowerCase();
+          const nativeFormat =
+            rawFormat === 'webvtt'
+              ? 'vtt'
+              : rawFormat === 'ass' || rawFormat === 'ssa'
+                ? 'ass'
+                : 'srt';
+          res.json({
+            success: true,
+            content: nativeContent,
+            format: nativeFormat,
+            label:
+              sub.name?.trim() ||
+              sub.language?.trim() ||
+              `字幕 ${streamIndex + 1}`,
+            language: sub.language ?? null,
+          });
+          return;
+        }
+
         const ctx = await resolveEmbyContext(movie);
         // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
-      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
-        subtitleProfile: true,
-      });
+        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+          subtitleProfile: true,
+        });
         const mediaSource = playback.MediaSources[0];
         const subStream = (mediaSource?.MediaStreams ?? []).find(
           (s) => s.Type === 'Subtitle' && s.Index === streamIndex,
