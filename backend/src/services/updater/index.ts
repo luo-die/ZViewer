@@ -124,7 +124,7 @@ function getPlatformAssetName(): string {
  * 因共享 IP/账号触发 GitHub API 速率限制（403 rate limit exceeded）。
  * CDN 代理仅用于 release 文件下载（见 downloadFile）。
  */
-function httpsGetJson<T>(url: string): Promise<T> {
+function httpsGetJsonOnce<T>(url: string, family: 4 | 0): Promise<T> {
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
@@ -134,6 +134,9 @@ function httpsGetJson<T>(url: string): Promise<T> {
           Accept: 'application/vnd.github+json',
         },
         timeout: 30_000,
+        // 显式 IPv4：部分服务器 DNS 优先返回 AAAA 但没有 IPv6 出口，
+        // 会导致检查更新直接 500（ENETUNREACH / fetch failed）
+        ...(family === 4 ? { family: 4 as const } : {}),
       },
       (res) => {
         if (
@@ -143,7 +146,9 @@ function httpsGetJson<T>(url: string): Promise<T> {
           res.headers.location
         ) {
           // 重定向跟随
-          httpsGetJson<T>(res.headers.location).then(resolve).catch(reject);
+          httpsGetJsonOnce<T>(res.headers.location, family)
+            .then(resolve)
+            .catch(reject);
           return;
         }
         if (res.statusCode && res.statusCode >= 400) {
@@ -167,6 +172,24 @@ function httpsGetJson<T>(url: string): Promise<T> {
       reject(new Error('请求超时'));
     });
   });
+}
+
+/**
+ * 检查更新用的 GitHub API 请求：先 IPv4 直连，失败再按系统默认解析重试。
+ *
+ * 某些服务器 DNS 优先返回 AAAA 但没有 IPv6 出口，直连会 ENETUNREACH，
+ * 表现为「检查更新」直接 500。
+ */
+async function httpsGetJson<T>(url: string): Promise<T> {
+  try {
+    return await httpsGetJsonOnce<T>(url, 4);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/ENETUNREACH|EAI_AGAIN|ECONNREFUSED|EHOSTUNREACH|请求超时|fetch failed/i.test(message)) {
+      throw err;
+    }
+    return httpsGetJsonOnce<T>(url, 0);
+  }
 }
 
 /**
@@ -272,7 +295,33 @@ export async function getUpdateInfo(
   const apiUrl = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=10`;
 
   // 获取 releases 列表（包含正式版和预发布版）
-  const releases = await httpsGetJson<GithubRelease[]>(apiUrl);
+  // 直连失败（网络受限）且配置了 CDN 加速时，退一步用代理重试一次；
+  // 仍失败则给出可操作的提示，而不是把裸错误抛成 500。
+  let releases: GithubRelease[] | null = null;
+  try {
+    releases = await httpsGetJson<GithubRelease[]>(apiUrl);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (cdnConfig?.proxyUrl) {
+      try {
+        releases = await httpsGetJson<GithubRelease[]>(
+          applyCdnToUrl(apiUrl, cdnConfig.proxyUrl),
+        );
+      } catch {
+        throw new Error(
+          '无法访问 GitHub（' +
+            message +
+            '）。可在「系统设置」开启 CDN 加速，或检查服务器外网访问。',
+        );
+      }
+    } else {
+      throw new Error(
+        '无法访问 GitHub（' +
+          message +
+          '）。可在「系统设置」开启 CDN 加速，或检查服务器外网访问。',
+      );
+    }
+  }
 
   if (!releases || releases.length === 0) {
     throw new Error('未找到任何发布版本');

@@ -76,6 +76,7 @@ import {
   extractEpisodeNumber,
   extractSeasonNumber,
   buildSearchKeyword,
+  getAssrtToken,
 } from '../services/online-subtitles';
 
 const router = Router();
@@ -1693,6 +1694,42 @@ async function findMovieById(movieId: number): Promise<Movie | null> {
   if (!Number.isFinite(movieId)) return null;
   return AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
 }
+
+/**
+ * 在线字幕连通性自检：token 是否配置 + 能否访问射手网 API。
+ * 便于在服务器网络受限时快速定位（错误信息含 errno）。
+ */
+router.get(
+  '/online/ping',
+  async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+    const started = Date.now();
+    const token = await getAssrtToken();
+    if (!token) {
+      res.json({
+        success: false,
+        tokenConfigured: false,
+        message: '未配置射手网 API Token（后台「基础设置 → 在线字幕」）',
+      });
+      return;
+    }
+    try {
+      const candidates = await searchAssrt('test', { token, limit: 1 });
+      res.json({
+        success: true,
+        tokenConfigured: true,
+        elapsedMs: Date.now() - started,
+        sampleCount: candidates.length,
+      });
+    } catch (err) {
+      res.json({
+        success: false,
+        tokenConfigured: true,
+        elapsedMs: Date.now() - started,
+        message: err instanceof Error ? err.message : '射手网不可达',
+      });
+    }
+  },
+);
 
 /** 搜索在线字幕：q 省略时用影片标题自动构造关键词 */
 router.get(

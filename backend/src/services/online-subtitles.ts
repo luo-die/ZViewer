@@ -7,7 +7,13 @@
  *
  * Token：仅从系统设置（管理员在后台填写）或环境变量 ASSRT_TOKEN 读取，
  * 绝不写入源码 / 版本库。
+ *
+ * 网络层用 node:http(s) 而不是 fetch：可显式指定 family=4，避免「DNS 先返回
+ * AAAA 但服务器没有 IPv6 出口」导致的 fetch failed；且 fetch 的报错没有可
+ * 诊断信息，node:http 能拿到 err.code。
  */
+import http from 'node:http';
+import https from 'node:https';
 import { getSystemSettings } from './system-settings';
 
 const API_BASE = 'https://api.assrt.net/v1';
@@ -19,11 +25,11 @@ const USER_AGENT = 'ZViewer/1.0 (+https://github.com/luo-die/ZViewer)';
 
 export interface AssrtCandidate {
   id: number;
-  /** 字幕标题（native_name） */
+  /** 字幕标题（native_name / m_title） */
   title: string;
   /** 视频名（部分条目提供） */
   videoName?: string;
-  /** 字幕格式（subtype，如 SSA / Subrip(srt)） */
+  /** 字幕格式（如 SSA / Subrip(srt)） */
   format?: string;
   /** 语言描述（如 "简 繁"） */
   language?: string;
@@ -48,6 +54,91 @@ export interface AssrtSubtitleContent {
   name: string;
 }
 
+interface RawResponse {
+  status: number;
+  body: Buffer;
+}
+
+/** 把底层网络错误转成可读信息 */
+function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const code = (err as NodeJS.ErrnoException).code;
+  return code ? code + ' (' + err.message + ')' : err.message;
+}
+
+/** 发起 GET 请求并返回原始字节（支持重定向、可指定 IP 协议族） */
+function rawGet(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+  family: 4 | 0,
+  redirects = 3,
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error('无效的 URL：' + url));
+      return;
+    }
+    const isHttp = parsed.protocol === 'http:';
+    const mod = isHttp ? http : https;
+    const req = mod.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttp ? 80 : 443),
+        path: parsed.pathname + parsed.search,
+        method: 'GET',
+        headers,
+        timeout: timeoutMs,
+        ...(family === 4 ? { family: 4 as const } : {}),
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        const location = res.headers.location;
+        if (status >= 300 && status < 400 && location && redirects > 0) {
+          res.resume();
+          resolve(
+            rawGet(
+              new URL(location, url).toString(),
+              headers,
+              timeoutMs,
+              family,
+              redirects - 1,
+            ),
+          );
+          return;
+        }
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve({ status, body: Buffer.concat(chunks) }));
+        res.on('error', reject);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('请求超时')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** 先按 IPv4 直连，失败再按系统默认解析重试一次 */
+async function requestWithFallback(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<RawResponse> {
+  try {
+    return await rawGet(url, headers, timeoutMs, 4);
+  } catch {
+    try {
+      return await rawGet(url, headers, timeoutMs, 0);
+    } catch (err2) {
+      throw new Error('射手网连接失败：' + describeError(err2));
+    }
+  }
+}
+
 /** 读取 assrt token：系统设置优先，其次环境变量 */
 export async function getAssrtToken(): Promise<string> {
   try {
@@ -60,32 +151,19 @@ export async function getAssrtToken(): Promise<string> {
   return (process.env.ASSRT_TOKEN ?? '').trim();
 }
 
-async function assrtGetOnce(url: string): Promise<unknown> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      throw new Error('射手网请求失败：HTTP ' + res.status);
-    }
-    return (await res.json()) as unknown;
-  } finally {
-    clearTimeout(timer);
+async function assrtGetJson(url: string): Promise<unknown> {
+  const res = await requestWithFallback(
+    url,
+    { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+    REQUEST_TIMEOUT_MS,
+  );
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error('射手网请求失败：HTTP ' + res.status);
   }
-}
-
-/** 带一次重试：射手网偶发超时/抖动 */
-async function assrtGet(url: string): Promise<unknown> {
   try {
-    return await assrtGetOnce(url);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!/abort|timeout|ECONN|fetch failed|HTTP 5/i.test(message)) throw err;
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    return assrtGetOnce(url);
+    return JSON.parse(res.body.toString('utf8')) as unknown;
+  } catch {
+    throw new Error('射手网返回内容不是 JSON');
   }
 }
 
@@ -117,12 +195,11 @@ export async function searchAssrt(
     limit +
     '&token=' +
     encodeURIComponent(token);
-  const sub = unwrap(await assrtGet(url));
+  const sub = unwrap(await assrtGetJson(url));
   const subs = Array.isArray(sub.subs) ? (sub.subs as Record<string, unknown>[]) : [];
   const out: AssrtCandidate[] = [];
   for (const item of subs) {
-    // 射手网同一接口会返回两套字段名（旧版 id/native_name/lang，新版 fileid/m_version/m_lang），
-    // 两套都要兼容。
+    // 射手网同一接口会返回两套字段名（旧版 id/native_name/lang，新版 fileid/m_version/m_lang）
     const id = Number(item.id ?? item.fileid ?? 0);
     const title = String(
       item.native_name ?? item.m_title ?? item.m_version ?? item.videoname ?? item.sub_name ?? '',
@@ -168,7 +245,7 @@ export async function listAssrtFiles(
   const token = options.token ?? (await getAssrtToken());
   if (!token) throw new Error('未配置射手网 API Token');
   const url = API_BASE + '/sub/detail?id=' + id + '&token=' + encodeURIComponent(token);
-  const sub = unwrap(await assrtGet(url));
+  const sub = unwrap(await assrtGetJson(url));
   const subs = Array.isArray(sub.subs) ? (sub.subs as Record<string, unknown>[]) : [];
   const entry = subs[0] ?? {};
   const list = Array.isArray(entry.filelist)
@@ -199,7 +276,7 @@ async function resolveFileUrl(
   token: string,
 ): Promise<{ url: string; name: string }> {
   const url = API_BASE + '/sub/detail?id=' + id + '&token=' + encodeURIComponent(token);
-  const sub = unwrap(await assrtGet(url));
+  const sub = unwrap(await assrtGetJson(url));
   const subs = Array.isArray(sub.subs) ? (sub.subs as Record<string, unknown>[]) : [];
   const list = Array.isArray(subs[0]?.filelist)
     ? (subs[0]!.filelist as Record<string, unknown>[])
@@ -249,29 +326,24 @@ export async function fetchAssrtSubtitle(
         name: options.directName ?? 'subtitle-' + id + '-' + index,
       }
     : await resolveFileUrl(id, index, token);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-  try {
-    const res = await fetch(resolved.url, {
-      headers: {
-        'User-Agent': USER_AGENT,
-        Accept: '*/*',
-        Referer: 'https://assrt.net/',
-      },
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error('字幕文件下载失败：HTTP ' + res.status);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const content = decodeSubtitle(buffer);
-    if (!content.trim()) throw new Error('字幕文件内容为空');
-    return { content, format: formatFromName(resolved.name), name: resolved.name };
-  } finally {
-    clearTimeout(timer);
+  const res = await requestWithFallback(
+    resolved.url,
+    {
+      'User-Agent': USER_AGENT,
+      Accept: '*/*',
+      Referer: 'https://assrt.net/',
+    },
+    DOWNLOAD_TIMEOUT_MS,
+  );
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error('字幕文件下载失败：HTTP ' + res.status);
   }
+  const content = decodeSubtitle(res.body);
+  if (!content.trim()) throw new Error('字幕文件内容为空');
+  return { content, format: formatFromName(resolved.name), name: resolved.name };
 }
 
-/** 从影片标题里提取用于搜索的关键词（去掉扩展名与压制/画质标记） */
+/** 从影片标题里提取用于搜索的关键词（去掉扩展名、集数标记与压制/画质标记） */
 export function buildSearchKeyword(title: string, path?: string | null): string {
   let text = (title || path || '').trim();
   text = text.replace(/\.(mkv|mp4|avi|ts|m2ts|rmvb|flv|wmv|mov)$/i, '');
@@ -297,9 +369,10 @@ export function buildSearchKeyword(title: string, path?: string | null): string 
   );
   text = text.replace(/[._]/g, ' ');
   // 去掉纯 ASCII 的短词尾巴（压制组名等，如 "-Studio"）
-  text = text.replace(/[\s-]+[a-z0-9]{2,12}$/i, (m) => (/[\u4e00-\u9fff]/.test(m) ? m : ' '));
+  text = text.replace(/[\s-]+[a-z0-9]{2,12}$/i, (m) =>
+    /[\u4e00-\u9fff]/.test(m) ? m : ' ',
+  );
   text = text.replace(/\s+/g, ' ').trim();
-  // 去掉首尾标点
   text = text.replace(/^[\s\-–—:：!！?？,，.。、]+/, '').replace(/[\s\-–—:：!！?？,，.。、]+$/, '');
   return text.trim();
 }
