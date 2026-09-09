@@ -77,6 +77,7 @@ import {
   extractSeasonNumber,
   buildSearchKeyword,
   getAssrtToken,
+  probeOutboundHosts,
 } from '../services/online-subtitles';
 
 const router = Router();
@@ -1690,10 +1691,45 @@ function titleSimilarity(query: string, candidate: string): number {
   return hit / grams.size;
 }
 
+/** 是否为网络层错误（服务器出网受限 → 让前端直连射手网） */
+function isNetworkError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /连接失败|请求超时|ENOTFOUND|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|fetch failed|socket hang up/i.test(
+    message,
+  );
+}
+
 async function findMovieById(movieId: number): Promise<Movie | null> {
   if (!Number.isFinite(movieId)) return null;
   return AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
 }
+
+/**
+ * 返回射手网 token（仅登录用户可取）。
+ *
+ * 用途：部分服务器出网受限（连不上 api.assrt.net），但用户浏览器可以直连。
+ * 此时前端拿此 token 直接在浏览器里调用射手网 API（该 API 返回
+ * Access-Control-Allow-Origin: *，允许跨域），服务器不参与网络请求。
+ * 该 token 只用于字幕检索，不含账号权限。
+ */
+router.get(
+  '/online/token',
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    if (!req.user || req.user.role === 'guest') {
+      res.status(403).json({ success: false, message: '需要登录后才能使用在线字幕' });
+      return;
+    }
+    const token = await getAssrtToken();
+    if (!token) {
+      res.status(400).json({
+        success: false,
+        message: '未配置射手网 API Token（后台「基础设置 → 在线字幕」）',
+      });
+      return;
+    }
+    res.json({ success: true, token });
+  },
+);
 
 /**
  * 在线字幕连通性自检：token 是否配置 + 能否访问射手网 API。
@@ -1731,6 +1767,26 @@ router.get(
   },
 );
 
+/** 出网连通性自检：逐个探测候选主机（服务器网络受限时定位用） */
+router.get(
+  '/online/probe',
+  async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const hosts = await probeOutboundHosts();
+      res.json({
+        success: true,
+        proxyConfigured: Boolean((process.env.ASSRT_PROXY ?? '').trim()),
+        hosts,
+      });
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        message: err instanceof Error ? err.message : '探测失败',
+      });
+    }
+  },
+);
+
 /** 搜索在线字幕：q 省略时用影片标题自动构造关键词 */
 router.get(
   "/online/search",
@@ -1748,6 +1804,7 @@ router.get(
     } catch (err) {
       res.status(400).json({
         success: false,
+        clientFallback: isNetworkError(err),
         message: err instanceof Error ? err.message : "在线字幕搜索失败",
       });
     }
@@ -1778,6 +1835,7 @@ router.get(
     } catch (err) {
       res.status(400).json({
         success: false,
+        clientFallback: isNetworkError(err),
         message: err instanceof Error ? err.message : "获取字幕文件列表失败",
       });
     }
@@ -1806,6 +1864,7 @@ router.get(
     } catch (err) {
       res.status(400).json({
         success: false,
+        clientFallback: isNetworkError(err),
         message: err instanceof Error ? err.message : "下载在线字幕失败",
       });
     }
@@ -1893,6 +1952,7 @@ router.get(
     } catch (err) {
       res.status(400).json({
         success: false,
+        clientFallback: isNetworkError(err),
         message: err instanceof Error ? err.message : "在线字幕自动匹配失败",
       });
     }

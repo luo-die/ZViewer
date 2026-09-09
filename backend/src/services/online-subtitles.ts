@@ -66,6 +66,94 @@ function describeError(err: unknown): string {
   return code ? code + ' (' + err.message + ')' : err.message;
 }
 
+/** 可选代理：ASSRT_PROXY（如 http://127.0.0.1:7890），用于服务器直连受限的环境 */
+function getProxyUrl(): URL | null {
+  const raw = (process.env.ASSRT_PROXY ?? '').trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+/** 通过 HTTP 代理建立到目标主机的隧道（https 走 CONNECT，http 直发） */
+function proxyGet(
+  target: URL,
+  proxy: URL,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const targetPort = target.port || (target.protocol === 'http:' ? '80' : '443');
+    const proxyMod = proxy.protocol === 'https:' ? https : http;
+    const connectReq = proxyMod.request({
+      hostname: proxy.hostname,
+      port: proxy.port || (proxy.protocol === 'https:' ? 443 : 80),
+      method: 'CONNECT',
+      path: target.hostname + ':' + targetPort,
+      timeout: timeoutMs,
+      headers: {
+        Host: target.hostname + ':' + targetPort,
+        ...(proxy.username
+          ? {
+              'Proxy-Authorization':
+                'Basic ' +
+                Buffer.from(
+                  decodeURIComponent(proxy.username) +
+                    ':' +
+                    decodeURIComponent(proxy.password),
+                ).toString('base64'),
+            }
+          : {}),
+      },
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error('代理 CONNECT 失败：HTTP ' + res.statusCode));
+        return;
+      }
+      const inner = target.protocol === 'http:' ? http : https;
+      const req = inner.request(
+        {
+          // 已通过 CONNECT 建立隧道：直接复用 socket，不再传 host/port
+          createConnection: () => socket,
+          path: target.pathname + target.search,
+          method: 'GET',
+          headers,
+          timeout: timeoutMs,
+          ...(target.protocol === 'https:' ? { servername: target.hostname } : {}),
+        },
+        (res2) => {
+          const status = res2.statusCode ?? 0;
+          const location = res2.headers.location;
+          if (status >= 300 && status < 400 && location) {
+            res2.resume();
+            socket.destroy();
+            resolve(
+              rawGet(new URL(location, target.toString()).toString(), headers, timeoutMs, 4),
+            );
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res2.on('data', (c: Buffer) => chunks.push(c));
+          res2.on('end', () => resolve({ status, body: Buffer.concat(chunks) }));
+          res2.on('error', reject);
+        },
+      );
+      req.on('timeout', () => req.destroy(new Error('请求超时')));
+      req.on('error', reject);
+      req.end();
+    });
+    connectReq.on('timeout', () => connectReq.destroy(new Error('代理连接超时')));
+    connectReq.on('error', reject);
+    connectReq.end();
+  });
+}
+
 /** 发起 GET 请求并返回原始字节（支持重定向、可指定 IP 协议族） */
 function rawGet(
   url: string,
@@ -128,6 +216,15 @@ async function requestWithFallback(
   headers: Record<string, string>,
   timeoutMs: number,
 ): Promise<RawResponse> {
+  // 配了代理就优先走代理（服务器直连受限时唯一的出路）
+  const proxy = getProxyUrl();
+  if (proxy) {
+    try {
+      return await proxyGet(new URL(url), proxy, headers, timeoutMs);
+    } catch (err) {
+      throw new Error('射手网连接失败（经代理 ' + proxy.host + '）：' + describeError(err));
+    }
+  }
   try {
     return await rawGet(url, headers, timeoutMs, 4);
   } catch {
@@ -137,6 +234,45 @@ async function requestWithFallback(
       throw new Error('射手网连接失败：' + describeError(err2));
     }
   }
+}
+
+/** 出网连通性自检：逐个探测候选主机，报告可达性与耗时 */
+export async function probeOutboundHosts(): Promise<
+  { name: string; url: string; ok: boolean; status?: number; ms: number; error?: string }[]
+> {
+  const targets: { name: string; url: string }[] = [
+    { name: '射手网 API', url: 'https://api.assrt.net/v1/sub/search?q=test&pos=0&cnt=1' },
+    { name: '射手网文件', url: 'https://file1.assrt.net/' },
+    { name: 'GitHub API', url: 'https://api.github.com/' },
+    { name: 'B站 API', url: 'https://api.bilibili.com/x/web-interface/nav' },
+    { name: '百度', url: 'https://www.baidu.com/' },
+    { name: 'SubHD', url: 'https://subhd.cc/' },
+    { name: 'UHD 媒体服务器', url: 'https://v1.uhdnow.com/' },
+  ];
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      const started = Date.now();
+      try {
+        const res = await rawGet(t.url, { 'User-Agent': USER_AGENT }, 6_000, 4);
+        return {
+          name: t.name,
+          url: t.url,
+          ok: res.status > 0 && res.status < 500,
+          status: res.status,
+          ms: Date.now() - started,
+        };
+      } catch (err) {
+        return {
+          name: t.name,
+          url: t.url,
+          ok: false,
+          ms: Date.now() - started,
+          error: describeError(err),
+        };
+      }
+    }),
+  );
+  return results;
 }
 
 /** 读取 assrt token：系统设置优先，其次环境变量 */
