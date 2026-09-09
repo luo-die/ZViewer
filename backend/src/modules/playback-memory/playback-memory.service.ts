@@ -19,6 +19,7 @@
  */
 import { AppDataSource } from '../../data-source';
 import { PlaybackState } from '../../entities/PlaybackState';
+import { Movie } from '../../entities/Movie';
 import type { PlaybackStateDto, SyncStateDto } from '../shared/dto/sync-state.dto';
 import type { QualityOptionDto } from '../shared/dto/sync-state.dto';
 import type { StorageAdapter } from '../../services/storage';
@@ -138,7 +139,44 @@ export class PlaybackMemoryService {
       });
     }
 
-    return this.advanceState(state);
+    const advanced = this.advanceState(state);
+    await this.applyEngineFlagsFromMovie(advanced);
+    return advanced;
+  }
+
+  /**
+   * 用影片记录补全引擎选择相关字段。
+   *
+   * mkvFastPath / playsvideoEnabled 是「影片级」播放引擎开关，权威来源是
+   * Movie 记录（房主广播时也会带上）。但观众初次进房是从这里取初始状态的，
+   * 而这两个字段并不随状态持久化——缺失时前端会按默认值处理
+   * （playsvideoEnabled 视为 true、mkvFastPath 视为 false），从而误走
+   * 浏览器转码管线（MKV+HEVC/FLAC 在该管线里会失败，表现为访客黑屏）。
+   * 因此这里按当前影片补齐。
+   */
+  private async applyEngineFlagsFromMovie(
+    state: PlaybackStateDto,
+  ): Promise<void> {
+    const movieId = state.currentMovieId;
+    if (movieId == null) return;
+    try {
+      const movie = await AppDataSource.getRepository(Movie).findOneBy({
+        id: movieId,
+      });
+      if (!movie) return;
+      state.playsvideoEnabled = movie.playsvideoEnabled !== false;
+      const format = (movie.format ?? "").toLowerCase();
+      const video = (movie.videoCodec ?? "").toLowerCase();
+      const audio = (movie.audioCodec ?? "").toLowerCase();
+      const videoNativeSafe =
+        !video || video.includes("avc") || video.includes("h264");
+      state.mkvFastPath =
+        format === "mkv" &&
+        videoNativeSafe &&
+        ["aac", "mp3", "opus", "vorbis"].includes(audio);
+    } catch {
+      /* 查库失败时保持原样（前端还有影片记录兜底） */
+    }
   }
 
   /**
@@ -331,10 +369,6 @@ export class PlaybackMemoryService {
         previewTitle: state.previewTitle ?? null,
         bufferMode: state.bufferMode ?? false,
         currentMovieId: state.currentMovieId ?? null,
-        // 引擎选择相关字段必须一起落库：观众初次进房从服务器取状态，
-        // 缺这两个字段会被误判为需要转码管线（MKV+FLAC 直接黑屏）
-        mkvFastPath: state.mkvFastPath ?? false,
-        playsvideoEnabled: state.playsvideoEnabled ?? true,
         lastUpdatedAt: state.updatedAt,
         hostSocketId,
       };
@@ -489,8 +523,6 @@ export class PlaybackMemoryService {
       previewTitle: entity.previewTitle ?? undefined,
       bufferMode: entity.bufferMode ?? undefined,
       currentMovieId: entity.currentMovieId ?? undefined,
-      mkvFastPath: entity.mkvFastPath ?? false,
-      playsvideoEnabled: entity.playsvideoEnabled ?? true,
       updatedAt: entity.lastUpdatedAt,
       hostSocketId: entity.hostSocketId,
     };
