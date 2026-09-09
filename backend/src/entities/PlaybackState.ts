@@ -105,6 +105,14 @@ export class PlaybackState {
   @Column({ type: 'int', nullable: true })
   currentMovieId!: number | null;
 
+  /** MKV 快速路径标记（原生友好编码直通播放），随状态一起恢复给观众 */
+  @Column({ type: 'boolean', default: false })
+  mkvFastPath!: boolean;
+
+  /** 影片级浏览器转码引擎开关，随状态一起恢复给观众 */
+  @Column({ type: 'boolean', default: true })
+  playsvideoEnabled!: boolean;
+
   /**
    * 最近一次状态更新的 Unix 时间戳（毫秒）。
    * 服务器基于此字段推算当前实际播放进度。

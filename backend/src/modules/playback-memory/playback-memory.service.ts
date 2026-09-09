@@ -331,6 +331,10 @@ export class PlaybackMemoryService {
         previewTitle: state.previewTitle ?? null,
         bufferMode: state.bufferMode ?? false,
         currentMovieId: state.currentMovieId ?? null,
+        // 引擎选择相关字段必须一起落库：观众初次进房从服务器取状态，
+        // 缺这两个字段会被误判为需要转码管线（MKV+FLAC 直接黑屏）
+        mkvFastPath: state.mkvFastPath ?? false,
+        playsvideoEnabled: state.playsvideoEnabled ?? true,
         lastUpdatedAt: state.updatedAt,
         hostSocketId,
       };
@@ -485,6 +489,8 @@ export class PlaybackMemoryService {
       previewTitle: entity.previewTitle ?? undefined,
       bufferMode: entity.bufferMode ?? undefined,
       currentMovieId: entity.currentMovieId ?? undefined,
+      mkvFastPath: entity.mkvFastPath ?? false,
+      playsvideoEnabled: entity.playsvideoEnabled ?? true,
       updatedAt: entity.lastUpdatedAt,
       hostSocketId: entity.hostSocketId,
     };

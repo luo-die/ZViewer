@@ -871,6 +871,13 @@ export function WatchTogetherCore({
     subtitles.subtitleEnabled && subtitles.activeTrackIndex >= 0
       ? (subtitles.subtitleTracks[subtitles.activeTrackIndex]?.cues ?? [])
       : []
+  // 双语：副字幕轨（与主字幕相同则视为关闭）
+  const activeSecondaryCues =
+    subtitles.subtitleEnabled &&
+    subtitles.secondaryTrackIndex >= 0 &&
+    subtitles.secondaryTrackIndex !== subtitles.activeTrackIndex
+      ? (subtitles.subtitleTracks[subtitles.secondaryTrackIndex]?.cues ?? [])
+      : []
 
   // ── 观众申请处理（socket 逻辑与重构前一致）─────────────────
   useEffect(() => {
@@ -1751,6 +1758,7 @@ export function WatchTogetherCore({
             strokeWidth={subtitles.subtitleStrokeWidth}
             shadowBlur={subtitles.subtitleShadowBlur}
             fontFamily={subtitles.subtitleFontFamily}
+            secondaryCues={activeSecondaryCues}
           />,
           slots.overlayRoot
         )}
@@ -1888,6 +1896,8 @@ export function WatchTogetherCore({
               subtitleEnabled={subtitles.subtitleEnabled}
               subtitleTracks={subtitles.subtitleTracks}
               activeTrackIndex={subtitles.activeTrackIndex}
+        secondaryTrackIndex={subtitles.secondaryTrackIndex}
+        onChangeSecondaryTrack={subtitles.setSecondaryTrack}
               subtitleFontSize={subtitles.subtitleFontSize}
               subtitleOffset={subtitles.subtitleOffset}
               subtitleShiftX={subtitles.subtitleShiftX}

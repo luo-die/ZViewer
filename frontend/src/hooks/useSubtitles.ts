@@ -161,6 +161,8 @@ export interface SubtitleState {
    * 「播的是第二部、字幕却是第一部」的串台，因此广播与本地状态都带上它。
    */
   subtitleMovieId: number | null
+  /** 副字幕轨索引（双语字幕）：-1 表示关闭 */
+  secondaryTrackIndex: number
   subtitleFontSize: number
   /** 字幕时间偏移（秒），正值延迟显示，负值提前显示 */
   subtitleOffset: number
@@ -182,6 +184,8 @@ interface SubtitleBroadcastPayload {
   activeIndex: number
   /** 这批字幕轨属于哪部影片（观众端据此丢弃串台的旧影片字幕） */
   movieId?: number | null
+  /** 副字幕轨索引（双语），-1 关闭 */
+  secondaryIndex?: number
   fontSize: number
   offset: number
   shiftX?: number
@@ -203,6 +207,7 @@ const DEFAULT_SUBTITLE_STATE: SubtitleState = {
   subtitleTracks: [],
   activeTrackIndex: -1,
   subtitleMovieId: null,
+  secondaryTrackIndex: -1,
   subtitleFontSize: 20,
   subtitleOffset: 0,
   subtitleShiftX: 0,
@@ -346,6 +351,7 @@ export function useSubtitles({
         tracks: next.subtitleTracks,
         activeIndex: next.activeTrackIndex,
         movieId: next.subtitleMovieId,
+        secondaryIndex: next.secondaryTrackIndex,
         fontSize: next.subtitleFontSize,
         offset: next.subtitleOffset,
         shiftX: next.subtitleShiftX,
@@ -386,12 +392,40 @@ export function useSubtitles({
       // 观众本地切换轨道：标记偏好，后续房主广播不覆盖此选择
       if (!isHost) viewerPrefTouchedRef.current = true
       setState((prev) => {
-        const next: SubtitleState = { ...prev, activeTrackIndex: index }
+        const next: SubtitleState = {
+          ...prev,
+          activeTrackIndex: index,
+          // 主字幕换成副字幕那条时关闭副字幕，避免同一轨渲染两遍
+          secondaryTrackIndex:
+            prev.secondaryTrackIndex === index ? -1 : prev.secondaryTrackIndex,
+        }
         broadcast(next)
         return next
       })
     },
-    [broadcast]
+    [broadcast, isHost]
+  )
+
+  /**
+   * 设置副字幕轨（双语显示）：-1 关闭。
+   * 与主字幕轨相同时自动关闭（同一轨重复渲染没有意义）。
+   */
+  const setSecondaryTrack = useCallback(
+    (index: number) => {
+      if (!isHost) viewerPrefTouchedRef.current = true
+      setState((prev) => {
+        const next: SubtitleState = {
+          ...prev,
+          secondaryTrackIndex:
+            index >= 0 && index === prev.activeTrackIndex ? -1 : index,
+          // 双语显示需要字幕渲染层处于开启状态
+          subtitleEnabled: index >= 0 ? true : prev.subtitleEnabled,
+        }
+        broadcast(next)
+        return next
+      })
+    },
+    [broadcast, isHost]
   )
 
   /**
@@ -513,6 +547,7 @@ export function useSubtitles({
         activeTrackIndex: -1,
         subtitleOffset: 0,
         subtitleMovieId: null,
+        secondaryTrackIndex: -1,
       }
       broadcast(next)
       return next
@@ -1183,6 +1218,8 @@ export function useSubtitles({
           ? prev.activeTrackIndex
           : payload.activeIndex ?? prev.activeTrackIndex,
         subtitleMovieId: payload.movieId ?? prev.subtitleMovieId,
+        secondaryTrackIndex:
+          payload.secondaryIndex ?? prev.secondaryTrackIndex,
         subtitleFontSize: touched
           ? prev.subtitleFontSize
           : payload.fontSize ?? prev.subtitleFontSize,
@@ -1220,6 +1257,7 @@ export function useSubtitles({
     ...state,
     setEnabled,
     setActiveTrack,
+    setSecondaryTrack,
     addTrackFromUrl,
     addTrackFromFile,
     addTrackFromContent,

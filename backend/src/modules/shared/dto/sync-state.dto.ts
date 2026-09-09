@@ -80,6 +80,17 @@ export interface SyncStateDto {
    * 观众收到此标记后强制走 MP4，避免被迫走服务器 DASH。
    */
   hostCliEnabled?: boolean;
+  /**
+   * MKV 快速路径：编解码原生友好时先尝试 <video> 原生播放。
+   * 必须随状态持久化——否则观众从服务器取初始状态时拿不到该字段，
+   * 会误判为需要浏览器转码管线（MKV+FLAC 等组合会直接失败黑屏）。
+   */
+  mkvFastPath?: boolean;
+  /**
+   * 影片级「浏览器转码引擎」开关（两级开关之一）。
+   * 同样必须随状态持久化：缺省会让观众端误启用转码管线。
+   */
+  playsvideoEnabled?: boolean;
 }
 
 /**

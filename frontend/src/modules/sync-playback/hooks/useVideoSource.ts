@@ -186,6 +186,15 @@ function toPlayerSource(
   startTime?: number,
   blobs?: { videoBlob: Blob; audioBlob: Blob }
 ): PlayerSource {
+  // 引擎选择相关的两个影片级字段可能不在状态里（老版本持久化的播放状态、
+  // 或服务器回放的初始状态）：缺失时回退到当前影片记录，否则会被误判为
+  // 「需要浏览器转码管线」——MKV+FLAC/HEVC 在该管线里会直接失败黑屏。
+  const storeState = useRoomStore.getState()
+  const storeMovie =
+    storeState.currentMovieId != null
+      ? storeState.movies.find((m) => m.id === storeState.currentMovieId)
+      : undefined
+
   const source: PlayerSource = {
     url: state.sourceUrl,
     audioUrl: state.audioUrl,
@@ -195,10 +204,11 @@ function toPlayerSource(
     headers: state.headers,
     // MKV 快速路径：原生友好编码跳过重封装管线直接原生播放
     // （原生失败由 usePlayerSource 自动回退 playsvideo 管线）
-    mkvFastPath: state.mkvFastPath,
+    mkvFastPath: state.mkvFastPath ?? false,
     // 影片级浏览器播放引擎开关（添加影片时设置），与系统级开关一起
     // 在 shouldUsePlaysVideo 中决定是否启用 playsvideo 管线
-    playsvideoEnabled: state.playsvideoEnabled,
+    playsvideoEnabled:
+      state.playsvideoEnabled ?? storeMovie?.playsvideoEnabled,
     // 挂载直链模式：直连失败不回退服务器代理，直接提示错误
     noProxyFallback: state.noProxyFallback,
     // 传入后端权威时长：B站 fMP4 流的 mvhd.duration 为 0，

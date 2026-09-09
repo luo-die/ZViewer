@@ -60,6 +60,9 @@ interface SettingsPanelProps {
   browseMovieId?: number
   onToggleSubtitles?: (enabled: boolean) => void
   onSelectSubtitleTrack?: (index: number) => void
+  /** 副字幕轨索引（双语），-1 关闭 */
+  secondaryTrackIndex?: number
+  onChangeSecondaryTrack?: (index: number) => void
   onAddSubtitleUrl?: (url: string, label?: string) => void
   onAddSubtitleFile?: (file: File) => void
   onAddSubtitleContent?: (
@@ -111,6 +114,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
     browseMovieId,
     onToggleSubtitles,
     onSelectSubtitleTrack,
+  secondaryTrackIndex = -1,
+  onChangeSecondaryTrack,
     onAddSubtitleUrl,
     onAddSubtitleFile,
     onAddSubtitleContent,
@@ -501,6 +506,50 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     )
                   })}
                 </div>
+                {onChangeSecondaryTrack && subtitleTracks.length > 1 && (
+                  <div className="mt-2">
+                    <div
+                      className="mb-1 text-[11px] font-medium uppercase tracking-wide"
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    >
+                      第二字幕（双语）
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      <button
+                        type="button"
+                        onClick={() => onChangeSecondaryTrack(-1)}
+                        className={cn(
+                          'rounded-md border px-2 py-0.5 text-[11px] transition-colors',
+                          secondaryTrackIndex < 0
+                            ? 'bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)] border-transparent'
+                            : 'text-[var(--md-sys-color-on-surface-variant)] hover:bg-[var(--md-sys-color-surface-container-highest)]'
+                        )}
+                        style={{ borderColor: 'var(--md-sys-color-outline)' }}
+                      >
+                        关闭
+                      </button>
+                      {subtitleTracks.map((track, i) =>
+                        i === (activeTrackIndex ?? -1) ? null : (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => onChangeSecondaryTrack(i)}
+                            title={track.label}
+                            className={cn(
+                              'max-w-[140px] truncate rounded-md border px-2 py-0.5 text-[11px] transition-colors',
+                              i === secondaryTrackIndex
+                                ? 'bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)] border-transparent'
+                                : 'text-[var(--md-sys-color-on-surface-variant)] hover:bg-[var(--md-sys-color-surface-container-highest)]'
+                            )}
+                            style={{ borderColor: 'var(--md-sys-color-outline)' }}
+                          >
+                            {track.label}
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             {subtitleEnabled && (
