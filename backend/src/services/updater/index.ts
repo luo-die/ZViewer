@@ -5,8 +5,15 @@ import path from 'path';
 import os from 'os';
 import { getSystemSettings } from '../system-settings';
 
-const REPO_OWNER = 'Zero-wyc';
-const REPO_NAME = 'ZViewer';
+/**
+ * 自动更新的发布源仓库。
+ *
+ * 默认指向本项目自维护的仓库（原上游 Zero-wyc/ZViewer 不再作为更新源）。
+ * 需要指向其他 fork 时可用环境变量覆盖，无需改代码：
+ *   UPDATE_REPO_OWNER=xxx UPDATE_REPO_NAME=yyy
+ */
+const REPO_OWNER = process.env.UPDATE_REPO_OWNER?.trim() || 'luo-die';
+const REPO_NAME = process.env.UPDATE_REPO_NAME?.trim() || 'ZViewer';
 
 /** CDN 加速配置，由调用方从 SystemSettings 读取后传入 */
 interface CdnConfig {
