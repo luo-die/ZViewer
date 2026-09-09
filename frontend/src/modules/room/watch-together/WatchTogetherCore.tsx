@@ -153,7 +153,7 @@ export function WatchTogetherCore({
   })
 
   // 字幕状态：房主操作广播同步，观众监听应用
-  const subtitles = useSubtitles({ roomId, isHost })
+  const subtitles = useSubtitles({ roomId, isHost, currentMovieId })
 
   // 内嵌字幕：源可访问即可（提取已全部前端化，中转/直链均可用）。
   // - server-files：后端本地文件（中转），前端 MKV demux 提取

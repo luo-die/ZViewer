@@ -155,6 +155,12 @@ export interface SubtitleState {
   subtitleEnabled: boolean
   subtitleTracks: SubtitleTrack[]
   activeTrackIndex: number
+  /**
+   * 当前字幕轨所属影片 id。
+   * 切影片时旧影片的后台提取可能才刚完成——不带影片标记就会出现
+   * 「播的是第二部、字幕却是第一部」的串台，因此广播与本地状态都带上它。
+   */
+  subtitleMovieId: number | null
   subtitleFontSize: number
   /** 字幕时间偏移（秒），正值延迟显示，负值提前显示 */
   subtitleOffset: number
@@ -174,6 +180,8 @@ interface SubtitleBroadcastPayload {
   enabled: boolean
   tracks: SubtitleTrack[]
   activeIndex: number
+  /** 这批字幕轨属于哪部影片（观众端据此丢弃串台的旧影片字幕） */
+  movieId?: number | null
   fontSize: number
   offset: number
   shiftX?: number
@@ -186,12 +194,15 @@ interface SubtitleBroadcastPayload {
 export interface UseSubtitlesOptions {
   roomId: string
   isHost: boolean
+  /** 当前播放的影片 id（用于丢弃切换影片后才返回的旧影片字幕） */
+  currentMovieId?: number | null
 }
 
 const DEFAULT_SUBTITLE_STATE: SubtitleState = {
   subtitleEnabled: false,
   subtitleTracks: [],
   activeTrackIndex: -1,
+  subtitleMovieId: null,
   subtitleFontSize: 20,
   subtitleOffset: 0,
   subtitleShiftX: 0,
@@ -278,7 +289,11 @@ function saveStoredSubtitleStyle(state: SubtitleState): void {
  * 保留各格式的位置/对齐/样式信息，由自定义渲染层直接显示。
  * ParsedCue[] 是纯数据，可通过 socket 直接 JSON 序列化同步给观众。
  */
-export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
+export function useSubtitles({
+  roomId,
+  isHost,
+  currentMovieId,
+}: UseSubtitlesOptions) {
   const { socket } = useSocket()
   // 本地保存过的样式只读一次：既用于初始状态，也决定观众是否算「已自定义」
   const storedStyleRef = useRef<Partial<SubtitleState> | null | undefined>(undefined)
@@ -294,6 +309,11 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
   // 房主广播的 subtitle-update 只更新轨道数据，不再覆盖观众的本地选择。
   // 本地存过样式（说明观众之前就调过）同样视为已自定义。
   const viewerPrefTouchedRef = useRef(Boolean(storedStyleRef.current))
+  /** 当前影片 id 镜像：异步提取回来时用它判断是否已经切片 */
+  const currentMovieIdRef = useRef<number | null>(currentMovieId ?? null)
+  useEffect(() => {
+    currentMovieIdRef.current = currentMovieId ?? null
+  }, [currentMovieId])
   /** 最新字幕状态镜像：延迟任务/回调读取，避免闭包陈旧 */
   const stateRef = useRef(state)
   useEffect(() => {
@@ -325,6 +345,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         enabled: next.subtitleEnabled,
         tracks: next.subtitleTracks,
         activeIndex: next.activeTrackIndex,
+        movieId: next.subtitleMovieId,
         fontSize: next.subtitleFontSize,
         offset: next.subtitleOffset,
         shiftX: next.subtitleShiftX,
@@ -491,6 +512,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         subtitleEnabled: false,
         activeTrackIndex: -1,
         subtitleOffset: 0,
+        subtitleMovieId: null,
       }
       broadcast(next)
       return next
@@ -888,6 +910,9 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
           language?: string | null
           message?: string
         }
+        // 捕获提取世代：切影片（clearTracks）会递增，回来时若已切片就丢弃结果，
+        // 否则会出现「播的是第二部、字幕却是第一部」的串台
+        const epoch = embeddedEpochRef.current
         const trackLabel = track.label || embeddedTrackLabel(track)
         // 局部结果与最终结果共用同一套「建轨 / 更新轨」逻辑：
         // 已存在同 label 的轨道时用更多 cues 覆盖（渐进补齐），否则新建并激活
@@ -914,7 +939,11 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
                 label: finalLabel,
                 lang: language ?? track.language ?? undefined,
               }
-              const next: SubtitleState = { ...prev, subtitleTracks: tracks }
+              const next: SubtitleState = {
+                ...prev,
+                subtitleTracks: tracks,
+                subtitleMovieId: currentMovieIdRef.current,
+              }
               if (allowBroadcast) broadcast(next)
               return next
             }
@@ -930,6 +959,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
               ],
               subtitleEnabled: true,
               activeTrackIndex: prev.subtitleTracks.length,
+              subtitleMovieId: currentMovieIdRef.current,
             }
             if (allowBroadcast) broadcast(next)
             return next
@@ -947,6 +977,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         }
         let data: ExtractPayload | null = null
         for (;;) {
+          if (embeddedEpochRef.current !== epoch) return 0
           const res = await apiFetch(extractUrl)
           data = (await res.json()) as ExtractPayload
           if (!data.pending) {
@@ -981,6 +1012,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         if (!data || !data.content) {
           throw new Error('提取内嵌字幕失败')
         }
+        if (embeddedEpochRef.current !== epoch) return 0
         applyTrack(
           data.content,
           data.format || 'srt',
@@ -1017,8 +1049,10 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
   const autoLoadEmbeddedTracks = useCallback(
     async (source: EmbeddedSource): Promise<number> => {
       if (!isHost) return 0
+      const epoch = embeddedEpochRef.current
       try {
         let tracks = await listEmbeddedTracks(source)
+        if (embeddedEpochRef.current !== epoch) return 0
         if (tracks.length === 0) {
           // 探测失败与「确实没有字幕轨」返回值相同（上游限流 / 反代超时常见），
           // 稍等后重试一次再判定，避免误退到浏览器解容器（会打爆上游限流）
@@ -1114,6 +1148,15 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         embeddedAbortRef.current?.abort()
         embeddedAbortRef.current = null
       }
+      // 串台保护：房主切影片后，旧影片的后台提取可能才刚返回并广播，
+      // 此时观众端已在放新影片——不属于当前影片的轨道一律丢弃
+      if (
+        payload.movieId != null &&
+        currentMovieIdRef.current != null &&
+        payload.movieId !== currentMovieIdRef.current
+      ) {
+        return
+      }
       // 观众改过本地偏好（开关/轨道/字号/偏移）后，房主广播只更新轨道
       // 数据；偏好字段保持观众本地选择。未改过则全量跟随房主。
       const touched = viewerPrefTouchedRef.current
@@ -1139,6 +1182,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         activeTrackIndex: touched
           ? prev.activeTrackIndex
           : payload.activeIndex ?? prev.activeTrackIndex,
+        subtitleMovieId: payload.movieId ?? prev.subtitleMovieId,
         subtitleFontSize: touched
           ? prev.subtitleFontSize
           : payload.fontSize ?? prev.subtitleFontSize,
