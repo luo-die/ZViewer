@@ -141,6 +141,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
   const [autoSearchMsg, setAutoSearchMsg] = useState('')
   const [embeddedLoading, setEmbeddedLoading] = useState(false)
   const [embeddedMsg, setEmbeddedMsg] = useState('')
+  /** embeddedMsg 是否为错误（决定文字颜色） */
+  const [embeddedMsgIsError, setEmbeddedMsgIsError] = useState(false)
   const [embeddedTracks, setEmbeddedTracks] = useState<EmbeddedTrackInfo[]>([])
   const [embeddedListLoading, setEmbeddedListLoading] = useState(false)
   const [extractingIndex, setExtractingIndex] = useState<number | null>(null)
@@ -191,12 +193,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
     if (embeddedListLoading || !onListEmbeddedTracks) return
     setEmbeddedListLoading(true)
     setEmbeddedMsg('')
+    setEmbeddedMsgIsError(false)
     try {
       const tracks = await onListEmbeddedTracks()
       setEmbeddedTracks(tracks)
       if (tracks.length === 0) setEmbeddedMsg('未检测到内嵌字幕')
-    } catch {
-      setEmbeddedMsg('检测失败')
+    } catch (err) {
+      setEmbeddedMsgIsError(true)
+      setEmbeddedMsg(err instanceof Error ? err.message : '检测失败')
     } finally {
       setEmbeddedListLoading(false)
     }
@@ -206,12 +210,17 @@ export function SettingsPanel(props: SettingsPanelProps) {
     if (embeddedLoading || !onExtractEmbeddedTrack) return
     setEmbeddedLoading(true)
     setEmbeddedMsg('')
+    setEmbeddedMsgIsError(false)
     setExtractingIndex(track.index)
     try {
       const count = await onExtractEmbeddedTrack(track)
       setEmbeddedMsg(count > 0 ? `已提取「${track.label}」` : '提取失败')
-    } catch {
-      setEmbeddedMsg('提取失败')
+      if (count === 0) setEmbeddedMsgIsError(true)
+    } catch (err) {
+      // 展示后端返回的具体原因（如 Emby 各候选地址的 404 明细），便于定位
+      const msg = err instanceof Error ? err.message : '提取失败'
+      setEmbeddedMsgIsError(true)
+      setEmbeddedMsg(msg.length > 160 ? `${msg.slice(0, 160)}…` : msg)
     } finally {
       setEmbeddedLoading(false)
       setExtractingIndex(null)
@@ -671,13 +680,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
                             )}
                             {embeddedMsg && (
                               <div
-                                className="text-center text-[10px]"
+                                className="break-words text-center text-[10px]"
                                 style={{
-                                  color:
-                                    embeddedMsg === '提取失败' ||
-                                    embeddedMsg === '检测失败'
-                                      ? 'var(--md-sys-color-error)'
-                                      : 'var(--md-sys-color-on-surface-variant)',
+                                  color: embeddedMsgIsError
+                                    ? 'var(--md-sys-color-error)'
+                                    : 'var(--md-sys-color-on-surface-variant)',
                                 }}
                               >
                                 {embeddedMsg}

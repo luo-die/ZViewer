@@ -832,7 +832,9 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
           track.index,
           err
         )
-        return 0
+        // 抛出真实原因（后端会带回已尝试的字幕地址与状态），由调用方展示；
+        // 自动加载路径（autoLoadEmbeddedTracks）内部已捕获，不受影响
+        throw err
       }
     },
     [isHost, broadcast]

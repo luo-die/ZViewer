@@ -867,6 +867,70 @@ router.get(
 );
 
 /**
+ * GET /emby-diagnose?movieId=
+ *
+ * 字幕提取 404 的排查接口（仅 root/admin）：直接返回 Emby PlaybackInfo 的原始
+ * 媒体源信息，重点看每条字幕流的 Index / Codec / IsExternal / DeliveryMethod /
+ * DeliveryUrl —— 这些字段决定 emby-client 该用哪个地址取字幕。
+ */
+router.get(
+  '/emby-diagnose',
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const role = req.user?.role;
+      if (role !== 'root' && role !== 'admin') {
+        res.status(403).json({ success: false, message: '无权限：仅管理员可诊断' });
+        return;
+      }
+      const movieId = Number(req.query.movieId);
+      if (!Number.isFinite(movieId)) {
+        res.status(400).json({ success: false, message: '缺少或无效的 movieId 参数' });
+        return;
+      }
+      const movie = await AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
+      if (!movie) {
+        res.status(400).json({ success: false, message: '影片不存在' });
+        return;
+      }
+      const ctx = await resolveEmbyContext(movie);
+      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId);
+      const sources = playback.MediaSources.map((s) => ({
+        Id: s.Id,
+        Container: s.Container,
+        Path: s.Path,
+        subtitleStreams: (s.MediaStreams ?? [])
+          .filter((m) => m.Type === 'Subtitle')
+          .map((m) => ({
+            Index: m.Index,
+            Codec: m.Codec,
+            Language: m.Language,
+            DisplayTitle: m.DisplayTitle,
+            IsExternal: m.IsExternal,
+            IsDefault: m.IsDefault,
+            IsForced: m.IsForced,
+            IsTextSubtitleStream: m.IsTextSubtitleStream,
+            DeliveryMethod: m.DeliveryMethod,
+            DeliveryUrl: m.DeliveryUrl,
+          })),
+      }));
+      res.json({
+        success: true,
+        source: (movie.source || '').toLowerCase(),
+        itemId: ctx.itemId,
+        userId: ctx.userId,
+        mediaSources: sources,
+      });
+    } catch (err) {
+      console.error('[subtitles] emby-diagnose error:', err);
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : '诊断失败',
+      });
+    }
+  },
+);
+
+/**
  * 提取指定内嵌字幕轨道内容：
  * - emby：调 Emby Subtitles Stream 端点（Emby 自动转封装为 SRT/ASS/VTT）
  * - 其余来源：内嵌字幕提取已前端化（浏览器端 MKV demux），后端不再支持
@@ -900,11 +964,20 @@ router.get(
           return;
         }
         const { ext, format } = mapEmbySubtitleFormat(subStream.Codec || '');
+        // 把整条字幕流的元信息传给客户端层：Emby 的取字幕地址随版本/投递方式变化，
+        // DeliveryUrl / DeliveryMethod 是定位正确地址的关键（404 排查见 emby-client）
         const content = await ctx.client.subtitleContent(
           ctx.itemId,
           mediaSource.Id,
           streamIndex,
           ext,
+          {
+            index: subStream.Index,
+            codec: subStream.Codec,
+            isExternal: subStream.IsExternal,
+            deliveryMethod: subStream.DeliveryMethod,
+            deliveryUrl: subStream.DeliveryUrl,
+          },
         );
         const label = subStream.DisplayTitle || subStream.Language || `轨道 ${streamIndex}`;
         res.json({
