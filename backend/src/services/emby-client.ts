@@ -661,8 +661,11 @@ export class EmbyClient {
       stream,
     };
     // 候选很多（索引 × 格式 × 路径形态），限制上限避免失败路径长时间阻塞；
-    // 排序保证「主索引 × 原格式/vtt/srt」排在最前，正常情况 1-3 次请求内命中
-    const candidates = buildSubtitleCandidates(ctx).slice(0, 30);
+    // 排序保证「主索引 × 原格式/vtt/srt」排在最前，正常情况 1-3 次请求内命中。
+    // 上限压到 10：部分第三方服务（UHD Media Server）对密集请求会 429，
+    // 试完十几种形态仍未命中说明该服务根本没有字幕端点，继续试只会把
+    // 限流额度打满，连播放本身都被拖累。
+    const candidates = buildSubtitleCandidates(ctx).slice(0, 10);
 
     const failures: string[] = [];
     for (const candidate of candidates) {
@@ -727,7 +730,8 @@ export class EmbyClient {
         );
       }
     }
-    for (const candidate of [...buildSubtitleCandidates(ctx), ...extra].slice(0, 60)) {
+    // 诊断端点同样限制请求数：密集探测会触发上游 429，反而污染诊断结论
+    for (const candidate of [...buildSubtitleCandidates(ctx), ...extra].slice(0, 16)) {
       try {
         const text = await this.request<string>({
           path: candidate,

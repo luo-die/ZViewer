@@ -45,6 +45,8 @@ const SPARSE_CONCURRENCY = 2
 const SPARSE_WINDOW = 64 * 1024
 /** 稀疏模式允许的 Cluster 解析失败比例（超过则判整体失败） */
 const SPARSE_MAX_FAIL_RATIO = 0.1
+/** 单次 Range 请求的最大尝试次数（429/5xx 退避重试，避免触发上游限流） */
+const RANGE_MAX_ATTEMPTS = 3
 
 export interface MkvSubtitleTrack {
   /** MKV TrackNumber（前端提取的轨道标识，与后端 ffmpeg stream index 不同） */
@@ -448,26 +450,40 @@ class RangeFetcher {
   }
 
   async fetchRange(start: number, len: number): Promise<Uint8Array> {
-    // 偶发 5xx / 网络抖动重试一次（并发下代理可能瞬时不稳）
+    // 429（媒体服务器限流）/ 5xx（代理抖动）按 Retry-After 或指数退避重试；
+    // 其它 4xx 立刻失败，避免白白消耗上游的请求额度
     let lastErr: unknown
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < RANGE_MAX_ATTEMPTS; attempt++) {
+      let res: Response
       try {
-        const res = await fetch(this.url, {
+        res = await fetch(this.url, {
           headers: {
             ...this.opts.headers,
             Range: `bytes=${start}-${start + len - 1}`,
           },
           signal: this.opts.signal,
         })
-        if (res.status !== 206) {
-          throw new Error(`服务器不支持 Range 请求（HTTP ${res.status}）`)
-        }
-        return new Uint8Array(await res.arrayBuffer())
       } catch (err) {
         if (this.opts.signal?.aborted) throw err
         lastErr = err
-        await new Promise((r) => setTimeout(r, 200))
+        await new Promise((r) => setTimeout(r, 300))
+        continue
       }
+      if (res.status === 206) {
+        return new Uint8Array(await res.arrayBuffer())
+      }
+      const retryable =
+        res.status === 429 || res.status === 408 || res.status >= 500
+      const err = new Error(`服务器不支持 Range 请求（HTTP ${res.status}）`)
+      if (!retryable) throw err
+      lastErr = err
+      if (attempt === RANGE_MAX_ATTEMPTS - 1) break
+      const retryAfter = Number(res.headers.get('retry-after'))
+      const delay =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 800 * 2 ** attempt + Math.random() * 300
+      await new Promise((r) => setTimeout(r, delay))
     }
     throw lastErr
   }

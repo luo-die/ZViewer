@@ -25,6 +25,7 @@ import { Movie } from '../entities/Movie';
 import { UserMount } from '../entities/UserMount';
 import { ServerFolder } from '../entities/ServerFolder';
 import { authenticateToken, type AuthenticatedRequest } from '../middleware/auth';
+import { CONFIG_DIR } from '../services/paths';
 
 // WebDAV 服务（仅用于 webdav 源）
 import {
@@ -896,8 +897,112 @@ async function listServerMkvTracks(
 }
 
 /** 提取结果缓存：同一影片同一轨重复请求直接复用（解容器需读整文件，代价高） */
-const mkvExtractCache = new Map<string, { content: string; format: string; label: string; language: string | null; at: number }>();
+interface MkvCachedSubtitle {
+  content: string;
+  format: string;
+  label: string;
+  language: string | null;
+  at: number;
+}
+const mkvExtractCache = new Map<string, MkvCachedSubtitle>();
 const MKV_CACHE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * 磁盘缓存：服务端解容器要把整个文件顺序读一遍（单集约 1GB），
+ * 因此结果必须跨重启、跨观看者复用——「管理员/房主提取一次，
+ * 之后所有人直接命中缓存」，否则每个观看者都要重跑一遍。
+ */
+const MKV_CACHE_DIR = path.join(CONFIG_DIR, 'subtitle-cache');
+
+/** 缓存文件名带 updatedAt：影片元数据/文件刷新后自动失效 */
+function mkvCachePath(movie: Movie, track: number): string {
+  const version = movie.updatedAt ? new Date(movie.updatedAt).getTime() : 0;
+  return path.join(MKV_CACHE_DIR, `mkv-${movie.id}-${track}-${version}.json`);
+}
+
+function readMkvCacheFromDisk(movie: Movie, track: number): MkvCachedSubtitle | null {
+  try {
+    const raw = fs.readFileSync(mkvCachePath(movie, track), 'utf8');
+    const parsed = JSON.parse(raw) as MkvCachedSubtitle;
+    if (parsed && typeof parsed.content === 'string' && parsed.content.length > 0) {
+      return parsed;
+    }
+  } catch {
+    /* 尚未缓存 / 缓存损坏 → 重新提取 */
+  }
+  return null;
+}
+
+function writeMkvCacheToDisk(movie: Movie, track: number, value: MkvCachedSubtitle): void {
+  try {
+    fs.mkdirSync(MKV_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(mkvCachePath(movie, track), JSON.stringify(value), 'utf8');
+  } catch (err) {
+    console.warn(
+      '[subtitles] 写入字幕缓存失败:',
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/**
+ * 后台提取（fire-and-forget）：解容器要顺序读完整集（约 1~2 分钟），
+ * 同步等待会让反向代理在无数据期间超时（实测 504），也让观看者干等；
+ * 因此改为「请求立即返回 pending → 前端轮询 → 提取结果落盘」。
+ * 同一影片同一轨只会跑一次，多观看者共享。
+ */
+const mkvInflight = new Set<string>();
+/** 最近一次提取失败原因：轮询方立即拿到真实原因，而不是一直等到超时 */
+const mkvFailures = new Map<string, { message: string; at: number }>();
+const MKV_FAILURE_TTL_MS = 2 * 60 * 1000;
+
+function startMkvExtractionInBackground(
+  movie: Movie,
+  track: number,
+  cacheKey: string,
+): boolean {
+  if (mkvInflight.has(cacheKey)) return false;
+  // 同时最多跑 2 个解容器任务：每个都要顺序读完整集，开太多会挤占带宽
+  // 并触发上游限流；超出的请求排队，前端下一次轮询会重新触发
+  if (mkvInflight.size >= 2) return false;
+  mkvInflight.add(cacheKey);
+  mkvFailures.delete(cacheKey);
+  void (async () => {
+    try {
+      const ctx = await resolveEmbyContext(movie);
+      const src = ctx.client.getStaticStreamSource(ctx.itemId);
+      const result = await extractMkvSubtitleTrack(
+        { url: src.url, headers: src.headers, timeoutMs: 900_000 },
+        track,
+      );
+      const label =
+        result.track.name?.trim() ||
+        [result.track.language?.trim(), result.format.toUpperCase()]
+          .filter(Boolean)
+          .join(' · ') ||
+        `轨道 ${track}`;
+      const value: MkvCachedSubtitle = {
+        content: result.content,
+        format: result.format,
+        label,
+        language: result.track.language ?? null,
+        at: Date.now(),
+      };
+      mkvExtractCache.set(cacheKey, value);
+      writeMkvCacheToDisk(movie, track, value);
+      console.info(
+        `[subtitles] 服务端字幕提取完成 movie=${movie.id} track=${track} ${result.format} ${result.content.length} 字节`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '字幕提取失败';
+      console.warn('[subtitles] 服务端字幕提取失败:', message);
+      mkvFailures.set(cacheKey, { message, at: Date.now() });
+    } finally {
+      mkvInflight.delete(cacheKey);
+    }
+  })();
+  return true;
+}
 
 /** Emby 字幕 codec → 提取后缀与前端解析格式。
  *  注意：Emby 的 Subtitles Stream 端点按扩展名路由转封装输出，
@@ -1346,34 +1451,45 @@ router.get(
               format: cached.format,
               label: cached.label,
               language: cached.language,
+              cached: true,
             });
             return;
           }
-          const ctx = await resolveEmbyContext(movie);
-          const src = ctx.client.getStaticStreamSource(ctx.itemId);
-          const result = await extractMkvSubtitleTrack(
-            { url: src.url, headers: src.headers, timeoutMs: 300_000 },
-            streamIndex,
-          );
-          const label =
-            result.track.name?.trim() ||
-            [result.track.language?.trim(), result.format.toUpperCase()]
-              .filter(Boolean)
-              .join(' · ') ||
-            `轨道 ${streamIndex}`;
-          mkvExtractCache.set(cacheKey, {
-            content: result.content,
-            format: result.format,
-            label,
-            language: result.track.language ?? null,
-            at: Date.now(),
-          });
-          res.json({
-            success: true,
-            content: result.content,
-            format: result.format,
-            label,
-            language: result.track.language ?? null,
+          // 磁盘缓存：跨重启 / 跨观看者复用（首次提取后所有人秒开）
+          const fromDisk = readMkvCacheFromDisk(movie, streamIndex);
+          if (fromDisk) {
+            mkvExtractCache.set(cacheKey, fromDisk);
+            res.json({
+              success: true,
+              content: fromDisk.content,
+              format: fromDisk.format,
+              label: fromDisk.label,
+              language: fromDisk.language,
+              cached: true,
+            });
+            return;
+          }
+          // 最近失败过（多为上游 429 限流）：直接返回原因，避免轮询空等
+          const failure = mkvFailures.get(cacheKey);
+          if (failure && Date.now() - failure.at < MKV_FAILURE_TTL_MS) {
+            res.status(400).json({
+              success: false,
+              message: /HTTP 429/.test(failure.message)
+                ? `${failure.message}（媒体服务器限流，稍等 1~2 分钟再试即可）`
+                : failure.message,
+            });
+            return;
+          }
+          // 未命中缓存 → 启动后台提取并立即返回 202，前端轮询等待结果。
+          // 这样长耗时任务不会占住 HTTP 连接（避免反向代理 504），
+          // 且多个观看者共享同一次提取。
+          const started = startMkvExtractionInBackground(movie, streamIndex, cacheKey);
+          res.status(202).json({
+            success: false,
+            pending: true,
+            message: started
+              ? '首次提取内嵌字幕（需读完整集，约 1~2 分钟），完成后自动加载'
+              : '字幕提取正在进行中，稍后自动加载',
           });
           return;
         }
@@ -1474,10 +1590,13 @@ router.get(
       });
     } catch (err) {
       console.error('[subtitles] embedded-extract error:', err);
-      res.status(400).json({
-        success: false,
-        message: err instanceof Error ? err.message : '提取内嵌字幕失败',
-      });
+      const raw = err instanceof Error ? err.message : '提取内嵌字幕失败';
+      // 上游限流（UHD 等第三方服务对密集请求返回 429）：明确提示可稍后重试，
+      // 而不是让用户误以为「没有字幕」
+      const message = /HTTP 429/.test(raw)
+        ? `${raw}（媒体服务器限流，稍等 1~2 分钟再试即可）`
+        : raw;
+      res.status(400).json({ success: false, message });
     }
   },
 );

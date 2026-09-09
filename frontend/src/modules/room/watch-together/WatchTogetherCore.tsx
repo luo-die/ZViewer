@@ -297,10 +297,10 @@ export function WatchTogetherCore({
     // 此前只能手动点「内嵌字幕轨道」逐条提取，导致"播放 Emby 资源无字幕"。
     // 延迟 1.5s：让起播请求先占住连接，避免 PlaybackInfo 探测与首帧竞争。
     //
-    // 回退：媒体服务器的字幕接口在部分服务端取不到（404）——Emby 自家 web
-    // 播放器（libmedia/avplayer）正是**在浏览器里解容器取字幕**，因此接口
-    // 返回 0 轨时改走前端 MKV demux（与 webdav/openlist 同一条链路，
-    // 直接复用播放地址，只要它是可 Range 请求的直推流）。
+    // 顺序：**先服务端解容器，失败才用浏览器解容器**。
+    // 浏览器端解容器（mkv-embedded）会对同一地址发起数百次 Range 请求，
+    // 实测会把媒体服务器的限流额度打满（429 → 连播放本身都被限流），
+    // 所以只在服务端路径不可用（非 MKV / 无文本字幕轨 / 提取失败）时才启用。
     if (
       (currentMovieSourceType === 'emby' ||
         currentMovieSourceType === 'jellyfin') &&
@@ -317,15 +317,20 @@ export function WatchTogetherCore({
           : `/api/jellyfin/stream?movieId=${movieId}&static=1`
       embeddedTimer = setTimeout(() => {
         void (async () => {
-          // 1) 浏览器端解容器：渐进式，首段到达即出字幕（起播体验最好）
-          const browserStarted = await subtitles.loadEmbeddedSubtitles(
+          // 1) 服务端优先：服务端 MKV 解容器 / 第三方原生 API 字幕。
+          //    只发 1~2 个请求，且提取结果落盘缓存——房主（或第一个观看者）
+          //    提取一次后，全体观看者与后续播放直接命中缓存。
+          const serverTracks = await subtitles.autoLoadEmbeddedTracks({
+            kind,
+            movieId,
+          })
+          if (serverTracks > 0) return
+          // 2) 兜底：浏览器端解容器（渐进式，首段到达即出字幕）
+          await subtitles.loadEmbeddedSubtitles(
             currentMoviePath ?? '',
             demuxUrl || sourceUrl,
             () => videoRef.current?.currentTime ?? null
           )
-          if (browserStarted > 0) return
-          // 2) 后端兜底：第三方服务原生 API 的外挂字幕 / 服务端 MKV 解容器
-          await subtitles.autoLoadEmbeddedTracks({ kind, movieId })
         })()
       }, 1500)
     }

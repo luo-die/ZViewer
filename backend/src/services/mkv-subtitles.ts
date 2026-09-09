@@ -39,6 +39,91 @@ const MAX_SUBTITLE_BYTES = 32 * 1024 * 1024; // 单轨字幕文本上限
 // Range 模式下每次抓取的窗口大小：越大 HTTP 往返越少（解容器需遍历整个文件）
 const CHUNK_SIZE = 4 * 1024 * 1024;
 
+/**
+ * 上游（第三方媒体服务器，如 UHD Media Server）对同一来源有请求频率限制：
+ * 密集 / 并发 Range 请求会返回 429「请求过于频繁」。因此这里：
+ *   - 所有上游请求串行排队，两次请求之间保持最小间隔；
+ *   - 429 / 5xx / 网络错误按指数退避重试（尊重 Retry-After）；
+ *   - 整文件提取默认走「单次顺序流」（mode='stream'），只发 1 个请求，
+ *     天然不受限流影响（Range 模式仅在探测文件头时使用）。
+ */
+const UPSTREAM_MIN_INTERVAL_MS = (() => {
+  const raw = Number(process.env.MKV_UPSTREAM_MIN_INTERVAL_MS ?? 120);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 120;
+})();
+const UPSTREAM_MAX_RETRIES = 4;
+const UPSTREAM_BASE_DELAY_MS = 1200;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 上游请求闸门：同一时刻只放行一个请求，并保证两次请求间隔 ≥ 最小间隔。 */
+let upstreamGate: Promise<void> = Promise.resolve();
+let upstreamLastAt = 0;
+
+async function withUpstreamSlot<T>(task: () => Promise<T>): Promise<T> {
+  const prev = upstreamGate;
+  let release!: () => void;
+  upstreamGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prev;
+  try {
+    const wait = upstreamLastAt + UPSTREAM_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    upstreamLastAt = Date.now();
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * 带上限流退避的上游请求。返回 4xx（非 429/408）时原样交给调用方判断；
+ * 429 / 5xx / 网络异常会退避重试，重试用尽后返回最后一次响应（或抛错）。
+ */
+async function fetchUpstream(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= UPSTREAM_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await withUpstreamSlot(() =>
+        fetch(url, { headers, signal: controller.signal }),
+      );
+      const retryable = res.status === 429 || res.status === 408 || res.status >= 500;
+      if (!retryable || attempt === UPSTREAM_MAX_RETRIES) return res;
+      const retryAfter = Number(res.headers.get('retry-after'));
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* ignore */
+      }
+      const delay =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : UPSTREAM_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 400);
+      console.warn(
+        `[mkv-subtitles] 上游 HTTP ${res.status}（限流/异常），${Math.round(delay)}ms 后重试（${attempt + 1}/${UPSTREAM_MAX_RETRIES}）`,
+      );
+      await sleep(delay);
+      continue;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === UPSTREAM_MAX_RETRIES) throw err;
+      await sleep(UPSTREAM_BASE_DELAY_MS * 2 ** attempt);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('MKV 读取失败：上游请求失败');
+}
+
 export interface MkvSubtitleTrackInfo {
   trackNumber: number;
   codecId: string;
@@ -66,6 +151,11 @@ export interface MkvSourceOptions {
   url: string;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  /**
+   * 'range'（默认）：按需 Range 抓取窗口，适合只读文件头的探测；
+   * 'stream'：单次请求顺序读取整个文件（提取字幕用，避免大量 Range 请求触发限流）。
+   */
+  mode?: 'range' | 'stream';
 }
 
 function isTextCodec(codecId: string): boolean {
@@ -86,7 +176,6 @@ class HttpByteReader {
   private bufStart = 0;
   private streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private streamDone = false;
-  private controller = new AbortController();
 
   private constructor(
     readonly rangeSupported: boolean,
@@ -102,28 +191,25 @@ class HttpByteReader {
 
   static async open(opts: MkvSourceOptions): Promise<HttpByteReader> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(opts.url, {
-        headers: { ...(opts.headers ?? {}), Range: 'bytes=0-1' },
-        signal: controller.signal,
-      });
-      const rangeSupported = res.status === 206;
-      if (!res.body) throw new Error(`MKV 读取失败: HTTP ${res.status}`);
-      // 把首个响应的 body 作为初始缓冲（两种模式都用得上）
-      const reader = res.body.getReader();
-      const first = await reader.read();
-      const buf = first.value ? Buffer.from(first.value) : Buffer.alloc(0);
-      const instance = new HttpByteReader(rangeSupported, opts, {
-        buf,
-        streamReader: rangeSupported ? null : reader,
-      });
-      instance.controller = controller;
-      return instance;
-    } finally {
-      clearTimeout(timer);
+    // 顺序模式：不带 Range 的单次请求（整文件顺序读，不会触发上游限流）
+    const sequential = opts.mode === 'stream';
+    const headers = sequential
+      ? { ...(opts.headers ?? {}) }
+      : { ...(opts.headers ?? {}), Range: 'bytes=0-1' };
+    const res = await fetchUpstream(opts.url, headers, timeoutMs);
+    const rangeSupported = !sequential && res.status === 206;
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`MKV 读取失败: HTTP ${res.status}`);
     }
+    if (!res.body) throw new Error(`MKV 读取失败: HTTP ${res.status}`);
+    // 把首个响应的 body 作为初始缓冲（两种模式都用得上）
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    const buf = first.value ? Buffer.from(first.value) : Buffer.alloc(0);
+    return new HttpByteReader(rangeSupported, opts, {
+      buf,
+      streamReader: rangeSupported ? null : reader,
+    });
   }
 
   get bytesRead(): number {
@@ -132,23 +218,18 @@ class HttpByteReader {
 
   private async fetchRange(start: number, length: number): Promise<Buffer> {
     const timeoutMs = this.opts.timeoutMs ?? 30_000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(this.opts.url, {
-        headers: {
-          ...(this.opts.headers ?? {}),
-          Range: `bytes=${start}-${start + length - 1}`,
-        },
-        signal: controller.signal,
-      });
-      if (!res.ok && res.status !== 206) {
-        throw new Error(`MKV 读取失败: HTTP ${res.status}`);
-      }
-      return Buffer.from(await res.arrayBuffer());
-    } finally {
-      clearTimeout(timer);
+    const res = await fetchUpstream(
+      this.opts.url,
+      {
+        ...(this.opts.headers ?? {}),
+        Range: `bytes=${start}-${start + length - 1}`,
+      },
+      timeoutMs,
+    );
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`MKV 读取失败: HTTP ${res.status}`);
     }
+    return Buffer.from(await res.arrayBuffer());
   }
 
   /** 确保 [offset, offset+need) 已在缓冲中 */
@@ -211,29 +292,40 @@ class HttpByteReader {
     return this.buf.subarray(start, start + n);
   }
 
-  /** 前进 n 字节；Range 模式只挪指针（不下载），顺序模式丢弃数据 */
+  /**
+   * 前进 n 字节；Range 模式只挪指针（不下载），顺序模式从流里丢弃。
+   * 顺序模式必须「边读边丢」而不是先缓存到目标位置——否则跳过视频块时
+   * 会把整块视频负载读进内存（大文件下内存与拷贝开销都不可接受）。
+   */
   async skip(n: number): Promise<void> {
     if (n <= 0) return;
     if (this.rangeSupported) {
       this.pos += n;
       return;
     }
-    // 顺序模式：把缓冲区推到目标位置
-    const target = this.pos + n;
-    if (target <= this.bufStart + this.buf.length) {
-      this.pos = target;
-      const drop = this.pos - this.bufStart;
-      this.buf = this.buf.subarray(drop);
-      this.bufStart = this.pos;
-      return;
+    let remaining = n;
+    while (remaining > 0) {
+      if (this.buf.length > 0) {
+        const take = Math.min(remaining, this.buf.length);
+        this.buf = this.buf.subarray(take);
+        this.bufStart += take;
+        this.pos += take;
+        remaining -= take;
+        continue;
+      }
+      if (!this.streamReader || this.streamDone) {
+        this.streamDone = true;
+        break;
+      }
+      const { value, done } = await this.streamReader.read();
+      if (done) {
+        this.streamDone = true;
+        break;
+      }
+      if (value && value.length) this.buf = Buffer.from(value);
     }
-    // 需要继续消费流：丢弃已有缓冲，再读一段
-    this.pos = target;
-    this.buf = Buffer.alloc(0);
-    this.bufStart = target;
-    await this.ensure(target, 1).catch(() => {
-      /* 允许读到末尾 */
-    });
+    // 流提前结束时也把指针推到位（后续读取会命中 EOF 分支）
+    this.pos += remaining;
   }
 
   async close(): Promise<void> {
@@ -294,6 +386,22 @@ function readUint(buf: Buffer): number {
   let v = 0;
   for (const b of buf) v = v * 256 + b;
   return v;
+}
+
+/** 读取 SimpleBlock / Block 负载开头的轨道号（VINT，通常 1 字节）；不足返回 -1 */
+function peekBlockTrack(head: Buffer): number {
+  if (head.length === 0) return -1;
+  const first = head[0]!;
+  let len = 1;
+  if (first & 0x80) len = 1;
+  else if (first & 0x40) len = 2;
+  else if (first & 0x20) len = 3;
+  else if (first & 0x10) len = 4;
+  else return -1;
+  if (head.length < len) return -1;
+  let track = first & (0xff >> len);
+  for (let i = 1; i < len; i++) track = track * 256 + head[i]!;
+  return track;
 }
 
 interface TrackEntry {
@@ -403,6 +511,48 @@ interface RawCue {
   text: string;
 }
 
+/** ASS 时间格式：H:MM:SS.cc */
+function formatAssTime(ms: number): string {
+  const total = Math.max(0, Math.round(ms));
+  const h = Math.floor(total / 3_600_000);
+  const m = Math.floor((total % 3_600_000) / 60_000);
+  const s = Math.floor((total % 60_000) / 1000);
+  const cs = Math.floor((total % 1000) / 10);
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+/**
+ * Matroska 的 ASS 块负载是 9 字段：
+ *   ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+ * （时间戳来自 Block，不在负载里）。直接拼进 [Events] 会字段错位、字幕不显示，
+ * 因此这里重组成标准 10 字段 Dialogue 行——与前端 mkv-embedded 的处理一致。
+ * 少数封装工具写的是完整 ASS 行（带 Dialogue:/Comment: 前缀），原样保留。
+ */
+function toAssDialogueLine(cue: RawCue): string {
+  const raw = cue.text.trimEnd();
+  if (!raw) return '';
+  const prefixed = /^(Dialogue|Comment)\s*:/i.test(raw);
+  const body = raw.replace(/^(Dialogue|Comment)\s*:\s*/i, '');
+  const fields = body.split(',');
+  const end = cue.endMs > cue.startMs ? cue.endMs : cue.startMs + 2000;
+  if (prefixed && fields.length >= 10) return `Dialogue: ${body}`;
+  if (fields.length >= 9) {
+    return `Dialogue: 0,${formatAssTime(cue.startMs)},${formatAssTime(end)},${fields.slice(2).join(',')}`;
+  }
+  return `Dialogue: 0,${formatAssTime(cue.startMs)},${formatAssTime(end)},${body}`;
+}
+
+/** 从 ASS 块负载里取出纯文本（SRT/VTT 用） */
+function assPayloadText(raw: string): string {
+  const text = raw.trimEnd();
+  if (!text) return '';
+  const body = text.replace(/^(Dialogue|Comment)\s*:\s*/i, '');
+  const fields = body.split(',');
+  if (fields.length >= 10) return fields.slice(9).join(','); // 带 Start/End 的完整行
+  if (fields.length >= 9) return fields.slice(8).join(','); // Matroska 9 字段
+  return body;
+}
+
 function formatSrtTime(ms: number): string {
   const total = Math.max(0, Math.round(ms));
   const h = Math.floor(total / 3_600_000);
@@ -417,7 +567,9 @@ export async function extractMkvSubtitleTrack(
   opts: MkvSourceOptions,
   trackNumber: number,
 ): Promise<MkvExtractResult> {
-  const reader = await HttpByteReader.open(opts);
+  // 提取整轨必须遍历全部 Cluster：默认走单次顺序流（1 个请求），
+  // 避免成百上千次 Range 请求把媒体服务器的限流额度打满（429）。
+  const reader = await HttpByteReader.open({ ...opts, mode: opts.mode ?? 'stream' });
   try {
     let timestampScale = 1_000_000;
     let tracks: TrackEntry[] = [];
@@ -496,20 +648,35 @@ export async function extractMkvSubtitleTrack(
           if (sub.id === ID_CLUSTER_TIMESTAMP) {
             clusterTs = readUint(await reader.readExactly(sub.size));
           } else if (sub.id === ID_SIMPLE_BLOCK) {
-            const payload = await reader.readExactly(sub.size);
-            const parsed = parseBlockPayload(payload);
-            if (parsed && parsed.track === trackNumber) {
-              const startMs = (clusterTs + parsed.relative) * (timestampScale / 1_000_000);
-              cues.push({ startMs, endMs: startMs, text: parsed.text });
-              cuesBytes += parsed.text.length;
+            // 先看块头里的轨道号：非目标轨（视频/音频）直接跳过负载，
+            // 否则等于把整个视频文件读进内存（旧实现的性能黑洞）
+            const head = await reader.peek(Math.min(sub.size, 4));
+            if (peekBlockTrack(head) !== trackNumber) {
+              await reader.skip(sub.size);
+            } else {
+              const payload = await reader.readExactly(sub.size);
+              const parsed = parseBlockPayload(payload);
+              if (parsed && parsed.track === trackNumber) {
+                const startMs = (clusterTs + parsed.relative) * (timestampScale / 1_000_000);
+                cues.push({ startMs, endMs: startMs, text: parsed.text });
+                cuesBytes += parsed.text.length;
+              }
             }
           } else if (sub.id === ID_BLOCK_GROUP) {
             let blockPayload: Buffer | null = null;
             let durationTicks = 0;
-            while (reader.position < subEnd) {
+            let skipGroup = false;
+            while (reader.position < subEnd && !skipGroup) {
               const inner = await readElementHeader(reader);
               if (inner.id === ID_BLOCK) {
-                blockPayload = await reader.readExactly(inner.size);
+                const head = await reader.peek(Math.min(inner.size, 4));
+                if (peekBlockTrack(head) !== trackNumber) {
+                  // 非目标轨：整组跳过（连 BlockDuration 也不需要）
+                  skipGroup = true;
+                  await reader.skip(subEnd - reader.position);
+                } else {
+                  blockPayload = await reader.readExactly(inner.size);
+                }
               } else if (inner.id === ID_BLOCK_DURATION) {
                 durationTicks = readUint(await reader.readExactly(inner.size));
               } else {
@@ -546,15 +713,22 @@ export async function extractMkvSubtitleTrack(
 
     let content: string;
     if (format === 'ass') {
-      const header = track.codecPrivate ? track.codecPrivate.toString('utf8') : '[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
-      const body = cues.map((c) => c.text.trimEnd()).filter(Boolean).join('\n');
-      content = `${header.endsWith('\n') ? header : `${header}\n`}${body}\n`;
+      const header = (
+        track.codecPrivate?.toString('utf8') ??
+        '[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1'
+      )
+        .replace(/\r\n/g, '\n')
+        .replace(/\s+$/, '');
+      const body = cues.map(toAssDialogueLine).filter(Boolean).join('\n');
+      // codecPrivate 自带 [Events]（含 Comment 事件）且后面可能还有 [Fonts]/[Graphics] 段，
+      // 因此字幕行必须追加在**新开的** [Events] 段里，否则会被解析器整体跳过
+      content = `${header}\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${body}\n`;
     } else if (format === 'vtt') {
       const lines: string[] = ['WEBVTT', ''];
       cues.forEach((c) => {
         const start = formatSrtTime(c.startMs).replace(',', '.');
         const end = formatSrtTime(c.endMs > c.startMs ? c.endMs : c.startMs + 2000).replace(',', '.');
-        lines.push(`${start} --> ${end}`, c.text.trimEnd(), '');
+        lines.push(`${start} --> ${end}`, assPayloadText(c.text), '');
       });
       content = lines.join('\n');
     } else {
@@ -564,7 +738,7 @@ export async function extractMkvSubtitleTrack(
       ordered.forEach((cue, i) => {
         const next = ordered[i + 1];
         const end = cue.endMs > cue.startMs ? cue.endMs : next ? next.startMs : cue.startMs + 2000;
-        lines.push(String(i + 1), `${formatSrtTime(cue.startMs)} --> ${formatSrtTime(end)}`, cue.text.trimEnd(), '');
+        lines.push(String(i + 1), `${formatSrtTime(cue.startMs)} --> ${formatSrtTime(end)}`, assPayloadText(cue.text), '');
       });
       content = lines.join('\n');
     }

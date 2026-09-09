@@ -797,20 +797,41 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
       // 否则走 Emby 兼容层的 Subtitles Stream 端点
       if (source.kind !== 'emby' && source.kind !== 'jellyfin') return 0
       const sourceFlag = track.mkv ? '&mkv=1' : track.native ? '&native=1' : ''
+      const extractUrl = `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}${sourceFlag}`
       try {
-        const res = await apiFetch(
-          `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}${sourceFlag}`
-        )
-        const data = (await res.json()) as {
+        // 服务端解容器要把整集文件顺序读一遍（首次约 1~2 分钟）：后端先返回
+        // 202 pending 并转入后台提取，这里轮询等待。提取结果同时写入磁盘缓存，
+        // 其他观看者与后续播放直接命中缓存，不再重复解容器。
+        type ExtractPayload = {
           success: boolean
+          pending?: boolean
           content?: string
           format?: string
           label?: string
           language?: string | null
           message?: string
         }
-        if (!res.ok || !data.success || !data.content) {
-          throw new Error(data.message || '提取内嵌字幕失败')
+        const deadline = Date.now() + 10 * 60 * 1000
+        let data: ExtractPayload | null = null
+        for (;;) {
+          const res = await apiFetch(extractUrl)
+          data = (await res.json()) as ExtractPayload
+          if (!data.pending) {
+            if (!res.ok || !data.success || !data.content) {
+              throw new Error(data.message || '提取内嵌字幕失败')
+            }
+            break
+          }
+          if (Date.now() > deadline) {
+            throw new Error(data.message || '字幕提取超时，请稍后重试')
+          }
+          console.info(
+            `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - (deadline - 10 * 60 * 1000)) / 1000)}s）`
+          )
+          await new Promise((resolve) => setTimeout(resolve, 4000))
+        }
+        if (!data || !data.content) {
+          throw new Error('提取内嵌字幕失败')
         }
         const cues = parseSubtitle(
           data.content,
@@ -868,9 +889,21 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
     async (source: EmbeddedSource): Promise<number> => {
       if (!isHost) return 0
       try {
-        const tracks = await listEmbeddedTracks(source)
+        let tracks = await listEmbeddedTracks(source)
+        if (tracks.length === 0) {
+          // 探测失败与「确实没有字幕轨」返回值相同（上游限流 / 反代超时常见），
+          // 稍等后重试一次再判定，避免误退到浏览器解容器（会打爆上游限流）
+          await new Promise((resolve) => setTimeout(resolve, 3000))
+          tracks = await listEmbeddedTracks(source)
+        }
         const pick = pickPreferredEmbeddedTrack(tracks)
         if (!pick) return 0
+        // 服务端解容器要把整集文件顺序读一遍（首次约 1~3 分钟），
+        // 结果会落盘缓存，之后所有观看者与后续播放秒开
+        console.info(
+          '[useSubtitles] 正在服务端提取内嵌字幕（首次可能需要 1~3 分钟，之后走缓存）：',
+          pick.label
+        )
         return await extractEmbeddedTrack(source, pick)
       } catch (err) {
         console.error('[useSubtitles] auto load embedded tracks failed:', err)
