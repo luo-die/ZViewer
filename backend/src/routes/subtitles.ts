@@ -830,7 +830,10 @@ router.get(
 
       if (source === 'emby' || source === 'jellyfin') {
         const ctx = await resolveEmbyContext(movie);
-        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId);
+        // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
+      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+        subtitleProfile: true,
+      });
         const mediaSource = playback.MediaSources[0];
         const subtitleStreams = (mediaSource?.MediaStreams ?? []).filter(
           (s) => s.Type === 'Subtitle',
@@ -893,7 +896,10 @@ router.get(
         return;
       }
       const ctx = await resolveEmbyContext(movie);
-      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId);
+      // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
+      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+        subtitleProfile: true,
+      });
       const sources = playback.MediaSources.map((s) => ({
         Id: s.Id,
         Container: s.Container,
@@ -911,14 +917,49 @@ router.get(
             IsTextSubtitleStream: m.IsTextSubtitleStream,
             DeliveryMethod: m.DeliveryMethod,
             DeliveryUrl: m.DeliveryUrl,
+            IsExternalUrl: m.IsExternalUrl,
           })),
       }));
+
+      // 探测矩阵：把候选字幕地址全试一遍，直接看哪个地址 200
+      const primary = playback.MediaSources[0];
+      const subtitleStreams = (primary?.MediaStreams ?? []).filter(
+        (m) => m.Type === 'Subtitle',
+      );
+      const wantIndex = Number.isFinite(Number(req.query.index))
+        ? Number(req.query.index)
+        : subtitleStreams[0]?.Index;
+      const target = subtitleStreams.find((m) => m.Index === wantIndex) ?? subtitleStreams[0];
+      let probes: unknown[] = [];
+      if (target && primary) {
+        const { ext } = mapEmbySubtitleFormat(target.Codec || '');
+        probes = await ctx.client.probeSubtitleCandidates({
+          itemId: ctx.itemId,
+          mediaSourceId: primary.Id,
+          index: target.Index,
+          ordinal: subtitleStreams.findIndex((m) => m.Index === target.Index),
+          format: ext,
+          subtitleCount: subtitleStreams.length,
+          playSessionId: playback.PlaySessionId,
+          stream: {
+            index: target.Index,
+            codec: target.Codec,
+            isExternal: target.IsExternal,
+            deliveryMethod: target.DeliveryMethod,
+            deliveryUrl: target.DeliveryUrl,
+          },
+        });
+      }
+
       res.json({
         success: true,
         source: (movie.source || '').toLowerCase(),
         itemId: ctx.itemId,
         userId: ctx.userId,
+        playSessionId: playback.PlaySessionId ?? null,
         mediaSources: sources,
+        probeTarget: target?.Index ?? null,
+        probes,
       });
     } catch (err) {
       console.error('[subtitles] emby-diagnose error:', err);
@@ -954,7 +995,10 @@ router.get(
 
       if (source === 'emby' || source === 'jellyfin') {
         const ctx = await resolveEmbyContext(movie);
-        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId);
+        // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
+      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+        subtitleProfile: true,
+      });
         const mediaSource = playback.MediaSources[0];
         const subStream = (mediaSource?.MediaStreams ?? []).find(
           (s) => s.Type === 'Subtitle' && s.Index === streamIndex,
@@ -964,8 +1008,13 @@ router.get(
           return;
         }
         const { ext, format } = mapEmbySubtitleFormat(subStream.Codec || '');
+        // 字幕流的「类型内序号」：部分 Emby 版本按此定位字幕，而非容器全局 Index
+        const subtitleStreams = (mediaSource.MediaStreams ?? []).filter(
+          (s) => s.Type === 'Subtitle',
+        );
+        const ordinal = subtitleStreams.findIndex((s) => s.Index === streamIndex);
         // 把整条字幕流的元信息传给客户端层：Emby 的取字幕地址随版本/投递方式变化，
-        // DeliveryUrl / DeliveryMethod 是定位正确地址的关键（404 排查见 emby-client）
+        // DeliveryUrl / DeliveryMethod / 索引约定都是定位正确地址的关键
         const content = await ctx.client.subtitleContent(
           ctx.itemId,
           mediaSource.Id,
@@ -977,6 +1026,11 @@ router.get(
             isExternal: subStream.IsExternal,
             deliveryMethod: subStream.DeliveryMethod,
             deliveryUrl: subStream.DeliveryUrl,
+          },
+          {
+            ordinal: ordinal >= 0 ? ordinal : undefined,
+            subtitleCount: subtitleStreams.length,
+            playSessionId: playback.PlaySessionId,
           },
         );
         const label = subStream.DisplayTitle || subStream.Language || `轨道 ${streamIndex}`;

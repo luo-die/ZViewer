@@ -52,8 +52,11 @@ export interface EmbyMediaStream {
    * 部分 Emby 版本不返回该字段（undefined），此时按 Codec 判断。
    */
   IsTextSubtitleStream?: boolean;
-  DeliveryMethod?: string; // 'External' | 'Embedded' | 'Hls' ...
+  DeliveryMethod?: string; // 'External' | 'Embedded' | 'Hls' | 'Encode' ...
+  /** 字幕文件地址（服务端下发；相对路径需拼 baseUrl，IsExternalUrl=true 时为绝对地址） */
   DeliveryUrl?: string;
+  /** DeliveryUrl 是否为站外绝对地址（为真时不再拼 baseUrl） */
+  IsExternalUrl?: boolean;
 }
 
 /** Emby 媒体源（MediaSource），含流列表。 */
@@ -82,6 +85,8 @@ export interface EmbyItem {
 
 export interface EmbyPlaybackInfo {
   MediaSources: EmbyMediaSource[];
+  /** 播放会话 ID（部分 Emby 版本的字幕端点要求带上） */
+  PlaySessionId?: string;
 }
 
 export interface EmbyClientOptions {
@@ -123,6 +128,81 @@ export interface EmbySubtitleStreamRef {
   deliveryUrl?: string;
 }
 
+/** 字幕提取上下文：定位字幕流所需的全部信息。 */
+export interface EmbySubtitleContext {
+  itemId: string;
+  mediaSourceId: string;
+  /** MediaStreams 里的 Index（Emby 常见的定位方式） */
+  index: number;
+  /**
+   * 该字幕在「字幕流数组」中的序号（0 基）。
+   * 部分服务端按类型内序号定位字幕，而不是容器全局 Index——两者都试。
+   */
+  ordinal?: number;
+  /** 输出格式（srt/ass/vtt），默认 srt */
+  format?: string;
+  /** 该媒体源的字幕流数量（用于限定索引试探范围） */
+  subtitleCount?: number;
+  /** PlaybackInfo 返回的 PlaySessionId（部分版本字幕端点要求） */
+  playSessionId?: string;
+  /** 字幕流元信息（含 DeliveryUrl 等） */
+  stream?: EmbySubtitleStreamRef;
+}
+
+/**
+ * PlaybackInfo 用的最小 DeviceProfile。
+ *
+ * 关键：**不声明 SubtitleProfiles 时，Emby 不会为字幕流下发 DeliveryMethod /
+ * DeliveryUrl**（实测 delivery=?），客户端就无从取字幕文件。
+ * 开源客户端正是靠这个地址取字幕——jellyfin-web 的 playbackmanager.js：
+ *   getSubtitleUrl(textStream) =>
+ *     textStream.IsExternalUrl ? textStream.DeliveryUrl
+ *                              : apiClient.getUrl(textStream.DeliveryUrl)
+ * 因此这里声明文本字幕走 External，让 Emby 下发字幕文件地址。
+ * DirectPlayProfiles 保持宽松，避免 Emby 因"什么都不支持"改返回转码源
+ * （转码源的 MediaStreams 可能不含字幕轨，会让轨道列表变空）。
+ */
+function buildSubtitleDeviceProfile(): Record<string, unknown> {
+  return {
+    Name: 'ZViewer',
+    MaxStreamingBitrate: 120_000_000,
+    MaxStaticBitrate: 100_000_000,
+    MusicStreamingTranscodingBitrate: 384_000,
+    DirectPlayProfiles: [
+      {
+        Container:
+          'mp4,m4v,mkv,webm,ts,mpegts,m2ts,avi,mov,flv,wmv,mpg,mpeg,ogv,3gp',
+        Type: 'Video',
+      },
+      { Container: 'mp3,aac,m4a,flac,webma,webm,wav,ogg', Type: 'Audio' },
+    ],
+    TranscodingProfiles: [
+      {
+        Container: 'ts',
+        Type: 'Video',
+        VideoCodec: 'h264',
+        AudioCodec: 'aac,mp3,ac3',
+        Protocol: 'hls',
+        Context: 'Streaming',
+        MaxAudioChannels: '2',
+        MinSegments: 2,
+        BreakOnNonKeyFrames: true,
+      },
+    ],
+    SubtitleProfiles: [
+      { Format: 'srt', Method: 'External' },
+      { Format: 'subrip', Method: 'External' },
+      { Format: 'ass', Method: 'External' },
+      { Format: 'ssa', Method: 'External' },
+      { Format: 'vtt', Method: 'External' },
+      { Format: 'webvtt', Method: 'External' },
+      { Format: 'mov_text', Method: 'External' },
+      { Format: 'ttml', Method: 'External' },
+      { Format: 'sub', Method: 'External' },
+    ],
+  };
+}
+
 /** 诊断用：把字幕流元信息压成一行，便于定位 404 原因 */
 function describeSubtitleStream(stream?: EmbySubtitleStreamRef): string {
   if (!stream) return 'stream=?';
@@ -134,6 +214,79 @@ function describeSubtitleStream(stream?: EmbySubtitleStreamRef): string {
   ];
   if (stream.deliveryUrl) parts.push(`deliveryUrl=${stream.deliveryUrl}`);
   return parts.join(' ');
+}
+
+/** 看起来像 HTML 错误页（而非字幕文本）时判为失败 */
+function looksLikeHtml(text: string): boolean {
+  const head = text.trim().slice(0, 200).toLowerCase();
+  return head.startsWith('<!doctype') || head.startsWith('<html') || head.includes('<head>');
+}
+
+/**
+ * 构造候选字幕地址（按命中概率排序，去重）。
+ *
+ * Emby 各版本/各投递方式对「定位字幕流」的约定不一致，已确认的失败形态是
+ * 标准地址（mediaSourceId + 全局 Index + 扩展名）返回 404 且 PlaybackInfo
+ * 未给出 DeliveryUrl/DeliveryMethod，因此把以下差异全部展开：
+ *   - 索引：容器全局 Index ↔ 字幕类型内序号（0 基）
+ *   - 路径：带 mediaSourceId ↔ 用 itemId 兜底 ↔ 省略 mediaSourceId
+ *   - 格式：显式扩展名 ↔ 不带扩展名 ↔ ?format= 查询参数
+ *   - 会话：带 ↔ 不带 PlaySessionId
+ *   - 前缀：/emby 前缀 ↔ 无前缀（serverUrl 本身可能已含 /emby）
+ *   - 投递：HLS 的 subtitles.m3u8
+ */
+export function buildSubtitleCandidates(ctx: EmbySubtitleContext): string[] {
+  const enc = encodeURIComponent;
+  const format = (ctx.format || 'srt').replace(/^\./, '');
+  const item = enc(ctx.itemId);
+  const ms = ctx.mediaSourceId ? enc(ctx.mediaSourceId) : '';
+  const out: string[] = [];
+  const push = (p: string | undefined) => {
+    if (p && !out.includes(p)) out.push(p);
+  };
+
+  // 1) Emby 自报的 DeliveryUrl
+  const delivery = ctx.stream?.deliveryUrl?.trim();
+  if (delivery) {
+    if (/^https?:\/\//i.test(delivery)) push(delivery);
+    else if (delivery.startsWith('/emby/')) push(delivery);
+    else if (delivery.startsWith('/')) push(`/emby${delivery}`);
+    else push(`/emby/${delivery}`);
+  }
+
+  // 2) 索引候选：全局 Index → 类型内序号 → 0/1/2（限定在字幕数附近）
+  const idxSet: number[] = [];
+  const addIdx = (v: number | undefined) => {
+    if (v !== undefined && v >= 0 && !idxSet.includes(v)) idxSet.push(v);
+  };
+  addIdx(ctx.index);
+  addIdx(ctx.ordinal);
+  const maxIdx = Math.max((ctx.subtitleCount ?? 1) + 1, ctx.index + 1, 4);
+  for (let i = 0; i <= maxIdx && i <= 8; i++) addIdx(i);
+
+  // 3) 各索引 × 各路径形态
+  for (const idx of idxSet) {
+    if (ms) push(`/emby/Videos/${item}/${ms}/Subtitles/${idx}/Stream.${format}`);
+    push(`/emby/Videos/${item}/${item}/Subtitles/${idx}/Stream.${format}`);
+    push(`/emby/Videos/${item}/Subtitles/${idx}/Stream.${format}`);
+  }
+  // 4) 主索引的其余形态（无扩展名 / format 查询参数 / 无 /emby 前缀）
+  const primary = ctx.index;
+  if (ms) {
+    push(`/emby/Videos/${item}/${ms}/Subtitles/${primary}/Stream`);
+    push(`/emby/Videos/${item}/${ms}/Subtitles/${primary}/Stream?format=${format}`);
+    push(`/Videos/${item}/${ms}/Subtitles/${primary}/Stream.${format}`);
+  }
+  push(`/Videos/${item}/${item}/Subtitles/${primary}/Stream.${format}`);
+  // 5) PlaySessionId 变体（部分版本要求）
+  if (ctx.playSessionId && ms) {
+    push(
+      `/emby/Videos/${item}/${ms}/Subtitles/${primary}/Stream.${format}?PlaySessionId=${enc(
+        ctx.playSessionId,
+      )}`,
+    );
+  }
+  return out;
 }
 
 export class EmbyError extends Error {
@@ -350,12 +503,35 @@ export class EmbyClient {
    * 播放信息 POST /emby/Items/{itemId}/PlaybackInfo?UserId=
    * 返回媒体源（直连 / 转码 URL 由 Emby 生成）。
    */
-  async playbackInfo(itemId: string, userId: string): Promise<EmbyPlaybackInfo> {
+  async playbackInfo(
+    itemId: string,
+    userId: string,
+    opts?: {
+      /**
+       * 带上声明 SubtitleProfiles 的 DeviceProfile —— Emby 才会为字幕流下发
+       * DeliveryUrl（取字幕文件的地址）。仅字幕相关调用需要，播放解析路径保持原样。
+       */
+      subtitleProfile?: boolean;
+    },
+  ): Promise<EmbyPlaybackInfo> {
     const res = await this.request<EmbyPlaybackInfo>({
       method: 'POST',
       path: `/emby/Items/${encodeURIComponent(itemId)}/PlaybackInfo`,
       query: { UserId: userId, reqformat: 'json' },
-      body: {},
+      body: opts?.subtitleProfile
+        ? {
+            UserId: userId,
+            // 只查询媒体信息，不启动播放会话（jellyfin-web 的 IsPlayback=false 同理）
+            IsPlayback: false,
+            AutoOpenLiveStream: false,
+            EnableDirectPlay: true,
+            EnableDirectStream: true,
+            EnableTranscoding: true,
+            AllowVideoStreamCopy: true,
+            AllowAudioStreamCopy: true,
+            DeviceProfile: buildSubtitleDeviceProfile(),
+          }
+        : {},
     });
     if (!res.MediaSources?.length) {
       throw new EmbyError('Emby 未返回可用媒体源', undefined, 'NO_MEDIA_SOURCE');
@@ -399,34 +575,20 @@ export class EmbyClient {
     index: number,
     ext?: string,
     stream?: EmbySubtitleStreamRef,
+    extra?: { ordinal?: number; subtitleCount?: number; playSessionId?: string },
   ): Promise<string> {
-    const format = (ext || 'srt').replace(/^\./, '');
-    const enc = encodeURIComponent;
-    const candidates: string[] = [];
-    const push = (p: string | undefined) => {
-      if (p && !candidates.includes(p)) candidates.push(p);
+    const ctx: EmbySubtitleContext = {
+      itemId,
+      mediaSourceId,
+      index,
+      ordinal: extra?.ordinal,
+      format: ext,
+      subtitleCount: extra?.subtitleCount,
+      playSessionId: extra?.playSessionId,
+      stream,
     };
-
-    // 1) Emby 自报的 DeliveryUrl
-    const delivery = stream?.deliveryUrl?.trim();
-    if (delivery) {
-      if (/^https?:\/\//i.test(delivery)) push(delivery);
-      else if (delivery.startsWith('/emby/')) push(delivery);
-      else if (delivery.startsWith('/')) push(`/emby${delivery}`);
-      else push(`/emby/${delivery}`);
-    }
-    // 2) 标准三段式
-    if (mediaSourceId) {
-      push(`/emby/Videos/${enc(itemId)}/${enc(mediaSourceId)}/Subtitles/${index}/Stream.${format}`);
-    }
-    // 3) mediaSourceId 用 itemId 兜底
-    push(`/emby/Videos/${enc(itemId)}/${enc(itemId)}/Subtitles/${index}/Stream.${format}`);
-    // 4) 省略 mediaSourceId
-    push(`/emby/Videos/${enc(itemId)}/Subtitles/${index}/Stream.${format}`);
-    // 5) 不带扩展名
-    if (mediaSourceId) {
-      push(`/emby/Videos/${enc(itemId)}/${enc(mediaSourceId)}/Subtitles/${index}/Stream`);
-    }
+    // 候选很多（索引 × 路径形态），限制上限避免失败路径长时间阻塞
+    const candidates = buildSubtitleCandidates(ctx).slice(0, 18);
 
     const failures: string[] = [];
     for (const candidate of candidates) {
@@ -437,8 +599,8 @@ export class EmbyClient {
           responseType: 'text',
           acceptAny: true,
         });
-        if (text && text.trim()) return text;
-        failures.push(`${candidate} → 空响应`);
+        if (text && text.trim() && !looksLikeHtml(text)) return text;
+        failures.push(`${candidate} → ${text && text.trim() ? 'HTML 错误页' : '空响应'}`);
       } catch (err) {
         const status = err instanceof EmbyError ? err.status : undefined;
         failures.push(
@@ -448,15 +610,55 @@ export class EmbyClient {
       }
     }
 
-    // 6) HLS 字幕兜底（DeliveryMethod=Hls 或以上地址全 404）
+    // HLS 字幕兜底（DeliveryMethod=Hls 时只有 subtitles.m3u8 可用）
     const hls = await this.subtitleFromHls(itemId, mediaSourceId, index).catch(() => null);
     if (hls) return hls;
 
     throw new EmbyError(
-      `Emby 未返回字幕内容（${describeSubtitleStream(stream)}）已尝试: ${failures.join(' | ')}`,
+      `Emby 未返回字幕内容（${describeSubtitleStream(stream)} ms=${mediaSourceId || '-'} ordinal=${
+        extra?.ordinal ?? '-'
+      }）已尝试: ${failures.join(' | ')}`,
       undefined,
       'SUBTITLE_UNAVAILABLE',
     );
+  }
+
+  /**
+   * 逐个探测候选字幕地址并返回每个地址的状态与响应预览（诊断用，不抛错）。
+   * 用于 /api/subtitles/emby-diagnose 一次性定位该 Emby 实例真正可用的字幕地址。
+   */
+  async probeSubtitleCandidates(
+    ctx: EmbySubtitleContext,
+  ): Promise<Array<{ url: string; status: number | 'error'; contentType?: string; preview?: string }>> {
+    const results: Array<{
+      url: string;
+      status: number | 'error';
+      contentType?: string;
+      preview?: string;
+    }> = [];
+    for (const candidate of buildSubtitleCandidates(ctx).slice(0, 40)) {
+      try {
+        const text = await this.request<string>({
+          path: candidate,
+          authHeader: true,
+          responseType: 'text',
+          acceptAny: true,
+        });
+        results.push({
+          url: candidate,
+          status: 200,
+          preview: (text || '').slice(0, 120).replace(/\s+/g, ' '),
+        });
+      } catch (err) {
+        const status = err instanceof EmbyError ? err.status : 'error';
+        results.push({
+          url: candidate,
+          status: status ?? 'error',
+          preview: err instanceof Error ? err.message.slice(0, 80) : undefined,
+        });
+      }
+    }
+    return results;
   }
 
   /**
