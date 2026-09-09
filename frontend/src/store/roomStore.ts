@@ -237,6 +237,12 @@ interface RoomState {
    */
   pendingViewerSourceReload: number
   /**
+   * 本机待处理的源重载计数器（由播放列表「浏览器转码引擎」开关触发，
+   * WatchTogetherCore 消费）。只影响本机：切换后按新的引擎选择重新 attach，
+   * 不广播、不写库。
+   */
+  pendingEngineReload: number
+  /**
    * MSE 流重新加载（seek 到未缓冲区域）状态。
    * - isReloading=true 期间进度条显示 reloadTargetTime 而非 video.currentTime（避免归零）
    * - 同时在播放器上展示加载动画
@@ -313,6 +319,12 @@ interface RoomState {
   triggerReloadBilibili: () => void
   /** 触发观众端重新 attach 当前源（计数器递增） */
   triggerViewerSourceReload: () => void
+  /**
+   * 触发本机重新 attach 当前源（计数器递增）。
+   * 用于只影响本机、不需要同步给其他人的播放偏好变更
+   * （如播放列表的「浏览器转码引擎」开关）——房主与观众都消费该信号。
+   */
+  triggerEngineReload: () => void
   reset: () => void
   // REST API
   fetchMovies: (roomId: string) => Promise<void>
@@ -406,6 +418,7 @@ const defaultState = {
   pendingPreviewPlay: null,
   pendingReloadBilibili: 0,
   pendingViewerSourceReload: 0,
+  pendingEngineReload: 0,
   isReloading: false,
   reloadTargetTime: null,
   bufferProgress: null as {
@@ -514,6 +527,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   triggerViewerSourceReload: () =>
     set((state) => ({
       pendingViewerSourceReload: state.pendingViewerSourceReload + 1,
+    })),
+  triggerEngineReload: () =>
+    set((state) => ({
+      pendingEngineReload: state.pendingEngineReload + 1,
     })),
   setReloadingState: (isReloading, targetTime) =>
     set({ isReloading, reloadTargetTime: targetTime }),

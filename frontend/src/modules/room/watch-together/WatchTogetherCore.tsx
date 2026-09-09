@@ -115,6 +115,8 @@ export function WatchTogetherCore({
     (state) => state.viewerCliResolvedSource
   )
   const currentMovieId = useRoomStore((state) => state.currentMovieId)
+  /** 本机引擎偏好变更信号（播放列表「浏览器转码引擎」开关） */
+  const pendingEngineReload = useRoomStore((s) => s.pendingEngineReload)
   // 当前影片的 directLink 标记，用于统计信息中显示"直链/服务器中转"
   // mp4 直链视频（sourceType='mp4'）实际走浏览器直连源服务器（resolveProxyUrl 返回原 URL），
   // 应显示为"直链"；挂载源（webdav/openlist 等）根据 directLink 字段判断。
@@ -1506,6 +1508,16 @@ export function WatchTogetherCore({
     if (!videoRef.current) return
     void reloadVideo(videoRef.current)
   }, [isHost, watchTogether.sourceType, reloadBilibili, reloadVideo, videoRef])
+
+  // 本机引擎偏好变更（播放列表的「浏览器转码引擎」开关）：
+  // 重新 attach 当前源，让新的引擎选择立刻生效（如 MKV 从原生直连切到
+  // 重封装管线，或反过来）。仅本机行为，不广播、不写库。
+  useEffect(() => {
+    if (pendingEngineReload === 0) return
+    const video = videoRef.current
+    if (!video) return
+    void reloadVideo(video)
+  }, [pendingEngineReload, reloadVideo, videoRef])
 
   // ── 面板外点击 / ESC 关闭 ──────────────────────────────
   const settingsAnchorRef = useRef<HTMLDivElement | null>(null)

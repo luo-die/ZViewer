@@ -35,6 +35,15 @@ export {
 } from './engines/playsvideo-engine'
 export { selectEngine, shouldUsePlaysVideo } from './engine-selector'
 
+// 浏览器转码引擎本机偏好（播放列表开关；仅本机生效，不同步）
+export {
+  getPlaysvideoLocalOverride,
+  setPlaysvideoLocalOverride,
+  usePlaysvideoLocalOverride,
+  resolvePlaysvideoEnabled,
+} from './playsvideo-preference'
+export type { PlaysvideoLocalOverride } from './playsvideo-preference'
+
 // 工具函数
 export { resetVideoElement, waitForMetadata } from './utils'
 

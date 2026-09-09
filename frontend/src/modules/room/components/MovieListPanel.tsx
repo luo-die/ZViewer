@@ -1,5 +1,13 @@
 import { useState, useMemo, useEffect } from 'react'
-import { Play, Trash2, Film, Monitor, ListVideo, Maximize } from 'lucide-react'
+import {
+  Play,
+  Trash2,
+  Film,
+  Monitor,
+  ListVideo,
+  Maximize,
+  Cpu,
+} from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Text, Paragraph } from '@/components/ui/Typography'
@@ -9,6 +17,11 @@ import { Modal } from '@/components/ui/Modal'
 import { message } from '@/components/ui/message'
 import { useSocket } from '@/hooks/useSocket'
 import { useRoomStore, type Movie } from '@/store/roomStore'
+import { useSystemSettingsStore } from '@/store/systemSettingsStore'
+import {
+  usePlaysvideoLocalOverride,
+  setPlaysvideoLocalOverride,
+} from '@/modules/player/playsvideo-preference'
 import {
   resolveBilibiliWithOptions,
   filterQualitiesByVip,
@@ -82,6 +95,7 @@ export function MovieListPanel({
   const triggerViewerSourceReload = useRoomStore(
     (state) => state.triggerViewerSourceReload
   )
+  const triggerEngineReload = useRoomStore((state) => state.triggerEngineReload)
   const viewerCliResolvedSource = useRoomStore(
     (state) => state.viewerCliResolvedSource
   )
@@ -92,6 +106,31 @@ export function MovieListPanel({
   const [pageLoadingId, setPageLoadingId] = useState<number | null>(null)
   const [bilibiliVip, setBilibiliVip] = useState(false)
   const isScreenShare = mode === 'screen-share'
+
+  // 浏览器转码引擎（playsvideo）：本机偏好，只存 localStorage，
+  // 面向所有观看者开放（不区分房主/房管/观众），切换后不影响其他人。
+  const playsvideoOverride = usePlaysvideoLocalOverride()
+  const systemPlaysvideoEnabled = useSystemSettingsStore(
+    (state) => state.playsvideoEnabled !== false
+  )
+  const currentMovie = movies.find((m) => m.id === currentMovieId)
+  // 开关展示「当前生效状态」：本机偏好优先，未设置时跟随当前影片的影片级开关
+  const engineEnabled =
+    playsvideoOverride !== null
+      ? playsvideoOverride === 'on'
+      : currentMovie?.playsvideoEnabled !== false
+
+  const handleToggleEngine = () => {
+    const next: 'on' | 'off' = engineEnabled ? 'off' : 'on'
+    setPlaysvideoLocalOverride(next)
+    // 正在播放的影片立即按新选择重新 attach（仅本机，不同步）
+    if (currentMovieId != null) triggerEngineReload()
+    message.success(
+      next === 'on'
+        ? '已启用浏览器转码引擎（仅本机生效）'
+        : '已关闭浏览器转码引擎（仅本机，强制原生直连）'
+    )
+  }
 
   // 弹窗显示完整影片列表
   const [showListModal, setShowListModal] = useState(false)
@@ -342,6 +381,75 @@ export function MovieListPanel({
           <Paragraph type="secondary" className="m-0 text-xs">
             当前为远程共享模式，影片播放已暂停
           </Paragraph>
+        </div>
+      )}
+
+      {/* 浏览器转码引擎开关：面向所有观看者，本机生效、不同步。
+          远程共享模式下播放的是 WebRTC 画面流，引擎不参与，隐藏。 */}
+      {!isScreenShare && (
+        <div
+          className="flex items-center justify-between gap-2 rounded-[var(--md-sys-shape-corner)] px-2.5 py-2"
+          style={{
+            backgroundColor:
+              'color-mix(in srgb, var(--md-sys-color-surface-container-high) calc(var(--glass-strength) * 100%), transparent)',
+          }}
+        >
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <Cpu
+                className="h-3.5 w-3.5 shrink-0"
+                style={{ color: 'var(--md-sys-color-primary)' }}
+              />
+              <Text className="text-xs font-medium">浏览器转码引擎</Text>
+              <span
+                className="shrink-0 rounded px-1 py-px text-[10px] font-medium"
+                style={{
+                  backgroundColor:
+                    'color-mix(in srgb, var(--md-sys-color-primary) 16%, transparent)',
+                  color: 'var(--md-sys-color-primary)',
+                }}
+                title="只影响本机，不会同步给房间内其他人"
+              >
+                仅本机
+              </span>
+            </div>
+            <Text
+              type="secondary"
+              className="mt-0.5 block text-[10px] leading-snug"
+            >
+              {systemPlaysvideoEnabled
+                ? '开启：MKV/DTS 等非常规格式由浏览器端重封装/转码播放。关闭：强制原生直连，不兼容编码将无声。'
+                : '管理后台已全局关闭该引擎，此处开关无效。'}
+            </Text>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={engineEnabled}
+            aria-label="浏览器转码引擎"
+            disabled={!systemPlaysvideoEnabled}
+            onClick={handleToggleEngine}
+            title={
+              '浏览器转码引擎：' +
+              (engineEnabled ? '已开启' : '已关闭') +
+              '（仅本机生效，不同步给其他人）'
+            }
+            className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            style={{
+              backgroundColor: engineEnabled
+                ? 'var(--md-sys-color-primary)'
+                : 'var(--md-sys-color-outline)',
+            }}
+          >
+            <span
+              className="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
+              style={{
+                transform: engineEnabled
+                  ? 'translateX(18px)'
+                  : 'translateX(2px)',
+              }}
+            />
+          </button>
         </div>
       )}
 
