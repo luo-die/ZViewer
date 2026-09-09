@@ -241,11 +241,14 @@ export async function probeOutboundHosts(): Promise<
   { name: string; url: string; ok: boolean; status?: number; ms: number; error?: string }[]
 > {
   const targets: { name: string; url: string }[] = [
-    { name: '射手网 API', url: 'https://api.assrt.net/v1/sub/search?q=test&pos=0&cnt=1' },
-    { name: '射手网文件', url: 'https://file1.assrt.net/' },
+    { name: '射手网 API(HTTPS/v1)', url: 'https://api.assrt.net/v1/sub/search?q=test&pos=0&cnt=1' },
+    { name: '射手网 API 根路径', url: 'https://api.assrt.net/' },
+    { name: '射手网 API(HTTP/80)', url: 'http://api.assrt.net/v1/sub/search?q=test&pos=0&cnt=1' },
+    { name: '射手网文件主机', url: 'https://file1.assrt.net/' },
+    { name: '射手网站点', url: 'https://assrt.net/' },
+    { name: '射手网 secure', url: 'https://secure.assrt.net/' },
     { name: 'GitHub API', url: 'https://api.github.com/' },
     { name: 'B站 API', url: 'https://api.bilibili.com/x/web-interface/nav' },
-    { name: '百度', url: 'https://www.baidu.com/' },
     { name: 'SubHD', url: 'https://subhd.cc/' },
     { name: 'UHD 媒体服务器', url: 'https://v1.uhdnow.com/' },
   ];
@@ -253,7 +256,7 @@ export async function probeOutboundHosts(): Promise<
     targets.map(async (t) => {
       const started = Date.now();
       try {
-        const res = await rawGet(t.url, { 'User-Agent': USER_AGENT }, 6_000, 4);
+        const res = await rawGet(t.url, { 'User-Agent': USER_AGENT }, 8_000, 4);
         return {
           name: t.name,
           url: t.url,
