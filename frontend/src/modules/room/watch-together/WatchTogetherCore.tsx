@@ -1905,6 +1905,7 @@ export function WatchTogetherCore({
               onChangeSubtitleStrokeWidth={subtitles.setStrokeWidth}
               onChangeSubtitleShadowBlur={subtitles.setShadowBlur}
               onChangeSubtitleFontFamily={subtitles.setFontFamily}
+        onResetSubtitleStyle={subtitles.resetSubtitleStyle}
               onAutoSearchSubtitles={
                 currentMovieId != null && isHost
                   ? () => subtitles.searchAutoSubtitles(currentMovieId)

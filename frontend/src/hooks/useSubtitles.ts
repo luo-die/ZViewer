@@ -202,6 +202,73 @@ const DEFAULT_SUBTITLE_STATE: SubtitleState = {
 }
 
 /**
+ * 字幕样式（字号/位置/描边/阴影/字体）是「个人偏好」：每个浏览器各自记住，
+ * 刷新/换影片/重新进房都保持不变；观众本地改过之后，房主广播不再覆盖它。
+ */
+const SUBTITLE_STYLE_KEY = 'zviewer-subtitle-style'
+
+const DEFAULT_SUBTITLE_STYLE = {
+  subtitleFontSize: 20,
+  subtitleOffset: 0,
+  subtitleShiftX: 0,
+  subtitleShiftY: 0,
+  subtitleStrokeWidth: 0,
+  subtitleShadowBlur: 4,
+  subtitleFontFamily: '',
+} satisfies Partial<SubtitleState>
+
+function clampNumber(value: unknown, min: number, max: number): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return Math.min(max, Math.max(min, value))
+}
+
+/** 读取本地保存的字幕样式（越界/损坏一律忽略，回退默认值） */
+function readStoredSubtitleStyle(): Partial<SubtitleState> | null {
+  try {
+    const raw = localStorage.getItem(SUBTITLE_STYLE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object') return null
+    const out: Partial<SubtitleState> = {}
+    const fontSize = clampNumber(parsed.fontSize, 12, 50)
+    if (fontSize !== undefined) out.subtitleFontSize = fontSize
+    const offset = clampNumber(parsed.offset, -5, 5)
+    if (offset !== undefined) out.subtitleOffset = offset
+    const shiftX = clampNumber(parsed.shiftX, -50, 50)
+    if (shiftX !== undefined) out.subtitleShiftX = shiftX
+    const shiftY = clampNumber(parsed.shiftY, -50, 50)
+    if (shiftY !== undefined) out.subtitleShiftY = shiftY
+    const strokeWidth = clampNumber(parsed.strokeWidth, 0, 4)
+    if (strokeWidth !== undefined) out.subtitleStrokeWidth = strokeWidth
+    const shadowBlur = clampNumber(parsed.shadowBlur, 0, 12)
+    if (shadowBlur !== undefined) out.subtitleShadowBlur = shadowBlur
+    if (typeof parsed.fontFamily === 'string') out.subtitleFontFamily = parsed.fontFamily
+    return out
+  } catch {
+    return null
+  }
+}
+
+function saveStoredSubtitleStyle(state: SubtitleState): void {
+  try {
+    localStorage.setItem(
+      SUBTITLE_STYLE_KEY,
+      JSON.stringify({
+        fontSize: state.subtitleFontSize,
+        offset: state.subtitleOffset,
+        shiftX: state.subtitleShiftX,
+        shiftY: state.subtitleShiftY,
+        strokeWidth: state.subtitleStrokeWidth,
+        shadowBlur: state.subtitleShadowBlur,
+        fontFamily: state.subtitleFontFamily,
+      })
+    )
+  } catch {
+    /* 隐私模式 / 配额不足：忽略，样式仍在本会话内生效 */
+  }
+}
+
+/**
  * 字幕状态管理 + socket 同步。
  *
  * - 房主：调用 set* 方法变更状态并广播 `subtitle-update`
@@ -213,11 +280,20 @@ const DEFAULT_SUBTITLE_STATE: SubtitleState = {
  */
 export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
   const { socket } = useSocket()
-  const [state, setState] = useState<SubtitleState>(DEFAULT_SUBTITLE_STATE)
+  // 本地保存过的样式只读一次：既用于初始状态，也决定观众是否算「已自定义」
+  const storedStyleRef = useRef<Partial<SubtitleState> | null | undefined>(undefined)
+  if (storedStyleRef.current === undefined) {
+    storedStyleRef.current = readStoredSubtitleStyle()
+  }
+  const [state, setState] = useState<SubtitleState>(() => ({
+    ...DEFAULT_SUBTITLE_STATE,
+    ...(storedStyleRef.current ?? {}),
+  }))
 
   // 观众本地偏好标记：观众自行修改过字幕设置（开关/轨道/字号/偏移）后，
   // 房主广播的 subtitle-update 只更新轨道数据，不再覆盖观众的本地选择。
-  const viewerPrefTouchedRef = useRef(false)
+  // 本地存过样式（说明观众之前就调过）同样视为已自定义。
+  const viewerPrefTouchedRef = useRef(Boolean(storedStyleRef.current))
   /** 最新字幕状态镜像：延迟任务/回调读取，避免闭包陈旧 */
   const stateRef = useRef(state)
   useEffect(() => {
@@ -966,95 +1042,62 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
     [isHost, listEmbeddedTracks, extractEmbeddedTrack]
   )
 
-  const setFontSize = useCallback(
-    (size: number) => {
-      // 观众本地调字号：标记偏好，后续房主广播不覆盖此选择
+  /**
+   * 统一的样式修改入口：写本地存储（个人偏好，刷新/换影片都保留）+ 房主广播。
+   * 观众改过之后标记偏好，后续房主广播不再覆盖其字号/位置等选择。
+   */
+  const applySubtitleStyle = useCallback(
+    (patch: Partial<SubtitleState>) => {
       if (!isHost) viewerPrefTouchedRef.current = true
       setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleFontSize: size }
+        const next: SubtitleState = { ...prev, ...patch }
+        saveStoredSubtitleStyle(next)
         broadcast(next)
         return next
       })
     },
     [broadcast, isHost]
+  )
+
+  const setFontSize = useCallback(
+    (size: number) => applySubtitleStyle({ subtitleFontSize: size }),
+    [applySubtitleStyle]
   )
 
   const setOffset = useCallback(
-    (offset: number) => {
-      // 观众本地调偏移：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleOffset: offset }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (offset: number) => applySubtitleStyle({ subtitleOffset: offset }),
+    [applySubtitleStyle]
   )
 
   const setShiftX = useCallback(
-    (shiftX: number) => {
-      // 观众本地调水平位移：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleShiftX: shiftX }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (shiftX: number) => applySubtitleStyle({ subtitleShiftX: shiftX }),
+    [applySubtitleStyle]
   )
 
   const setShiftY = useCallback(
-    (shiftY: number) => {
-      // 观众本地调垂直位移：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleShiftY: shiftY }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (shiftY: number) => applySubtitleStyle({ subtitleShiftY: shiftY }),
+    [applySubtitleStyle]
   )
 
   const setStrokeWidth = useCallback(
-    (strokeWidth: number) => {
-      // 观众本地调描边：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleStrokeWidth: strokeWidth }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (strokeWidth: number) => applySubtitleStyle({ subtitleStrokeWidth: strokeWidth }),
+    [applySubtitleStyle]
   )
 
   const setShadowBlur = useCallback(
-    (shadowBlur: number) => {
-      // 观众本地调阴影：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleShadowBlur: shadowBlur }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (shadowBlur: number) => applySubtitleStyle({ subtitleShadowBlur: shadowBlur }),
+    [applySubtitleStyle]
   )
 
   const setFontFamily = useCallback(
-    (fontFamily: string) => {
-      // 观众本地换字体：标记偏好，后续房主广播不覆盖此选择
-      if (!isHost) viewerPrefTouchedRef.current = true
-      setState((prev) => {
-        const next: SubtitleState = { ...prev, subtitleFontFamily: fontFamily }
-        broadcast(next)
-        return next
-      })
-    },
-    [broadcast, isHost]
+    (fontFamily: string) => applySubtitleStyle({ subtitleFontFamily: fontFamily }),
+    [applySubtitleStyle]
+  )
+
+  /** 恢复默认字号/位置/描边/阴影/字体（仅样式，不动字幕轨） */
+  const resetSubtitleStyle = useCallback(
+    () => applySubtitleStyle({ ...DEFAULT_SUBTITLE_STYLE }),
+    [applySubtitleStyle]
   )
 
   // 观众：接收房主的字幕广播
@@ -1149,5 +1192,6 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
     setStrokeWidth,
     setShadowBlur,
     setFontFamily,
+    resetSubtitleStyle,
   }
 }

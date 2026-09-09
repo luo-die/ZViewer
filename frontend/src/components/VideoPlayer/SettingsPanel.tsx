@@ -74,6 +74,8 @@ interface SettingsPanelProps {
   onChangeSubtitleStrokeWidth?: (strokeWidth: number) => void
   onChangeSubtitleShadowBlur?: (shadowBlur: number) => void
   onChangeSubtitleFontFamily?: (fontFamily: string) => void
+  /** 恢复默认字号/位置/描边/阴影/字体 */
+  onResetSubtitleStyle?: () => void
   onAutoSearchSubtitles?: () => Promise<number>
   canAutoSearchSubtitles?: boolean
   canLoadEmbeddedSubtitles?: boolean
@@ -119,6 +121,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onChangeSubtitleStrokeWidth,
     onChangeSubtitleShadowBlur,
     onChangeSubtitleFontFamily,
+  onResetSubtitleStyle,
     onAutoSearchSubtitles,
     canAutoSearchSubtitles,
     canLoadEmbeddedSubtitles,
@@ -733,13 +736,26 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     )}
                     style={{ borderColor: 'var(--md-sys-color-outline)' }}
                   >
-                    {advancedOpen ? '收起高级设置' : '高级设置'}
+                    {advancedOpen ? '收起字幕样式' : '字幕样式 / 位置'}
                     <ChevronRight
                       className={cn(
                         'h-3.5 w-3.5 transition-transform',
                         advancedOpen && 'rotate-180'
                       )}
                     />
+                  </button>
+                )}
+                {advancedOpen && onResetSubtitleStyle && (
+                  <button
+                    type="button"
+                    onClick={onResetSubtitleStyle}
+                    className="mt-1 w-full rounded-md border py-1 text-xs transition-all active:brightness-95 hover:bg-[var(--md-sys-color-surface-container-highest)]"
+                    style={{
+                      borderColor: 'var(--md-sys-color-outline)',
+                      color: 'var(--md-sys-color-on-surface-variant)',
+                    }}
+                  >
+                    恢复默认样式
                   </button>
                 )}
               </>
