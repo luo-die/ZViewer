@@ -940,7 +940,15 @@ interface MkvCachedSubtitle {
   label: string;
   language: string | null;
   at: number;
+  /**
+   * 缓存格式版本。
+   * v2 起：只有「读到文件末尾」的完整提取才会落盘。
+   * 早期版本曾把「跳读中途中断」的部分结果当完整结果缓存，导致字幕只到前几分钟，
+   * 因此不带 v2 的旧缓存一律视为无效并重新提取。
+   */
+  v?: number;
 }
+const MKV_CACHE_VERSION = 2;
 const mkvExtractCache = new Map<string, MkvCachedSubtitle>();
 const MKV_CACHE_TTL_MS = 60 * 60 * 1000;
 
@@ -961,7 +969,12 @@ function readMkvCacheFromDisk(movie: Movie, track: number): MkvCachedSubtitle | 
   try {
     const raw = fs.readFileSync(mkvCachePath(movie, track), 'utf8');
     const parsed = JSON.parse(raw) as MkvCachedSubtitle;
-    if (parsed && typeof parsed.content === 'string' && parsed.content.length > 0) {
+    if (
+      parsed &&
+      typeof parsed.content === 'string' &&
+      parsed.content.length > 0 &&
+      parsed.v === MKV_CACHE_VERSION
+    ) {
       return parsed;
     }
   } catch {
@@ -973,7 +986,11 @@ function readMkvCacheFromDisk(movie: Movie, track: number): MkvCachedSubtitle | 
 function writeMkvCacheToDisk(movie: Movie, track: number, value: MkvCachedSubtitle): void {
   try {
     fs.mkdirSync(MKV_CACHE_DIR, { recursive: true });
-    fs.writeFileSync(mkvCachePath(movie, track), JSON.stringify(value), 'utf8');
+    fs.writeFileSync(
+      mkvCachePath(movie, track),
+      JSON.stringify({ ...value, v: MKV_CACHE_VERSION }),
+      'utf8',
+    );
   } catch (err) {
     console.warn(
       '[subtitles] 写入字幕缓存失败:',
@@ -1064,12 +1081,25 @@ function startMkvExtractionInBackground(
           .filter(Boolean)
           .join(' · ') ||
         `轨道 ${track}`;
+      // 只缓存「读到文件末尾」的完整结果：中途中断的内容若被当成完整结果落盘，
+      // 之后每次播放都只显示前几分钟的字幕（且不会重新提取），极难排查。
+      if (result.complete === false) {
+        const message =
+          '字幕提取中途中断（上游限流或网络异常），仅取到部分内容；稍后重试或改用其他字幕轨';
+        console.warn(
+          `[subtitles] 提取不完整，不写入缓存 movie=${movie.id} track=${track} ${result.content.length} 字节`,
+        );
+        mkvPartial.delete(cacheKey);
+        mkvFailures.set(cacheKey, { message, at: Date.now() });
+        return;
+      }
       const value: MkvCachedSubtitle = {
         content: result.content,
         format: result.format,
         label,
         language: result.track.language ?? null,
         at: Date.now(),
+        v: MKV_CACHE_VERSION,
       };
       mkvExtractCache.set(cacheKey, value);
       mkvPartial.delete(cacheKey);

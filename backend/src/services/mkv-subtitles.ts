@@ -211,6 +211,12 @@ export interface MkvExtractResult {
   format: 'ass' | 'srt' | 'vtt';
   track: MkvSubtitleTrackInfo;
   rangeSupported: boolean;
+  /**
+   * 是否读到了文件末尾（提取完整）。
+   * false = 中途中断（上游限流/网络错误），内容只是「已读到的部分」，
+   * 调用方**不得**把它当作完整结果落盘缓存。
+   */
+  complete: boolean;
 }
 
 export interface MkvSourceOptions {
@@ -260,6 +266,8 @@ class HttpByteReader {
   private streamStartedAt = Date.now();
   /** 已发出的上游请求数（跳读模式的预算控制用） */
   private requests = 0;
+  /** 收到 429 的次数：连续限流说明跳读策略在该上游不可行，应尽快降级 */
+  private rateLimitHits = 0;
   /** 上游文件总大小（从 Content-Range/Content-Length 推断，未知为 0） */
   fileSize = 0;
   /** 当前最小请求间隔（429 时自适应放大） */
@@ -291,6 +299,7 @@ class HttpByteReader {
     return {
       minIntervalMs: this.minIntervalMs,
       onRateLimit: () => {
+        this.rateLimitHits++;
         const next = Math.min(Math.max(this.minIntervalMs * 2, 60), 1000);
         if (next !== this.minIntervalMs) {
           console.warn(
@@ -399,6 +408,17 @@ class HttpByteReader {
   /** 已发出的上游请求数（跳读模式预算控制） */
   get requestCount(): number {
     return this.requests;
+  }
+
+  /** 上游 429 次数 */
+  get rateLimitCount(): number {
+    return this.rateLimitHits;
+  }
+
+  /** 是否已读到数据源末尾（判定提取是否完整） */
+  get eof(): boolean {
+    if (this.fileSize > 0) return this.pos >= this.fileSize - 1;
+    return this.streamDone && this.buf.length === 0;
   }
 
   /** 确保 [offset, offset+need) 已在缓冲中 */
@@ -878,14 +898,54 @@ export async function extractMkvSubtitleTrack(
       return { track, relative, text };
     };
 
+    // 解析循环整体包一层：Cluster 内部的读取错误（如上游 429）若直接抛出，
+    // 会让整次提取失败；这里记录错误，循环结束后统一处理（必要时改用顺序流重试）。
+    let parseError: unknown = null;
+    try {
     while (reader.position < segmentEnd) {
       if (Date.now() > deadline) break;
       if (cuesBytes > MAX_SUBTITLE_BYTES) break;
+      // 上游连续限流（429）说明跳读策略在该服务上不可行：立即降级为
+      // 「从当前位置继续的顺序流」（1 个请求，天然不受限流影响）。
+      if (reader.rangeSupported && reader.rateLimitCount >= 2) {
+        try {
+          const next = await HttpByteReader.openAt(opts, reader.position, true);
+          await reader.close();
+          reader = next;
+          console.warn(
+            `[mkv-subtitles] 上游连续限流 ${reader.rateLimitCount} 次，已降级为顺序流继续提取`,
+          );
+        } catch (err) {
+          console.warn(
+            '[mkv-subtitles] 限流降级失败:',
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       let header: ElementHeader;
       try {
         header = await readElementHeader(reader);
-      } catch {
-        break; // 数据源结束
+      } catch (err) {
+        // 读取失败：跳读模式先尝试降级为顺序流接着读（此前直接 break 会把
+        // 「已读到的前几分钟」当成完整结果返回并落盘，表现为「字幕只到 2 分钟」）。
+        if (reader.rangeSupported) {
+          try {
+            const next = await HttpByteReader.openAt(opts, reader.position, true);
+            await reader.close();
+            reader = next;
+            console.warn(
+              '[mkv-subtitles] 跳读中断，已降级为顺序流继续提取:',
+              err instanceof Error ? err.message : err,
+            );
+            continue;
+          } catch (fallbackErr) {
+            console.warn(
+              '[mkv-subtitles] 降级顺序流失败:',
+              fallbackErr instanceof Error ? fallbackErr.message : fallbackErr,
+            );
+          }
+        }
+        break; // 数据源结束 / 无法继续
       }
       const elemEnd = header.unknownSize ? segmentEnd : reader.position + header.size;
 
@@ -1023,12 +1083,43 @@ export async function extractMkvSubtitleTrack(
       }
       await reader.skip(elemEnd - reader.position);
     }
+    } catch (err) {
+      parseError = err;
+      console.warn(
+        '[mkv-subtitles] 解析中断:',
+        err instanceof Error ? err.message : err,
+      );
+    }
 
     const track = tracks.find((t) => t.trackNumber === trackNumber);
     if (!track) throw new Error(`未找到字幕轨 ${trackNumber}`);
     const format = codecToFormat(track.codecId);
     if (!isTextCodec(track.codecId)) {
       throw new Error(`不支持的字幕编码 ${track.codecId}（位图字幕无法转文本）`);
+    }
+    // 是否读到文件末尾：读不到说明中途断了（限流/网络），内容只是「已读到的部分」。
+    // 此时**不能**当成完整结果（否则会落盘缓存，表现为「字幕只到前几分钟」）。
+    const complete =
+      !parseError && (reader.eof || reader.position >= segmentEnd);
+    if ((parseError || !complete) && !forceStream) {
+      // 跳读/自适应模式中断（或没读到末尾）：改用顺序流（单请求、不受限流影响）
+      // 重头再解一次；顺序流仍失败时按「不完整」返回，绝不落盘缓存。
+      console.warn(
+        '[mkv-subtitles] 跳读提取' +
+          (parseError ? '出错' : '未读完') +
+          `（已取 ${cues.length} 条），改用顺序流重试`,
+      );
+      await reader.close();
+      return extractMkvSubtitleTrack(
+        { ...opts, mode: 'stream' },
+        trackNumber,
+        onPartial,
+      );
+    }
+    if (parseError && cues.length === 0) {
+      throw parseError instanceof Error
+        ? parseError
+        : new Error(String(parseError));
     }
     if (!sawCluster || cues.length === 0) {
       throw new Error('未在容器中读到字幕数据');
@@ -1040,6 +1131,7 @@ export async function extractMkvSubtitleTrack(
       content,
       format,
       rangeSupported: reader.rangeSupported,
+      complete,
       track: {
         trackNumber: track.trackNumber,
         codecId: track.codecId,
