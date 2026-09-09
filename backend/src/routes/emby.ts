@@ -83,13 +83,33 @@ function mapEmbyEntry(item: EmbyItem) {
   // MusicVideo 同为可直接播放的条目（搜索结果可能命中），列入可播放类型
   const fileTypes = new Set(['Movie', 'Video', 'Episode', 'MusicVideo', 'TvSeries']);
   const isFile = fileTypes.has(item.Type) || item.IsFile === true;
+  const primaryTag = item.ImageTags?.Primary ?? null;
   return {
     name: item.Name,
     path: item.Id,
     type: (isFile ? 'file' : 'directory') as 'file' | 'directory',
     embyType: item.Type,
     childCount: item.ChildCount ?? 0,
+    // 缩略图：只下发 tag，实际图片地址由前端按模块拼 /mounts/:id/image（含鉴权）
+    imageTag: primaryTag,
+    imageAspectRatio: item.PrimaryImageAspectRatio ?? null,
+    // 「整季添加」排序与可读标题（S01E02 剧集名）
+    indexNumber: item.IndexNumber ?? null,
+    parentIndexNumber: item.ParentIndexNumber ?? null,
+    seriesName: item.SeriesName ?? null,
+    productionYear: item.ProductionYear ?? null,
+    runtimeTicks: item.RunTimeTicks ?? null,
   };
+}
+
+/** 图片类型白名单（避免把任意路径透传给上游） */
+const IMAGE_TYPES = new Set(['Primary', 'Thumb', 'Backdrop', 'Logo', 'Banner', 'Art', 'Disc', 'Box']);
+
+/** 数值查询参数解析（越界回落到默认值） */
+function clampQueryNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.floor(n), min), max);
 }
 
 router.use(authenticateToken);
@@ -407,6 +427,135 @@ router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response
     res.status(status).json({
       success: false,
       message: extractErrorMessage(err, '搜索 Emby 媒体库失败'),
+      code,
+    });
+  }
+});
+
+// 图片代理 - GET /mounts/:id/image?itemId=&tag=&type=Primary&maxWidth=&maxHeight=
+// 浏览列表的缩略图走本端点：后端带 token 取图后中转，
+// 前端 <img> 无需（也无法）携带 Emby 凭证，内网 Emby 同样可用。
+router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const itemId = typeof req.query.itemId === 'string' ? req.query.itemId.trim() : '';
+    if (!itemId) {
+      res.status(400).json({ success: false, message: 'itemId 不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const typeRaw = typeof req.query.type === 'string' ? req.query.type : 'Primary';
+    const type = IMAGE_TYPES.has(typeRaw) ? typeRaw : 'Primary';
+    const tag = typeof req.query.tag === 'string' && req.query.tag ? req.query.tag : undefined;
+    const maxWidth = clampQueryNumber(req.query.maxWidth, 16, 1280, 320);
+    const maxHeight = clampQueryNumber(req.query.maxHeight, 16, 1920, 480);
+
+    const mount = await userMountRepository().findOneBy({
+      id: mountId,
+      userId: req.user!.userId,
+      type: 'emby',
+    });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveEmbySession(mount);
+    const upstreamUrl = session.client.buildItemImageUrl(itemId, {
+      type,
+      tag,
+      maxWidth,
+      maxHeight,
+      quality: 90,
+    });
+
+    await proxyHttpUpstream(req, res, {
+      url: upstreamUrl,
+      headers: {
+        extra: {
+          'X-Emby-Token': session.token,
+          Referer: session.client.baseUrl,
+        },
+      },
+      cors: 'wildcard',
+      defaultContentType: 'image/jpeg',
+      // 图片内容按 tag 变化（tag 拼在上游 URL 里），可长时间缓存
+      cacheControl: 'public, max-age=86400',
+      timeoutMs: 15_000,
+      logTag: 'emby-image',
+      errorMessage: '获取 Emby 图片失败',
+    });
+  } catch (err) {
+    console.error('[emby] image proxy error:', err);
+    if (!res.headersSent) {
+      const code = extractErrorCode(err);
+      res.status(code === 'AUTH_FAILED' ? 401 : 502).json({
+        success: false,
+        message: extractErrorMessage(err, '获取 Emby 图片失败'),
+        code,
+      });
+    } else {
+      res.destroy();
+    }
+  }
+});
+
+// 整季/全剧剧集 - GET /mounts/:id/episodes?path=&limit=
+// 递归收集季 / 剧集下的全部可播放单集（按季号、集号排序），
+// 供浏览框「整季添加」一次性加入房间，无需逐个勾选。
+router.get('/mounts/:id/episodes', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const itemId = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+    if (!itemId) {
+      res.status(400).json({ success: false, message: 'path 不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const limit = clampQueryNumber(req.query.limit, 1, 1000, 500);
+
+    const mount = await userMountRepository().findOneBy({
+      id: mountId,
+      userId: req.user!.userId,
+      type: 'emby',
+    });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveEmbySession(mount);
+    if (!session.userId) {
+      res.status(400).json({
+        success: false,
+        message: '未获取到 Emby 用户信息，请重新保存该挂载配置',
+        code: 'NO_USER',
+      });
+      return;
+    }
+
+    const items = await session.client.collectPlayableDescendants(session.userId, itemId, {
+      maxItems: limit,
+    });
+    res.json({
+      success: true,
+      entries: items.map(mapEmbyEntry),
+      total: items.length,
+      truncated: items.length >= limit,
+    });
+  } catch (err) {
+    console.error('[emby] episodes error:', err);
+    const code = extractErrorCode(err);
+    const status = code === 'AUTH_FAILED' ? 401 : code === 'TIMEOUT' ? 504 : 400;
+    res.status(status).json({
+      success: false,
+      message: extractErrorMessage(err, '获取 Emby 剧集列表失败'),
       code,
     });
   }

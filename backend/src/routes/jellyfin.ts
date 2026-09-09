@@ -63,7 +63,31 @@ async function resolveJellyfinSession(mount: UserMount): Promise<{
   return { client, userId, token };
 }
 
-function mapJellyfinEntry(item: { Id: string; Name: string; Type: string; IsFolder?: boolean; IsFile?: boolean; ChildCount?: number }) {
+/** 图片类型白名单（避免把任意路径透传给上游） */
+const IMAGE_TYPES = new Set(['Primary', 'Thumb', 'Backdrop', 'Logo', 'Banner', 'Art', 'Disc', 'Box']);
+
+/** 数值查询参数解析（越界回落到默认值） */
+function clampQueryNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.floor(n), min), max);
+}
+
+function mapJellyfinEntry(item: {
+  Id: string;
+  Name: string;
+  Type: string;
+  IsFolder?: boolean;
+  IsFile?: boolean;
+  ChildCount?: number;
+  ImageTags?: Record<string, string | undefined>;
+  PrimaryImageAspectRatio?: number;
+  IndexNumber?: number;
+  ParentIndexNumber?: number;
+  SeriesName?: string;
+  ProductionYear?: number;
+  RunTimeTicks?: number;
+}) {
   const fileTypes = new Set(['Movie', 'Video', 'Episode', 'MusicVideo', 'TvSeries']);
   const isFile = fileTypes.has(item.Type) || item.IsFile === true;
   return {
@@ -72,6 +96,14 @@ function mapJellyfinEntry(item: { Id: string; Name: string; Type: string; IsFold
     type: (isFile ? 'file' : 'directory') as 'file' | 'directory',
     embyType: item.Type,
     childCount: item.ChildCount ?? 0,
+    // 缩略图：只下发 tag，图片地址由前端拼 /api/jellyfin/mounts/:id/image（含鉴权）
+    imageTag: item.ImageTags?.Primary ?? null,
+    imageAspectRatio: item.PrimaryImageAspectRatio ?? null,
+    indexNumber: item.IndexNumber ?? null,
+    parentIndexNumber: item.ParentIndexNumber ?? null,
+    seriesName: item.SeriesName ?? null,
+    productionYear: item.ProductionYear ?? null,
+    runtimeTicks: item.RunTimeTicks ?? null,
   };
 }
 
@@ -322,6 +354,131 @@ router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response
     res.status(status).json({
       success: false,
       message: extractErrorMessage(err, '搜索 Jellyfin 媒体库失败'),
+      code,
+    });
+  }
+});
+
+// 图片代理 - GET /mounts/:id/image?itemId=&tag=&type=Primary&maxWidth=&maxHeight=
+// 与 emby.ts 对齐：浏览列表缩略图由后端带 token 取图后中转。
+router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const itemId = typeof req.query.itemId === 'string' ? req.query.itemId.trim() : '';
+    if (!itemId) {
+      res.status(400).json({ success: false, message: 'itemId 不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const typeRaw = typeof req.query.type === 'string' ? req.query.type : 'Primary';
+    const type = IMAGE_TYPES.has(typeRaw) ? typeRaw : 'Primary';
+    const tag = typeof req.query.tag === 'string' && req.query.tag ? req.query.tag : undefined;
+    const maxWidth = clampQueryNumber(req.query.maxWidth, 16, 1280, 320);
+    const maxHeight = clampQueryNumber(req.query.maxHeight, 16, 1920, 480);
+
+    const mount = await userMountRepository().findOneBy({
+      id: mountId,
+      userId: req.user!.userId,
+      type: 'jellyfin',
+    });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveJellyfinSession(mount);
+    const upstreamUrl = session.client.buildItemImageUrl(itemId, {
+      type,
+      tag,
+      maxWidth,
+      maxHeight,
+      quality: 90,
+    });
+
+    await proxyHttpUpstream(req, res, {
+      url: upstreamUrl,
+      headers: {
+        extra: {
+          'X-Emby-Token': session.token,
+          Referer: session.client.baseUrl,
+        },
+      },
+      cors: 'wildcard',
+      defaultContentType: 'image/jpeg',
+      cacheControl: 'public, max-age=86400',
+      timeoutMs: 15_000,
+      logTag: 'jellyfin-image',
+      errorMessage: '获取 Jellyfin 图片失败',
+    });
+  } catch (err) {
+    console.error('[jellyfin] image proxy error:', err);
+    if (!res.headersSent) {
+      const code = extractErrorCode(err);
+      res.status(code === 'AUTH_FAILED' ? 401 : 502).json({
+        success: false,
+        message: extractErrorMessage(err, '获取 Jellyfin 图片失败'),
+        code,
+      });
+    } else {
+      res.destroy();
+    }
+  }
+});
+
+// 整季/全剧剧集 - GET /mounts/:id/episodes?path=&limit=
+router.get('/mounts/:id/episodes', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const itemId = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+    if (!itemId) {
+      res.status(400).json({ success: false, message: 'path 不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const limit = clampQueryNumber(req.query.limit, 1, 1000, 500);
+
+    const mount = await userMountRepository().findOneBy({
+      id: mountId,
+      userId: req.user!.userId,
+      type: 'jellyfin',
+    });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveJellyfinSession(mount);
+    if (!session.userId) {
+      res.status(400).json({
+        success: false,
+        message: '未获取到 Jellyfin 用户信息，请重新保存该挂载配置',
+        code: 'NO_USER',
+      });
+      return;
+    }
+
+    const items = await session.client.collectPlayableDescendants(session.userId, itemId, {
+      maxItems: limit,
+    });
+    res.json({
+      success: true,
+      entries: items.map(mapJellyfinEntry),
+      total: items.length,
+      truncated: items.length >= limit,
+    });
+  } catch (err) {
+    console.error('[jellyfin] episodes error:', err);
+    const code = extractErrorCode(err);
+    const status = code === 'AUTH_FAILED' ? 401 : code === 'TIMEOUT' ? 504 : 400;
+    res.status(status).json({
+      success: false,
+      message: extractErrorMessage(err, '获取 Jellyfin 剧集列表失败'),
       code,
     });
   }

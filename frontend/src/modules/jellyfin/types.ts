@@ -35,15 +35,15 @@ export interface JellyfinTestResult {
   serverId?: string
 }
 
-export interface JellyfinDirectoryEntry {
-  name: string
-  path: string
-  /** file = 可播放条目（电影/单集），directory = 可继续浏览（媒体库/剧集/季） */
-  type: 'file' | 'directory'
-  /** Jellyfin 条目类型（CollectionFolder/Series/Season/Movie/Episode/Video） */
-  embyType?: string
-  childCount?: number
-}
+import type { EmbyDirectoryEntry } from '@/modules/emby/types'
+
+/**
+ * Jellyfin 条目结构 = Emby 条目结构
+ *
+ * 两者接口完全兼容，浏览组件（EmbyBrowser）与条目类型共用一份定义，
+ * 避免新增字段（缩略图、集序号）时两处不同步。
+ */
+export type JellyfinDirectoryEntry = EmbyDirectoryEntry
 
 export interface JellyfinResolvedSource {
   title: string

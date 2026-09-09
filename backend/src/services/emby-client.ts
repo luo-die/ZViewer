@@ -81,6 +81,23 @@ export interface EmbyItem {
   IsFile?: boolean;
   /** 媒体源信息（PlaybackInfo 或带 Fields=MediaSources 时返回） */
   MediaSources?: EmbyMediaSource[];
+  /**
+   * 图片 tag 集合：有 Primary 表示该条目有主图（电影海报 / 剧集海报 / 单集缩略图）。
+   * 浏览器列表的缩略图据此显示，tag 变化即缓存失效（拼接在图片 URL 上）。
+   */
+  ImageTags?: Record<string, string | undefined>;
+  /** 主图宽高比（0.6667≈2:3 海报，1.7778≈16:9 剧照），用于选择缩略图展示比例 */
+  PrimaryImageAspectRatio?: number;
+  /** 集序号（Episode.IndexNumber / Season.IndexNumber） */
+  IndexNumber?: number;
+  /** 所属季序号（Episode.ParentIndexNumber） */
+  ParentIndexNumber?: number;
+  /** 所属剧集名（Episode.SeriesName），「整季添加」时用于生成可读标题 */
+  SeriesName?: string;
+  /** 发行年份 */
+  ProductionYear?: number;
+  /** 时长（100ns tick，除以 1e7 得秒） */
+  RunTimeTicks?: number;
 }
 
 export interface EmbyPlaybackInfo {
@@ -298,6 +315,39 @@ export function buildSubtitleCandidates(ctx: EmbySubtitleContext): string[] {
     );
   }
   return out;
+}
+
+/**
+ * 列表类请求（Views / Items / Search）统一使用的 Fields 白名单：
+ * - ChildCount / MediaSources / Path：子项数、播放源、文件路径
+ * - PrimaryImageAspectRatio / ImageTags：列表缩略图（有 Primary tag 才显示图片）
+ * - IndexNumber / ParentIndexNumber / SeriesName / RunTimeTicks：
+ *   「整季添加」时的排序与可读标题（S01E02 剧集名）
+ * 未识别的字段服务端会忽略，不会导致请求失败。
+ */
+const ITEM_LIST_FIELDS =
+  'ChildCount,MediaSources,Path,PrimaryImageAspectRatio,ImageTags,IndexNumber,ParentIndexNumber,SeriesName,RunTimeTicks';
+
+/** 可直接播放的条目类型（与路由层 mapEmbyEntry 保持一致） */
+const PLAYABLE_ITEM_TYPES = new Set(['Movie', 'Episode', 'Video', 'MusicVideo']);
+
+/** 条目是否可直接播放 */
+export function isPlayableItem(item: EmbyItem): boolean {
+  return PLAYABLE_ITEM_TYPES.has(item.Type) || item.IsFile === true;
+}
+
+/**
+ * 「整季添加」排序：先按季序号，再按集序号，最后按名称。
+ * 缺少序号的条目（电影/合集）排在末尾，保持服务端返回顺序的相对稳定。
+ */
+export function compareEpisodeOrder(a: EmbyItem, b: EmbyItem): number {
+  const sa = a.ParentIndexNumber ?? 0;
+  const sb = b.ParentIndexNumber ?? 0;
+  if (sa !== sb) return sa - sb;
+  const ia = a.IndexNumber ?? 0;
+  const ib = b.IndexNumber ?? 0;
+  if (ia !== ib) return ia - ib;
+  return (a.Name ?? '').localeCompare(b.Name ?? '');
 }
 
 export class EmbyError extends Error {
@@ -526,7 +576,7 @@ export class EmbyClient {
   async userViews(userId: string): Promise<EmbyItem[]> {
     const res = await this.request<{ Items?: EmbyItem[] }>({
       path: `/emby/Users/${encodeURIComponent(userId)}/Views`,
-      query: { Fields: 'ChildCount' },
+      query: { Fields: ITEM_LIST_FIELDS },
     });
     return res.Items ?? [];
   }
@@ -542,7 +592,7 @@ export class EmbyClient {
       query: {
         ParentId: parentId,
         IncludeItemTypes: includeItemTypes,
-        Fields: 'ChildCount,MediaSources,Path',
+        Fields: ITEM_LIST_FIELDS,
         Recursive: parentId ? undefined : 'false',
       },
     });
@@ -565,11 +615,95 @@ export class EmbyClient {
         SearchTerm: term,
         Recursive: 'true',
         IncludeItemTypes: 'Movie,Series,Season,Episode,Video,MusicVideo,BoxSet,CollectionFolder',
-        Fields: 'ChildCount,MediaSources,Path',
+        Fields: ITEM_LIST_FIELDS,
         Limit: limit,
       },
     });
     return res.Items ?? [];
+  }
+
+  /**
+   * 条目图片地址 GET /emby/Items/{itemId}/Images/{type}
+   *
+   * 供服务端图片代理使用（routes/emby.ts 的 /mounts/:id/image）：
+   * 由后端带 token 取图后中转给浏览器，前端不直连 Emby、也拿不到挂载凭证。
+   * tag 有值时拼上，让服务端图片缓存随图片变更失效（Emby 的常规约定）。
+   */
+  buildItemImageUrl(
+    itemId: string,
+    opts?: {
+      type?: string;
+      tag?: string;
+      maxWidth?: number;
+      maxHeight?: number;
+      quality?: number;
+    },
+  ): string {
+    const type = opts?.type && /^[A-Za-z]+$/.test(opts.type) ? opts.type : 'Primary';
+    const url = new URL(
+      `${this.baseUrl}/emby/Items/${encodeURIComponent(itemId)}/Images/${type}`,
+    );
+    if (opts?.tag) url.searchParams.set('tag', opts.tag);
+    if (opts?.maxWidth) url.searchParams.set('maxWidth', String(opts.maxWidth));
+    if (opts?.maxHeight) url.searchParams.set('maxHeight', String(opts.maxHeight));
+    if (opts?.quality) url.searchParams.set('quality', String(opts.quality));
+    if (this.opts.token) url.searchParams.set('api_key', this.opts.token);
+    return url.toString();
+  }
+
+  /**
+   * 递归收集某条目下全部可播放子项（「整季添加」用）。
+   *
+   * 从季（Season）出发得到该季全部单集，从剧集（Series）出发得到全部季的全部单集；
+   * 媒体库 / 合集同样适用。广度优先逐层展开，串行请求避免触发上游限流
+   * （UHD Media Server 一类第三方实现并发过高会 429，进而拖累播放）。
+   *
+   * 上限保护：
+   * - maxItems（默认 500）：超出即停止，返回已收集部分（超长剧集不至于把房间撑爆）
+   * - maxRequests（默认 40）：限制上游请求数，防止异常结构导致的无限下钻
+   */
+  async collectPlayableDescendants(
+    userId: string,
+    rootId: string,
+    opts?: { maxItems?: number; maxRequests?: number; maxDepth?: number },
+  ): Promise<EmbyItem[]> {
+    const maxItems = opts?.maxItems ?? 500;
+    const maxRequests = opts?.maxRequests ?? 40;
+    const maxDepth = opts?.maxDepth ?? 4;
+
+    const found: EmbyItem[] = [];
+    const visited = new Set<string>([rootId]);
+    let requests = 0;
+    let queue: Array<{ id: string; depth: number }> = [{ id: rootId, depth: 0 }];
+
+    while (queue.length > 0 && requests < maxRequests && found.length < maxItems) {
+      const next: Array<{ id: string; depth: number }> = [];
+      for (const node of queue) {
+        if (requests >= maxRequests || found.length >= maxItems) break;
+        requests++;
+        let children: EmbyItem[] = [];
+        try {
+          children = await this.items(userId, node.id);
+        } catch (err) {
+          // 单个子树失败不放弃整体（例如权限受限的季），继续其它分支
+          if (err instanceof EmbyError && err.code === 'AUTH_FAILED') throw err;
+          continue;
+        }
+        for (const child of children) {
+          if (isPlayableItem(child)) {
+            found.push(child);
+            if (found.length >= maxItems) break;
+            continue;
+          }
+          if (visited.has(child.Id)) continue;
+          visited.add(child.Id);
+          if (node.depth + 1 < maxDepth) next.push({ id: child.Id, depth: node.depth + 1 });
+        }
+      }
+      queue = next;
+    }
+
+    return found.sort(compareEpisodeOrder);
   }
 
   /**

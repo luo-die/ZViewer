@@ -23,7 +23,15 @@ interface MountBrowserProps {
   open: boolean
   onClose: () => void
   onSelectFile?: (path: string) => void
-  onSelectFiles?: (paths: string[]) => void
+  /**
+   * 批量选中回调。
+   * entries 为可读条目（路径 + 展示名），Emby/Jellyfin 用它给剧集生成标题；
+   * WebDAV/OpenList/FTP 等文件型挂载不传（沿用文件名推断标题）。
+   */
+  onSelectFiles?: (
+    paths: string[],
+    entries?: Array<{ path: string; name: string }>
+  ) => void
   selectable?: boolean
 }
 
@@ -35,9 +43,12 @@ export default function MountBrowser({
   onSelectFiles,
   selectable = false,
 }: MountBrowserProps) {
-  const handleFiles = (paths: string[]) => {
+  const handleFiles = (
+    paths: string[],
+    entries?: Array<{ path: string; name: string }>
+  ) => {
     if (onSelectFiles) {
-      onSelectFiles(paths)
+      onSelectFiles(paths, entries)
     } else if (onSelectFile && paths[0]) {
       onSelectFile(paths[0])
     }

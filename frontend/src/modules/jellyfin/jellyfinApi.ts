@@ -5,6 +5,10 @@
  */
 import { apiFetch } from '@/lib/api'
 import { buildProxyUrl } from '@/modules/direct-link/directLinkApi'
+import {
+  decorateLibraryEntries,
+  type LibraryModule,
+} from '@/modules/emby/embyApi'
 import type { MediaFormat } from '@/lib/mediaFormat'
 import type {
   JellyfinMount,
@@ -123,7 +127,41 @@ export async function browseJellyfinMount(
   if (!res.ok || !data.success) {
     throw new Error(data.message || '浏览 Jellyfin 挂载失败')
   }
-  return data.entries || []
+  // 与 Emby 一致：补上缩略图代理地址
+  return decorateLibraryEntries(
+    'jellyfin' as LibraryModule,
+    id,
+    data.entries || []
+  )
+}
+
+/**
+ * 收集季 / 剧集下的全部可播放单集（「整季添加」用）。
+ * 与 fetchEmbyEpisodes 对齐。
+ */
+export async function fetchJellyfinEpisodes(
+  id: number,
+  path: string,
+  limit?: number
+): Promise<JellyfinDirectoryEntry[]> {
+  const params = new URLSearchParams({ path })
+  if (limit != null) params.set('limit', String(limit))
+  const res = await apiFetch(
+    `/api/jellyfin/mounts/${id}/episodes?${params.toString()}`
+  )
+  const data = (await res.json()) as {
+    success: boolean
+    entries?: JellyfinDirectoryEntry[]
+    message?: string
+  }
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || '获取 Jellyfin 剧集列表失败')
+  }
+  return decorateLibraryEntries(
+    'jellyfin' as LibraryModule,
+    id,
+    data.entries || []
+  )
 }
 
 /**
@@ -148,7 +186,11 @@ export async function searchJellyfinMount(
   if (!res.ok || !data.success) {
     throw new Error(data.message || '搜索 Jellyfin 媒体库失败')
   }
-  return data.entries || []
+  return decorateLibraryEntries(
+    'jellyfin' as LibraryModule,
+    id,
+    data.entries || []
+  )
 }
 
 export async function resolveJellyfin(

@@ -43,6 +43,29 @@ export interface EmbyDirectoryEntry {
   /** Emby 条目类型（CollectionFolder/Series/Season/Movie/Episode/Video） */
   embyType?: string
   childCount?: number
+  /**
+   * 缩略图地址（本站 /api/emby/mounts/:id/image 代理，已带鉴权 token）。
+   * 由 API 层根据后端下发的 imageTag 拼装；条目无主图时为 undefined。
+   */
+  imageUrl?: string
+  /** 主图宽高比（0.6667≈2:3 海报，1.7778≈16:9 剧照），用于选择缩略图展示比例 */
+  imageAspectRatio?: number | null
+  /** 集序号（单集/季） */
+  indexNumber?: number | null
+  /** 所属季序号（单集的 ParentIndexNumber） */
+  parentIndexNumber?: number | null
+  /** 所属剧集名（单集的 SeriesName） */
+  seriesName?: string | null
+  /** 发行年份 */
+  productionYear?: number | null
+  /** 时长（100ns tick，除以 1e7 得秒） */
+  runtimeTicks?: number | null
+}
+
+/** 浏览框选中条目回传（路径 + 可读名称，用于批量添加时生成影片标题） */
+export interface SelectedLibraryEntry {
+  path: string
+  name: string
 }
 
 export interface EmbyResolvedSource {

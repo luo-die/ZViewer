@@ -5,13 +5,18 @@
  */
 import EmbyBrowser from '@/modules/emby/EmbyBrowser'
 import type { EmbyDirectoryEntry } from '@/modules/emby/types'
-import { browseJellyfinMount, searchJellyfinMount } from './jellyfinApi'
+import {
+  browseJellyfinMount,
+  searchJellyfinMount,
+  fetchJellyfinEpisodes,
+} from './jellyfinApi'
+import type { SelectedLibraryEntry } from '@/modules/emby/types'
 
 interface JellyfinBrowserProps {
   mountId: number | null
   open: boolean
   onClose: () => void
-  onSelectFiles?: (paths: string[]) => void
+  onSelectFiles?: (paths: string[], entries?: SelectedLibraryEntry[]) => void
   selectable?: boolean
 }
 
@@ -39,6 +44,12 @@ export default function JellyfinBrowser({
         searchJellyfinMount as (
           mountId: number,
           query: string
+        ) => Promise<EmbyDirectoryEntry[]>
+      }
+      fetchEpisodes={
+        fetchJellyfinEpisodes as (
+          mountId: number,
+          path: string
         ) => Promise<EmbyDirectoryEntry[]>
       }
       title="浏览 Jellyfin 媒体库"

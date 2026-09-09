@@ -585,7 +585,10 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
   }, [sourceType, mounts])
 
   const handleSelectFilesFromMount = useCallback(
-    async (paths: string[]) => {
+    async (
+      paths: string[],
+      entries?: Array<{ path: string; name: string }>
+    ) => {
       if (!isHost) {
         message.info('只有房主可以添加影片')
         return
@@ -601,12 +604,23 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
         return
       }
 
+      // 浏览框回传的展示名（Emby/Jellyfin 单集为「S01E02 剧集名」）。
+      // 媒体库型源优先用它作标题——只靠文件名解析出的标题不含季集编号。
+      const selectedTitleMap = new Map(
+        (entries ?? []).map((e) => [normalizeMountPath(e.path), e.name])
+      )
+
       setLoading(true)
       setResolveProgress(`正在批量解析 ${paths.length} 个文件...`)
       try {
         let added = 0
         for (const path of paths) {
           const normalizedPath = normalizeMountPath(path)
+          setResolveProgress(
+            `正在添加 ${added + 1}/${paths.length}：${
+              selectedTitleMap.get(normalizedPath) ?? normalizedPath
+            }`
+          )
           if (sourceType === 'webdav' || sourceType === 'openlist') {
             // WebDAV 与 OpenList 共用同一套协议逻辑，仅 API 前缀与直链获取不同
             // 内网地址强制使用服务器转发（浏览器无法直连内网服务器）
@@ -676,7 +690,10 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
           } else if (sourceType === 'emby') {
             // Emby：解析播放信息，支持服务器转发（默认）或直链直连
             const resolved = await resolveEmby(mountId, normalizedPath)
-            const title = resolved.title || extractTitleFromUrl(normalizedPath)
+            const title =
+              selectedTitleMap.get(normalizedPath) ||
+              resolved.title ||
+              extractTitleFromUrl(normalizedPath)
             const mount = mounts.find((m) => m.id === mountId)
             await addMovie(roomId, {
               url:
@@ -694,7 +711,10 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
             added++
           } else if (sourceType === 'jellyfin') {
             const resolved = await resolveJellyfin(mountId, normalizedPath)
-            const title = resolved.title || extractTitleFromUrl(normalizedPath)
+            const title =
+              selectedTitleMap.get(normalizedPath) ||
+              resolved.title ||
+              extractTitleFromUrl(normalizedPath)
             const mount = mounts.find((m) => m.id === mountId)
             await addMovie(roomId, {
               url:
@@ -1651,8 +1671,8 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
           />
           <Text className="text-xs text-[var(--md-sys-color-on-surface-variant)]">
             {selectedMountId
-              ? '已选择挂载，点击「浏览 Emby 媒体库」逐级选择电影 / 剧集，多选模式可批量添加。'
-              : '选择挂载后点击「浏览 Emby 媒体库」逐级选择电影 / 剧集，多选模式可批量添加。服务器转发由本服务中转（跨域/防盗链友好）；直链直连由浏览器直接访问 Emby 服务器。'}
+              ? '已选择挂载，点击「浏览 Emby 媒体库」逐级选择：电影单选、单集多选，季 / 剧集可直接「整季添加」。'
+              : '选择挂载后点击「浏览 Emby 媒体库」逐级选择：电影单选、单集多选，季 / 剧集可直接「整季添加」。服务器转发由本服务中转（跨域/防盗链友好）；直链直连由浏览器直接访问 Emby 服务器。'}
           </Text>
         </Space>
       )
@@ -1707,8 +1727,8 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
           />
           <Text className="text-xs text-[var(--md-sys-color-on-surface-variant)]">
             {selectedMountId
-              ? '已选择挂载，点击「浏览 Jellyfin 媒体库」逐级选择电影 / 剧集，多选模式可批量添加。'
-              : '选择挂载后点击「浏览 Jellyfin 媒体库」逐级选择电影 / 剧集，多选模式可批量添加。服务器转发由本服务中转（跨域/防盗链友好）；直链直连由浏览器直接访问 Jellyfin 服务器。'}
+              ? '已选择挂载，点击「浏览 Jellyfin 媒体库」逐级选择：电影单选、单集多选，季 / 剧集可直接「整季添加」。'
+              : '选择挂载后点击「浏览 Jellyfin 媒体库」逐级选择：电影单选、单集多选，季 / 剧集可直接「整季添加」。服务器转发由本服务中转（跨域/防盗链友好）；直链直连由浏览器直接访问 Jellyfin 服务器。'}
           </Text>
         </Space>
       )

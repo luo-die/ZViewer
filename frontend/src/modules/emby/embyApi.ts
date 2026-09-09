@@ -5,6 +5,7 @@
  */
 import { apiFetch } from '@/lib/api'
 import { buildProxyUrl } from '@/modules/direct-link/directLinkApi'
+import { appendAuthToken } from '@/modules/player/services/url-proxy'
 import type { MediaFormat } from '@/lib/mediaFormat'
 import type {
   EmbyMount,
@@ -13,6 +14,66 @@ import type {
   EmbyDirectoryEntry,
   EmbyResolvedSource,
 } from './types'
+
+/** 媒体库挂载类型（Emby / Jellyfin 共用同一套浏览与图片代理接口） */
+export type LibraryModule = 'emby' | 'jellyfin'
+
+/**
+ * 后端 /browse、/search、/episodes 返回的原始条目。
+ * 比前端条目多一个 imageTag（图片版本标识），由本层拼成 imageUrl。
+ */
+interface RawLibraryEntry {
+  name: string
+  path: string
+  type: 'file' | 'directory'
+  embyType?: string
+  childCount?: number
+  imageTag?: string | null
+  imageAspectRatio?: number | null
+  indexNumber?: number | null
+  parentIndexNumber?: number | null
+  seriesName?: string | null
+  productionYear?: number | null
+  runtimeTicks?: number | null
+}
+
+/**
+ * 缩略图地址（本站图片代理，需鉴权）。
+ *
+ * 为什么要走代理：Emby/Jellyfin 的图片端点需要 api_key，而 <img> 无法设置请求头；
+ * 由后端带 token 取图后中转，前端不直连媒体服务器（内网 Emby 也能显示缩略图）。
+ * tag 拼在 URL 里，图片变更后缓存自动失效。
+ */
+export function buildLibraryImageUrl(
+  module: LibraryModule,
+  mountId: number,
+  entry: { path: string; imageTag?: string | null },
+  opts?: { type?: string; maxWidth?: number; maxHeight?: number }
+): string | undefined {
+  if (!entry.imageTag) return undefined
+  const params = new URLSearchParams({
+    itemId: entry.path,
+    tag: entry.imageTag,
+    type: opts?.type ?? 'Primary',
+    maxWidth: String(opts?.maxWidth ?? 200),
+    maxHeight: String(opts?.maxHeight ?? 300),
+  })
+  return appendAuthToken(
+    `/api/${module}/mounts/${mountId}/image?${params.toString()}`
+  )
+}
+
+/** 原始条目 → 前端条目（补上缩略图地址） */
+export function decorateLibraryEntries(
+  module: LibraryModule,
+  mountId: number,
+  raw: RawLibraryEntry[]
+): EmbyDirectoryEntry[] {
+  return raw.map((entry) => ({
+    ...entry,
+    imageUrl: buildLibraryImageUrl(module, mountId, entry),
+  }))
+}
 
 function jsonHeaders(): Record<string, string> {
   return { 'Content-Type': 'application/json' }
@@ -117,13 +178,38 @@ export async function browseEmbyMount(
   const res = await apiFetch(`/api/emby/mounts/${id}/browse${query}`)
   const data = (await res.json()) as {
     success: boolean
-    entries?: EmbyDirectoryEntry[]
+    entries?: RawLibraryEntry[]
     message?: string
   }
   if (!res.ok || !data.success) {
     throw new Error(data.message || '浏览 Emby 挂载失败')
   }
-  return data.entries || []
+  return decorateLibraryEntries('emby', id, data.entries || [])
+}
+
+/**
+ * 收集季 / 剧集下的全部可播放单集（「整季添加」用）。
+ * 后端递归展开并按季号、集号排序，前端一次拿到可直接批量添加的列表。
+ */
+export async function fetchEmbyEpisodes(
+  id: number,
+  path: string,
+  limit?: number
+): Promise<EmbyDirectoryEntry[]> {
+  const params = new URLSearchParams({ path })
+  if (limit != null) params.set('limit', String(limit))
+  const res = await apiFetch(
+    `/api/emby/mounts/${id}/episodes?${params.toString()}`
+  )
+  const data = (await res.json()) as {
+    success: boolean
+    entries?: RawLibraryEntry[]
+    message?: string
+  }
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || '获取 Emby 剧集列表失败')
+  }
+  return decorateLibraryEntries('emby', id, data.entries || [])
 }
 
 /**
@@ -142,13 +228,13 @@ export async function searchEmbyMount(
   )
   const data = (await res.json()) as {
     success: boolean
-    entries?: EmbyDirectoryEntry[]
+    entries?: RawLibraryEntry[]
     message?: string
   }
   if (!res.ok || !data.success) {
     throw new Error(data.message || '搜索 Emby 媒体库失败')
   }
-  return data.entries || []
+  return decorateLibraryEntries('emby', id, data.entries || [])
 }
 
 export async function resolveEmby(

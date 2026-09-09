@@ -15,6 +15,8 @@ import {
   CheckSquare2,
   Square,
   ListChecks,
+  ListPlus,
+  Loader2,
   Clapperboard,
   Search,
   X,
@@ -23,20 +25,27 @@ import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { Spinner } from '@/components/ui/Spinner'
 import { Text } from '@/components/ui/Typography'
+import { message } from '@/components/ui/message'
 import { cn } from '@/lib/utils'
-import { browseEmbyMount, searchEmbyMount } from './embyApi'
-import type { EmbyDirectoryEntry } from './types'
+import { browseEmbyMount, searchEmbyMount, fetchEmbyEpisodes } from './embyApi'
+import { formatEntryTitle, formatEpisodeCode } from './entryUtils'
+import type { EmbyDirectoryEntry, SelectedLibraryEntry } from './types'
 
 export interface MediaLibraryBrowserProps {
   mountId: number | null
   open: boolean
   onClose: () => void
-  onSelectFiles?: (paths: string[]) => void
+  onSelectFiles?: (paths: string[], entries?: SelectedLibraryEntry[]) => void
   selectable?: boolean
   /** 浏览函数（Emby/Jellyfin 传入各自实现），默认 Emby */
   browse?: (mountId: number, path?: string) => Promise<EmbyDirectoryEntry[]>
   /** 搜索函数（Emby/Jellyfin 传入各自实现），默认 Emby */
   search?: (mountId: number, query: string) => Promise<EmbyDirectoryEntry[]>
+  /** 整季/全剧剧集展开函数（Emby/Jellyfin 传入各自实现），默认 Emby */
+  fetchEpisodes?: (
+    mountId: number,
+    path: string
+  ) => Promise<EmbyDirectoryEntry[]>
   /** 弹窗标题，默认「浏览 Emby 媒体库」 */
   title?: string
 }
@@ -68,6 +77,47 @@ const FOLDER_ICONS: Record<string, React.ReactNode> = {
   ),
 }
 
+/**
+ * 条目缩略图。
+ *
+ * - 有主图 → 海报（2:3）/ 剧照（16:9，单集与横图条目）缩略图，懒加载
+ * - 无主图或加载失败 → 回落为原来的类型图标，列表观感与改动前一致
+ */
+function EntryThumbnail({
+  entry,
+  fallback,
+}: {
+  entry: EmbyDirectoryEntry
+  fallback: React.ReactNode
+}) {
+  const [failed, setFailed] = useState(false)
+  const wide =
+    (entry.imageAspectRatio ?? 0) > 1.2 ||
+    entry.embyType === 'Episode' ||
+    entry.embyType === 'Video'
+  const box = wide ? 'h-[34px] w-[60px]' : 'h-12 w-8'
+  if (!entry.imageUrl || failed) {
+    return (
+      <span className={cn('flex shrink-0 items-center justify-center', box)}>
+        {fallback}
+      </span>
+    )
+  }
+  return (
+    <img
+      src={entry.imageUrl}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      className={cn(
+        'shrink-0 rounded-[6px] bg-[var(--md-sys-color-surface-container-high)] object-cover',
+        box
+      )}
+    />
+  )
+}
+
 export default function EmbyBrowser({
   mountId,
   open,
@@ -75,6 +125,7 @@ export default function EmbyBrowser({
   onSelectFiles,
   browse = browseEmbyMount,
   search = searchEmbyMount,
+  fetchEpisodes = fetchEmbyEpisodes,
   title = '浏览 Emby 媒体库',
 }: MediaLibraryBrowserProps) {
   /** 面包屑历史栈：不含根（根 = 媒体库） */
@@ -96,6 +147,10 @@ export default function EmbyBrowser({
   const searchSeqRef = useRef(0)
   /** 搜索重试计数器（相同关键词重新触发 effect） */
   const [searchNonce, setSearchNonce] = useState(0)
+  /** 正在展开的季/剧集 itemId（「整季添加」进行中，按钮显示加载态） */
+  const [seasonLoadingPath, setSeasonLoadingPath] = useState<string | null>(
+    null
+  )
 
   const searchMode = query.trim().length > 0
   const currentPath =
@@ -255,9 +310,46 @@ export default function EmbyBrowser({
 
   const confirmSelection = () => {
     if (selectedFiles.length === 0) return
-    onSelectFiles?.(selectedFiles.map((f) => f.path))
+    onSelectFiles?.(
+      selectedFiles.map((f) => f.path),
+      selectedFiles.map((f) => ({ path: f.path, name: formatEntryTitle(f) }))
+    )
     onClose()
   }
+
+  /**
+   * 整季 / 全剧添加：展开该季（或剧集）下的全部单集后一次性加入房间。
+   *
+   * 展开由后端递归完成（季 → 单集，剧集 → 各季单集），按季号、集号排序；
+   * 这里只负责把结果交给 onSelectFiles，批量解析与入列沿用既有流程。
+   */
+  const addWholeSeason = useCallback(
+    async (entry: EmbyDirectoryEntry) => {
+      if (mountId === null || !onSelectFiles) return
+      setSeasonLoadingPath(entry.path)
+      try {
+        const episodes = await fetchEpisodes(mountId, entry.path)
+        const files = episodes.filter((e) => e.type === 'file')
+        if (files.length === 0) {
+          message.warning(`「${entry.name}」下没有找到可播放的剧集`)
+          return
+        }
+        message.success(`正在添加「${entry.name}」共 ${files.length} 集…`)
+        onSelectFiles(
+          files.map((f) => f.path),
+          files.map((f) => ({ path: f.path, name: formatEntryTitle(f) }))
+        )
+        onClose()
+      } catch (err) {
+        message.error(
+          err instanceof Error ? err.message : '展开剧集失败，请稍后重试'
+        )
+      } finally {
+        setSeasonLoadingPath(null)
+      }
+    },
+    [mountId, onSelectFiles, fetchEpisodes, onClose]
+  )
 
   const renderEntry = (
     entry: EmbyDirectoryEntry,
@@ -273,6 +365,14 @@ export default function EmbyBrowser({
       : undefined) ?? (
       <Folder className="h-5 w-5 shrink-0 text-[var(--md-sys-color-primary)]" />
     )
+    const episodeCode = formatEpisodeCode(entry)
+    // 整季 / 全剧添加：仅对季与剧集目录开放，且调用方已提供批量添加回调
+    const canAddWholeSeason =
+      isDirectory &&
+      !!onSelectFiles &&
+      (entry.embyType === 'Season' || entry.embyType === 'Series')
+    const seasonLabel = entry.embyType === 'Series' ? '全剧添加' : '整季添加'
+    const seasonLoading = seasonLoadingPath === entry.path
 
     return (
       <div
@@ -297,16 +397,26 @@ export default function EmbyBrowser({
           }
         }}
       >
-        {isDirectory ? (
-          folderIcon
-        ) : (
-          <Film className="h-5 w-5 shrink-0 text-[var(--md-sys-color-on-surface-variant)]" />
-        )}
+        <EntryThumbnail
+          entry={entry}
+          fallback={
+            isDirectory ? (
+              folderIcon
+            ) : (
+              <Film className="h-5 w-5 shrink-0 text-[var(--md-sys-color-on-surface-variant)]" />
+            )
+          }
+        />
 
         <span
           className="min-w-0 flex-1 truncate text-[15px] font-medium"
-          title={entry.name}
+          title={formatEntryTitle(entry)}
         >
+          {episodeCode && (
+            <span className="mr-1.5 rounded bg-[var(--md-sys-color-surface-container-high)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--md-sys-color-on-surface-variant)]">
+              {episodeCode}
+            </span>
+          )}
           {entry.name}
         </span>
 
@@ -314,6 +424,32 @@ export default function EmbyBrowser({
           <span className="shrink-0 text-[13px] text-[var(--md-sys-color-on-surface-variant)]">
             {entry.childCount} 项
           </span>
+        )}
+
+        {canAddWholeSeason && (
+          <button
+            type="button"
+            title={`${seasonLabel}（展开该${entry.embyType === 'Series' ? '剧集' : '季'}下全部单集）`}
+            disabled={seasonLoading}
+            className={cn(
+              'flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-[12px] font-medium transition-all',
+              'border-[var(--md-sys-color-outline-variant)] text-[var(--md-sys-color-primary)]',
+              'hover:border-[var(--md-sys-color-primary)] hover:bg-[var(--md-sys-color-primary-container)]',
+              'disabled:cursor-wait disabled:opacity-60',
+              'opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100'
+            )}
+            onClick={(e) => {
+              e.stopPropagation()
+              void addWholeSeason(entry)
+            }}
+          >
+            {seasonLoading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <ListPlus className="h-3.5 w-3.5" />
+            )}
+            {seasonLabel}
+          </button>
         )}
 
         {!isDirectory && (showCheckbox || isSelected) && (
@@ -391,7 +527,7 @@ export default function EmbyBrowser({
           >
             {multiSelectMode
               ? `已选择 ${selectedFiles.length} 个条目`
-              : '多选模式可批量添加'}
+              : '多选批量添加；季 / 剧集可一键「整季添加」'}
           </Text>
           <div className="flex items-center gap-3">
             <Button variant="secondary" size="md" onClick={onClose}>
