@@ -886,16 +886,23 @@ const embeddedTracksCache = new Map<
 >();
 const EMBEDDED_TRACKS_TTL_MS = 5 * 60 * 1000;
 
+/** 容器探测结果：文本字幕轨 + Range 支持 + 文件大小（提取策略用） */
+interface ServerMkvTracks {
+  tracks: MkvSubtitleTrackInfo[];
+  rangeSupported: boolean;
+  fileSize: number;
+}
+
 const mkvProbeCache = new Map<
   number,
-  { at: number; value: { tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null }
+  { at: number; value: ServerMkvTracks | null }
 >();
 const MKV_PROBE_TTL_MS = 10 * 60 * 1000;
 const MKV_PROBE_FAILURE_TTL_MS = 60 * 1000;
 
 async function listServerMkvTracks(
   movie: Movie,
-): Promise<{ tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null> {
+): Promise<ServerMkvTracks | null> {
   const cached = mkvProbeCache.get(movie.id);
   if (cached) {
     const ttl = cached.value ? MKV_PROBE_TTL_MS : MKV_PROBE_FAILURE_TTL_MS;
@@ -910,7 +917,10 @@ async function listServerMkvTracks(
       timeoutMs: 60_000,
     });
     const tracks = probe.tracks.filter((t) => t.isText);
-    const value = tracks.length === 0 ? null : { tracks, rangeSupported: probe.rangeSupported };
+    const value =
+      tracks.length === 0
+        ? null
+        : { tracks, rangeSupported: probe.rangeSupported, fileSize: probe.fileSize };
     mkvProbeCache.set(movie.id, { at: Date.now(), value });
     return value;
   } catch (err) {
@@ -986,15 +996,15 @@ const mkvInflight = new Set<string>();
 const mkvPartial = new Map<string, MkvCachedSubtitle & { partial: true }>();
 /** 最近一次提取失败原因：轮询方立即拿到真实原因，而不是一直等到超时 */
 /**
- * 字幕提取的读取限速（字节/秒）。
- * 默认 8MB/s：足够在开头几秒内取到首批 cue，又不会把媒体源带宽吃满
- * 影响起播；环境变量 MKV_EXTRACT_MAX_MBPS=0 表示不限速。
+ * 字幕提取的读取限速（字节/秒，0 = 不限速）。
+ * 默认 0：大文件会自适应切到 Range 跳读（只下载字幕块，带宽占用极小），
+ * 无需再靠限速保护起播；如需给顺序流兜底限速，设 MKV_EXTRACT_MAX_MBPS。
  */
 const MKV_EXTRACT_MAX_BYTES_PER_SEC = (() => {
   const raw = process.env.MKV_EXTRACT_MAX_MBPS;
-  if (raw === undefined) return 8 * 1024 * 1024;
+  if (raw === undefined) return 0;
   const mbps = Number(raw);
-  if (!Number.isFinite(mbps) || mbps < 0) return 8 * 1024 * 1024;
+  if (!Number.isFinite(mbps) || mbps < 0) return 0;
   return Math.round(mbps * 1024 * 1024);
 })();
 
@@ -1005,6 +1015,8 @@ function startMkvExtractionInBackground(
   movie: Movie,
   track: number,
   cacheKey: string,
+  /** 文件大小（探测阶段拿到）：提取阶段据此选择跳读 / 顺序流 */
+  fileSizeHint?: number,
 ): boolean {
   if (mkvInflight.has(cacheKey)) return false;
   // 同时最多跑 2 个解容器任务：每个都要顺序读完整集，开太多会挤占带宽
@@ -1025,9 +1037,13 @@ function startMkvExtractionInBackground(
           url: src.url,
           headers: src.headers,
           timeoutMs: 900_000,
-          // 顺序读取限速：字幕提取与播放同时进行，全速拉整集会挤占
+          // 文件大小提示：大文件走 Range 跳读（只下载字幕附近的块，
+          // 940MB 单集的完整字幕从分钟级降到十几秒），小文件仍走顺序流。
+          fileSizeHint,
+          // 顺序流模式的读取限速：字幕提取与播放同时进行，全速拉整集会挤占
           // 「服务器 → 媒体源」带宽导致起播卡顿；限速后开头 cue 仍秒级到达。
           // MKV_EXTRACT_MAX_MBPS=0 可关闭限速（内网/带宽充裕时更快）。
+          // 跳读模式下不适用（本来就不下载整集）。
           maxBytesPerSec: MKV_EXTRACT_MAX_BYTES_PER_SEC,
         },
         track,
@@ -1608,7 +1624,12 @@ router.get(
           // 顺序读取下第一个 Cluster 的头几 MB 内就有字幕，通常 0.5~1.5s 可拿到，
           // 直接带回去能省掉一轮轮询（前端原本要等下一个 4s 轮询才有字幕）。
           // 超过等待窗口仍返回 202，长任务继续在后台跑（避免反向代理 504）。
-          const started = startMkvExtractionInBackground(movie, streamIndex, cacheKey);
+          const started = startMkvExtractionInBackground(
+            movie,
+            streamIndex,
+            cacheKey,
+            known.fileSize,
+          );
           const FIRST_PARTIAL_WAIT_MS = 1_500;
           const waitUntil = Date.now() + FIRST_PARTIAL_WAIT_MS;
           for (;;) {

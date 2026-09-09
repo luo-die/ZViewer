@@ -40,6 +40,57 @@ const MAX_SUBTITLE_BYTES = 32 * 1024 * 1024; // 单轨字幕文本上限
 const CHUNK_SIZE = 4 * 1024 * 1024;
 
 /**
+ * 「跳读」模式（Range 跳过视频负载）的窗口大小。
+ * 顺序流要下载整个文件（940MB 的单集约 2 分钟），而字幕只占其中极小一段；
+ * 跳读模式下解析器只按需取小块：解析到视频块就只推进指针（不下载），
+ * 到下一个元素再抓一个小窗口。窗口越小省得越多，但请求数越多。
+ * 64KB 是折中：每个视频块浪费 ≤64KB，25 分钟剧集约 300~600 个请求、~20MB。
+ */
+const SKIP_WINDOW_BYTES = (() => {
+  const raw = Number(process.env.MKV_SKIP_WINDOW_KB ?? 64);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1024) : 64 * 1024;
+})();
+
+/**
+ * 跳读模式的最小请求间隔。顺序流只发 1 个请求，不受限流影响；
+ * 跳读模式请求数多，间隔太小会触发上游 429，太大又浪费时间。
+ * 遇到 429 会自适应翻倍（见 HttpByteReader.onRateLimit）。
+ */
+const SKIP_MIN_INTERVAL_MS = (() => {
+  const raw = Number(process.env.MKV_SKIP_MIN_INTERVAL_MS ?? 30);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 30;
+})();
+
+/** 跳读模式的请求预算：超过后自动降级为顺序流（从当前位置继续），避免请求风暴 */
+const SKIP_MAX_REQUESTS = (() => {
+  const raw = Number(process.env.MKV_SKIP_MAX_REQUESTS ?? 1500);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 1500;
+})();
+
+/** 小于该体积的文件直接用顺序流（1 个请求就够，跳读没有收益） */
+const RANGE_SKIP_MIN_FILE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * 自适应策略：先用顺序流跑一小段，量一下上游吞吐，再决定是否切跳读。
+ * - 上游快（内网/NAS，整集 20s 内能读完）→ 继续顺序流：请求数最少、最稳；
+ * - 上游慢（远程/跨网，整集要读几十秒到几分钟）→ 切跳读：只下载字幕附近的块。
+ * 采样时长与切换阈值都可调，便于按部署环境调优。
+ */
+const SKIP_SAMPLE_MS = (() => {
+  const raw = Number(process.env.MKV_SKIP_SAMPLE_MS ?? 1200);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1200;
+})();
+const SKIP_PROJECT_MS = (() => {
+  const raw = Number(process.env.MKV_SKIP_PROJECT_MS ?? 15_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+})();
+/** 采样阶段的字节上限：快链路上不必读满 1.2s（否则会白读几十 MB） */
+const SKIP_SAMPLE_BYTES = (() => {
+  const raw = Number(process.env.MKV_SKIP_SAMPLE_MB ?? 16);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1024 * 1024) : 16 * 1024 * 1024;
+})();
+
+/**
  * 上游（第三方媒体服务器，如 UHD Media Server）对同一来源有请求频率限制：
  * 密集 / 并发 Range 请求会返回 429「请求过于频繁」。因此这里：
  *   - 所有上游请求串行排队，两次请求之间保持最小间隔；
@@ -62,7 +113,10 @@ function sleep(ms: number): Promise<void> {
 let upstreamGate: Promise<void> = Promise.resolve();
 let upstreamLastAt = 0;
 
-async function withUpstreamSlot<T>(task: () => Promise<T>): Promise<T> {
+async function withUpstreamSlot<T>(
+  task: () => Promise<T>,
+  minIntervalMs = UPSTREAM_MIN_INTERVAL_MS,
+): Promise<T> {
   const prev = upstreamGate;
   let release!: () => void;
   upstreamGate = new Promise<void>((resolve) => {
@@ -70,7 +124,7 @@ async function withUpstreamSlot<T>(task: () => Promise<T>): Promise<T> {
   });
   await prev;
   try {
-    const wait = upstreamLastAt + UPSTREAM_MIN_INTERVAL_MS - Date.now();
+    const wait = upstreamLastAt + minIntervalMs - Date.now();
     if (wait > 0) await sleep(wait);
     upstreamLastAt = Date.now();
     return await task();
@@ -83,20 +137,30 @@ async function withUpstreamSlot<T>(task: () => Promise<T>): Promise<T> {
  * 带上限流退避的上游请求。返回 4xx（非 429/408）时原样交给调用方判断；
  * 429 / 5xx / 网络异常会退避重试，重试用尽后返回最后一次响应（或抛错）。
  */
+/** 上游请求的限流参数（跳读模式用更小的间隔，并在 429 时自适应放大） */
+interface UpstreamGate {
+  minIntervalMs: number;
+  /** 收到 429 时调用，调用方负责放大间隔 */
+  onRateLimit?: () => void;
+}
+
 async function fetchUpstream(
   url: string,
   headers: Record<string, string>,
   timeoutMs: number,
+  gate?: UpstreamGate,
 ): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= UPSTREAM_MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await withUpstreamSlot(() =>
-        fetch(url, { headers, signal: controller.signal }),
+      const res = await withUpstreamSlot(
+        () => fetch(url, { headers, signal: controller.signal }),
+        gate?.minIntervalMs,
       );
       const retryable = res.status === 429 || res.status === 408 || res.status >= 500;
+      if (res.status === 429) gate?.onRateLimit?.();
       if (!retryable || attempt === UPSTREAM_MAX_RETRIES) return res;
       const retryAfter = Number(res.headers.get('retry-after'));
       try {
@@ -138,6 +202,8 @@ export interface MkvProbeResult {
   /** 服务端是否支持 Range 请求（诊断用） */
   rangeSupported: boolean;
   timestampScale: number;
+  /** 文件总大小（0 = 未知）；提取阶段据此选择跳读 / 顺序流 */
+  fileSize: number;
 }
 
 export interface MkvExtractResult {
@@ -156,6 +222,12 @@ export interface MkvSourceOptions {
    * 'stream'：单次请求顺序读取整个文件（提取字幕用，避免大量 Range 请求触发限流）。
    */
   mode?: 'range' | 'stream';
+  /** Range 模式每次抓取的窗口大小（默认 4MB；跳读模式传小窗口） */
+  windowBytes?: number;
+  /** 两次上游请求之间的最小间隔（默认 120ms；跳读模式可放宽到 30ms） */
+  minIntervalMs?: number;
+  /** 文件总大小提示（来自探测阶段的 Content-Range，用于决定跳读还是顺序流） */
+  fileSizeHint?: number;
   /**
    * 顺序流模式的读取限速（字节/秒，0/未设置 = 不限速）。
    * 字幕提取要与播放同时进行，若全速拉取整集文件会挤占「服务器 → 媒体源」
@@ -186,27 +258,71 @@ class HttpByteReader {
   /** 顺序模式限速：已读字节数与起始时间（见 throttleStream） */
   private streamBytes = 0;
   private streamStartedAt = Date.now();
+  /** 已发出的上游请求数（跳读模式的预算控制用） */
+  private requests = 0;
+  /** 上游文件总大小（从 Content-Range/Content-Length 推断，未知为 0） */
+  fileSize = 0;
+  /** 当前最小请求间隔（429 时自适应放大） */
+  private minIntervalMs: number;
 
   private constructor(
     readonly rangeSupported: boolean,
     private readonly opts: MkvSourceOptions,
-    initial?: { buf: Buffer; streamReader: ReadableStreamDefaultReader<Uint8Array> | null },
+    initial?: {
+      buf: Buffer;
+      streamReader: ReadableStreamDefaultReader<Uint8Array> | null;
+      bufStart?: number;
+      pos?: number;
+      fileSize?: number;
+    },
   ) {
+    this.minIntervalMs = opts.minIntervalMs ?? UPSTREAM_MIN_INTERVAL_MS;
     if (initial) {
       this.buf = initial.buf;
-      this.bufStart = 0;
+      this.bufStart = initial.bufStart ?? 0;
       this.streamReader = initial.streamReader;
+      this.pos = initial.pos ?? 0;
+      if (initial.fileSize) this.fileSize = initial.fileSize;
     }
+  }
+ 
+  /** 跳读模式：每个小窗口一次请求，间隔更短；429 时自适应放大 */
+  private gate(): UpstreamGate {
+    return {
+      minIntervalMs: this.minIntervalMs,
+      onRateLimit: () => {
+        const next = Math.min(Math.max(this.minIntervalMs * 2, 60), 1000);
+        if (next !== this.minIntervalMs) {
+          console.warn(
+            `[mkv-subtitles] 上游限流（429），请求间隔 ${this.minIntervalMs}ms → ${next}ms`,
+          );
+          this.minIntervalMs = next;
+        }
+      },
+    };
+  }
+
+  /** 从 Content-Range / Content-Length 解析文件总大小 */
+  private static parseFileSize(res: Response): number {
+    const cr = res.headers.get('content-range');
+    const total = cr ? Number(cr.split('/').pop()) : NaN;
+    if (Number.isFinite(total) && total > 0) return total;
+    const cl = Number(res.headers.get('content-length'));
+    return Number.isFinite(cl) && cl > 0 ? cl : 0;
   }
 
   static async open(opts: MkvSourceOptions): Promise<HttpByteReader> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
     // 顺序模式：不带 Range 的单次请求（整文件顺序读，不会触发上游限流）
     const sequential = opts.mode === 'stream';
+    const windowBytes = opts.windowBytes ?? CHUNK_SIZE;
     const headers = sequential
       ? { ...(opts.headers ?? {}) }
-      : { ...(opts.headers ?? {}), Range: 'bytes=0-1' };
-    const res = await fetchUpstream(opts.url, headers, timeoutMs);
+      : { ...(opts.headers ?? {}), Range: `bytes=0-${windowBytes - 1}` };
+    const gate: UpstreamGate = {
+      minIntervalMs: opts.minIntervalMs ?? UPSTREAM_MIN_INTERVAL_MS,
+    };
+    const res = await fetchUpstream(opts.url, headers, timeoutMs, gate);
     const rangeSupported = !sequential && res.status === 206;
     if (!res.ok && res.status !== 206) {
       throw new Error(`MKV 读取失败: HTTP ${res.status}`);
@@ -219,6 +335,41 @@ class HttpByteReader {
     return new HttpByteReader(rangeSupported, opts, {
       buf,
       streamReader: rangeSupported ? null : reader,
+      fileSize: HttpByteReader.parseFileSize(res),
+    });
+  }
+
+  /**
+   * 从指定字节偏移继续读取（用于跳读 → 顺序流的降级：
+   * Range: bytes=offset- 让上游从该位置把剩余内容顺序吐出来，
+   * 之后按普通顺序流处理，不再产生小请求）。
+   */
+  static async openAt(
+    opts: MkvSourceOptions,
+    offset: number,
+    asSequential: boolean,
+  ): Promise<HttpByteReader> {
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    const res = await fetchUpstream(
+      opts.url,
+      { ...(opts.headers ?? {}), Range: `bytes=${offset}-` },
+      timeoutMs,
+      { minIntervalMs: opts.minIntervalMs ?? UPSTREAM_MIN_INTERVAL_MS },
+    );
+    if (!res.ok && res.status !== 206) {
+      throw new Error(`MKV 读取失败: HTTP ${res.status}`);
+    }
+    if (!res.body) throw new Error(`MKV 读取失败: HTTP ${res.status}`);
+    const streamReader = res.body.getReader();
+    const first = await streamReader.read();
+    const buf = first.value ? Buffer.from(first.value) : Buffer.alloc(0);
+    const rangeSupported = !asSequential && res.status === 206;
+    return new HttpByteReader(rangeSupported, opts, {
+      buf,
+      streamReader: rangeSupported ? null : streamReader,
+      bufStart: offset,
+      pos: offset,
+      fileSize: HttpByteReader.parseFileSize(res),
     });
   }
 
@@ -228,6 +379,7 @@ class HttpByteReader {
 
   private async fetchRange(start: number, length: number): Promise<Buffer> {
     const timeoutMs = this.opts.timeoutMs ?? 30_000;
+    this.requests++;
     const res = await fetchUpstream(
       this.opts.url,
       {
@@ -235,11 +387,18 @@ class HttpByteReader {
         Range: `bytes=${start}-${start + length - 1}`,
       },
       timeoutMs,
+      this.gate(),
     );
     if (!res.ok && res.status !== 206) {
       throw new Error(`MKV 读取失败: HTTP ${res.status}`);
     }
+    if (!this.fileSize) this.fileSize = HttpByteReader.parseFileSize(res);
     return Buffer.from(await res.arrayBuffer());
+  }
+
+  /** 已发出的上游请求数（跳读模式预算控制） */
+  get requestCount(): number {
+    return this.requests;
   }
 
   /** 确保 [offset, offset+need) 已在缓冲中 */
@@ -252,7 +411,9 @@ class HttpByteReader {
     }
     if (this.rangeSupported) {
       const start = offset;
-      const length = Math.max(need, CHUNK_SIZE);
+      // 跳读模式用小窗口（见 SKIP_WINDOW_BYTES）：解析到视频块只推进指针，
+      // 真正下载的只有字幕块附近的小块数据。
+      const length = Math.max(need, this.opts.windowBytes ?? CHUNK_SIZE);
       this.buf = await this.fetchRange(start, length);
       this.bufStart = start;
       return;
@@ -517,6 +678,7 @@ export async function probeMkvSubtitleTracks(opts: MkvSourceOptions): Promise<Mk
     return {
       rangeSupported: reader.rangeSupported,
       timestampScale,
+      fileSize: reader.fileSize,
       tracks: tracks
         .filter((t) => t.trackType === TRACK_TYPE_SUBTITLE)
         .map((t) => ({
@@ -635,9 +797,26 @@ export async function extractMkvSubtitleTrack(
   /** 提取过程中回调「已读到的部分字幕」（约每 5 秒一次，供前端渐进显示） */
   onPartial?: (content: string) => void,
 ): Promise<MkvExtractResult> {
-  // 提取整轨必须遍历全部 Cluster：默认走单次顺序流（1 个请求），
-  // 避免成百上千次 Range 请求把媒体服务器的限流额度打满（429）。
-  const reader = await HttpByteReader.open({ ...opts, mode: opts.mode ?? 'stream' });
+  // 提取整轨必须遍历全部 Cluster，两种读取策略：
+  // - 顺序流（1 个请求，下载整个文件）：请求数最少、最稳，但 940MB 的单集要读 1~2 分钟，
+  //   且与播放抢带宽；
+  // - 跳读（Range 小窗口 + 跳过视频负载）：只下载字幕附近的小块数据（~20MB 量级），
+  //   完整字幕从分钟级降到十几秒，代价是请求数变多（需要限流保护）。
+  // 策略：大文件走跳读，小文件/未知大小走顺序流；跳读请求数超预算时自动降级为
+  // 「从当前位置继续的顺序流」，避免把上游限流额度打满。
+  const skipOpts: MkvSourceOptions = {
+    ...opts,
+    mode: 'range',
+    windowBytes: opts.windowBytes ?? SKIP_WINDOW_BYTES,
+    minIntervalMs: opts.minIntervalMs ?? SKIP_MIN_INTERVAL_MS,
+  };
+  // mode='range' 强制跳读；mode='stream' 强制顺序流；未指定则自适应。
+  const forceSkip = opts.mode === 'range';
+  const forceStream = opts.mode === 'stream';
+  let reader = await HttpByteReader.open(forceSkip ? skipOpts : { ...opts, mode: 'stream' });
+  const streamStartedAt = Date.now();
+  // 已完成策略决策（跳读 / 顺序流 / 不支持 Range）
+  let strategyDecided = forceSkip || forceStream;
   try {
     let timestampScale = 1_000_000;
     let tracks: TrackEntry[] = [];
@@ -785,6 +964,61 @@ export async function extractMkvSubtitleTrack(
           }
         }
         emitPartial();
+        // 自适应决策：顺序流跑了一小段后，按实测吞吐推算「整集读完要多久」，
+        // 太慢就切跳读（从当前 Cluster 边界续读，不重头来）。
+        if (!strategyDecided && reader.position > 0) {
+          const elapsed = Date.now() - streamStartedAt;
+          // 采样窗口：读满 1.2s 或 16MB（快链路提前决策）即评估
+          if (elapsed >= SKIP_SAMPLE_MS || reader.position >= SKIP_SAMPLE_BYTES) {
+            const total = reader.fileSize || opts.fileSizeHint || 0;
+            const rate = reader.position / Math.max(elapsed, 1); // 字节/毫秒
+            const projectedMs = total > 0 && rate > 0 ? total / rate : 0;
+            if (total > RANGE_SKIP_MIN_FILE_BYTES && projectedMs > SKIP_PROJECT_MS) {
+              try {
+                const next = await HttpByteReader.openAt(skipOpts, reader.position, false);
+                if (next.rangeSupported) {
+                  await reader.close();
+                  reader = next;
+                  console.info(
+                    `[mkv-subtitles] 上游吞吐 ${(rate * 1000 / 1048576).toFixed(1)}MB/s，` +
+                      `整集预计 ${(projectedMs / 1000).toFixed(0)}s → 切换 Range 跳读（仅下载字幕块）`,
+                  );
+                } else {
+                  await next.close();
+                  console.info('[mkv-subtitles] 上游不支持 Range，继续顺序流');
+                }
+              } catch (err) {
+                console.warn(
+                  '[mkv-subtitles] 切换跳读失败，继续顺序流:',
+                  err instanceof Error ? err.message : err,
+                );
+              }
+            } else if (total > 0) {
+              console.info(
+                `[mkv-subtitles] 上游吞吐 ${(rate * 1000 / 1048576).toFixed(1)}MB/s，` +
+                  `整集预计 ${(projectedMs / 1000).toFixed(0)}s → 保持顺序流`,
+              );
+            }
+            strategyDecided = true;
+          }
+        }
+        // 请求预算保护：跳读模式请求数超限时降级为「从当前位置继续的顺序流」
+        // （Range: bytes=pos- 拿到剩余内容，之后按普通顺序流读取，不再产生小请求）。
+        if (reader.rangeSupported && reader.requestCount > SKIP_MAX_REQUESTS) {
+          try {
+            const next = await HttpByteReader.openAt(opts, reader.position, true);
+            await reader.close();
+            reader = next;
+            console.warn(
+              `[mkv-subtitles] 跳读请求数超预算（${SKIP_MAX_REQUESTS}），已降级为顺序流继续提取`,
+            );
+          } catch (err) {
+            console.warn(
+              '[mkv-subtitles] 降级顺序流失败，继续跳读:',
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
         continue;
       }
       await reader.skip(elemEnd - reader.position);
