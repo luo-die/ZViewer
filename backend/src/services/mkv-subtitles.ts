@@ -553,6 +553,44 @@ function assPayloadText(raw: string): string {
   return body;
 }
 
+/** 组装字幕文本（ASS/SRT/VTT）；提取过程中也用它产出「已提取部分」 */
+function buildSubtitleContent(
+  format: 'ass' | 'srt' | 'vtt',
+  track: TrackEntry,
+  cues: RawCue[],
+): string {
+  if (format === 'ass') {
+    const header = (
+      track.codecPrivate?.toString('utf8') ??
+      '[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1'
+    )
+      .replace(/\r\n/g, '\n')
+      .replace(/\s+$/, '');
+    const body = cues.map(toAssDialogueLine).filter(Boolean).join('\n');
+    // codecPrivate 自带 [Events]（含 Comment 事件）且后面可能还有 [Fonts]/[Graphics] 段，
+    // 因此字幕行必须追加在**新开的** [Events] 段里，否则会被解析器整体跳过
+    return `${header}\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${body}\n`;
+  }
+  if (format === 'vtt') {
+    const lines: string[] = ['WEBVTT', ''];
+    cues.forEach((c) => {
+      const start = formatSrtTime(c.startMs).replace(',', '.');
+      const end = formatSrtTime(c.endMs > c.startMs ? c.endMs : c.startMs + 2000).replace(',', '.');
+      lines.push(`${start} --> ${end}`, assPayloadText(c.text), '');
+    });
+    return lines.join('\n');
+  }
+  // SRT：用块时间戳合成（若块没有时长，用下一块的起点兜底）
+  const ordered = [...cues].sort((a, b) => a.startMs - b.startMs);
+  const lines: string[] = [];
+  ordered.forEach((cue, i) => {
+    const next = ordered[i + 1];
+    const end = cue.endMs > cue.startMs ? cue.endMs : next ? next.startMs : cue.startMs + 2000;
+    lines.push(String(i + 1), `${formatSrtTime(cue.startMs)} --> ${formatSrtTime(end)}`, assPayloadText(cue.text), '');
+  });
+  return lines.join('\n');
+}
+
 function formatSrtTime(ms: number): string {
   const total = Math.max(0, Math.round(ms));
   const h = Math.floor(total / 3_600_000);
@@ -566,6 +604,8 @@ function formatSrtTime(ms: number): string {
 export async function extractMkvSubtitleTrack(
   opts: MkvSourceOptions,
   trackNumber: number,
+  /** 提取过程中回调「已读到的部分字幕」（约每 5 秒一次，供前端渐进显示） */
+  onPartial?: (content: string) => void,
 ): Promise<MkvExtractResult> {
   // 提取整轨必须遍历全部 Cluster：默认走单次顺序流（1 个请求），
   // 避免成百上千次 Range 请求把媒体服务器的限流额度打满（429）。
@@ -585,6 +625,21 @@ export async function extractMkvSubtitleTrack(
     const cues: RawCue[] = [];
     let cuesBytes = 0;
     let sawCluster = false;
+    let lastPartialAt = 0;
+    /** 边读边交付：整集要读 1~2 分钟，先让已读到的部分字幕立即可用 */
+    const emitPartial = (): void => {
+      if (!onPartial || cues.length === 0) return;
+      const now = Date.now();
+      if (now - lastPartialAt < 5_000) return;
+      lastPartialAt = now;
+      const entry = tracks.find((t) => t.trackNumber === trackNumber);
+      if (!entry || !isTextCodec(entry.codecId)) return;
+      try {
+        onPartial(buildSubtitleContent(codecToFormat(entry.codecId), entry, cues));
+      } catch {
+        /* 部分结果失败不影响整体提取 */
+      }
+    };
 
     const parseBlockPayload = (payload: Buffer): { track: number; relative: number; text: string } | null => {
       if (payload.length < 4) return null;
@@ -696,6 +751,7 @@ export async function extractMkvSubtitleTrack(
             await reader.skip(subEnd - reader.position);
           }
         }
+        emitPartial();
         continue;
       }
       await reader.skip(elemEnd - reader.position);
@@ -711,37 +767,7 @@ export async function extractMkvSubtitleTrack(
       throw new Error('未在容器中读到字幕数据');
     }
 
-    let content: string;
-    if (format === 'ass') {
-      const header = (
-        track.codecPrivate?.toString('utf8') ??
-        '[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1'
-      )
-        .replace(/\r\n/g, '\n')
-        .replace(/\s+$/, '');
-      const body = cues.map(toAssDialogueLine).filter(Boolean).join('\n');
-      // codecPrivate 自带 [Events]（含 Comment 事件）且后面可能还有 [Fonts]/[Graphics] 段，
-      // 因此字幕行必须追加在**新开的** [Events] 段里，否则会被解析器整体跳过
-      content = `${header}\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${body}\n`;
-    } else if (format === 'vtt') {
-      const lines: string[] = ['WEBVTT', ''];
-      cues.forEach((c) => {
-        const start = formatSrtTime(c.startMs).replace(',', '.');
-        const end = formatSrtTime(c.endMs > c.startMs ? c.endMs : c.startMs + 2000).replace(',', '.');
-        lines.push(`${start} --> ${end}`, assPayloadText(c.text), '');
-      });
-      content = lines.join('\n');
-    } else {
-      // SRT：用块时间戳合成（若块没有时长，用下一块的起点兜底）
-      const ordered = [...cues].sort((a, b) => a.startMs - b.startMs);
-      const lines: string[] = [];
-      ordered.forEach((cue, i) => {
-        const next = ordered[i + 1];
-        const end = cue.endMs > cue.startMs ? cue.endMs : next ? next.startMs : cue.startMs + 2000;
-        lines.push(String(i + 1), `${formatSrtTime(cue.startMs)} --> ${formatSrtTime(end)}`, assPayloadText(cue.text), '');
-      });
-      content = lines.join('\n');
-    }
+    const content = buildSubtitleContent(format, track, cues);
 
     return {
       content,

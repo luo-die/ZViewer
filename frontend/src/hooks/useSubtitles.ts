@@ -805,13 +805,70 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         type ExtractPayload = {
           success: boolean
           pending?: boolean
+          partial?: boolean
           content?: string
           format?: string
           label?: string
           language?: string | null
           message?: string
         }
+        const trackLabel = track.label || embeddedTrackLabel(track)
+        // 局部结果与最终结果共用同一套「建轨 / 更新轨」逻辑：
+        // 已存在同 label 的轨道时用更多 cues 覆盖（渐进补齐），否则新建并激活
+        const applyTrack = (
+          content: string,
+          format: string,
+          label?: string,
+          language?: string | null,
+          allowBroadcast = true
+        ): void => {
+          const cues = parseSubtitle(content, mapOutputFormat(format || 'srt'))
+          setState((prev) => {
+            const finalLabel = trackLabel || label || embeddedTrackLabel(track)
+            const existing = prev.subtitleTracks.findIndex(
+              (t) => t.label === finalLabel
+            )
+            if (existing >= 0) {
+              if (prev.subtitleTracks[existing]!.cues.length >= cues.length) {
+                return prev // 无新增，避免无谓广播
+              }
+              const tracks = [...prev.subtitleTracks]
+              tracks[existing] = {
+                cues,
+                label: finalLabel,
+                lang: language ?? track.language ?? undefined,
+              }
+              const next: SubtitleState = { ...prev, subtitleTracks: tracks }
+              if (allowBroadcast) broadcast(next)
+              return next
+            }
+            const next: SubtitleState = {
+              ...prev,
+              subtitleTracks: [
+                ...prev.subtitleTracks,
+                {
+                  cues,
+                  label: finalLabel,
+                  lang: language ?? track.language ?? undefined,
+                },
+              ],
+              subtitleEnabled: true,
+              activeTrackIndex: prev.subtitleTracks.length,
+            }
+            if (allowBroadcast) broadcast(next)
+            return next
+          })
+        }
         const deadline = Date.now() + 10 * 60 * 1000
+        const startedAt = Date.now()
+        // 观众端广播节流：部分结果每 20s 最多广播一次，完整结果立即广播
+        let lastPartialBroadcast = 0
+        const allowPartialBroadcast = (): boolean => {
+          const now = Date.now()
+          if (now - lastPartialBroadcast < 20_000) return false
+          lastPartialBroadcast = now
+          return true
+        }
         let data: ExtractPayload | null = null
         for (;;) {
           const res = await apiFetch(extractUrl)
@@ -820,45 +877,41 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
             if (!res.ok || !data.success || !data.content) {
               throw new Error(data.message || '提取内嵌字幕失败')
             }
+            if (data.partial) {
+              // 边提取边显示：先给已读到的部分，继续轮询补齐
+              applyTrack(
+                data.content,
+                data.format || 'ass',
+                data.label,
+                data.language,
+                allowPartialBroadcast()
+              )
+              console.info(
+                `[useSubtitles] 字幕已部分可用（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s），后台继续补齐…`
+              )
+              await new Promise((resolve) => setTimeout(resolve, 4000))
+              continue
+            }
             break
           }
           if (Date.now() > deadline) {
             throw new Error(data.message || '字幕提取超时，请稍后重试')
           }
           console.info(
-            `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - (deadline - 10 * 60 * 1000)) / 1000)}s）`
+            `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s）`
           )
           await new Promise((resolve) => setTimeout(resolve, 4000))
         }
         if (!data || !data.content) {
           throw new Error('提取内嵌字幕失败')
         }
-        const cues = parseSubtitle(
+        applyTrack(
           data.content,
-          mapOutputFormat(data.format || 'srt')
+          data.format || 'srt',
+          data.label,
+          data.language,
+          true
         )
-        const newTrack: SubtitleTrack = {
-          cues,
-          label: track.label || data.label || embeddedTrackLabel(track),
-          lang: data.language ?? track.language ?? undefined,
-        }
-        setState((prev) => {
-          // 去重：相同 label 的轨道已存在（重复手动提取）时激活它而非重复建轨
-          const existing = prev.subtitleTracks.findIndex(
-            (t) => t.label === newTrack.label
-          )
-          if (existing >= 0) {
-            return prev
-          }
-          const next: SubtitleState = {
-            ...prev,
-            subtitleTracks: [...prev.subtitleTracks, newTrack],
-            subtitleEnabled: true,
-            activeTrackIndex: prev.subtitleTracks.length,
-          }
-          broadcast(next)
-          return next
-        })
         return 1
       } catch (err) {
         console.error(

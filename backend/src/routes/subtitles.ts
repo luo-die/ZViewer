@@ -952,6 +952,11 @@ function writeMkvCacheToDisk(movie: Movie, track: number, value: MkvCachedSubtit
  * 同一影片同一轨只会跑一次，多观看者共享。
  */
 const mkvInflight = new Set<string>();
+/**
+ * 提取中的「部分结果」：整集要顺序读 1~2 分钟，边读边把已解析到的字幕
+ * 返回给前端，字幕秒级可用（后面继续补齐），而不是让用户干等完整提取。
+ */
+const mkvPartial = new Map<string, MkvCachedSubtitle & { partial: true }>();
 /** 最近一次提取失败原因：轮询方立即拿到真实原因，而不是一直等到超时 */
 const mkvFailures = new Map<string, { message: string; at: number }>();
 const MKV_FAILURE_TTL_MS = 2 * 60 * 1000;
@@ -971,9 +976,23 @@ function startMkvExtractionInBackground(
     try {
       const ctx = await resolveEmbyContext(movie);
       const src = ctx.client.getStaticStreamSource(ctx.itemId);
+      const labelOf = (name?: string, language?: string, format?: string): string =>
+        name?.trim() ||
+        [language?.trim(), (format || '').toUpperCase()].filter(Boolean).join(' · ') ||
+        `轨道 ${track}`;
       const result = await extractMkvSubtitleTrack(
         { url: src.url, headers: src.headers, timeoutMs: 900_000 },
         track,
+        (partial) => {
+          mkvPartial.set(cacheKey, {
+            content: partial,
+            format: 'ass',
+            label: labelOf(undefined, undefined, 'ass'),
+            language: null,
+            at: Date.now(),
+            partial: true,
+          });
+        },
       );
       const label =
         result.track.name?.trim() ||
@@ -989,6 +1008,7 @@ function startMkvExtractionInBackground(
         at: Date.now(),
       };
       mkvExtractCache.set(cacheKey, value);
+      mkvPartial.delete(cacheKey);
       writeMkvCacheToDisk(movie, track, value);
       console.info(
         `[subtitles] 服务端字幕提取完成 movie=${movie.id} track=${track} ${result.format} ${result.content.length} 字节`,
@@ -996,6 +1016,7 @@ function startMkvExtractionInBackground(
     } catch (err) {
       const message = err instanceof Error ? err.message : '字幕提取失败';
       console.warn('[subtitles] 服务端字幕提取失败:', message);
+      mkvPartial.delete(cacheKey);
       mkvFailures.set(cacheKey, { message, at: Date.now() });
     } finally {
       mkvInflight.delete(cacheKey);
@@ -1466,6 +1487,20 @@ router.get(
               label: fromDisk.label,
               language: fromDisk.language,
               cached: true,
+            });
+            return;
+          }
+          // 提取中：把「已读到的部分字幕」先返回（partial=true），字幕秒级可用，
+          // 前端继续轮询直到拿到完整结果
+          const partial = mkvPartial.get(cacheKey);
+          if (partial && Date.now() - partial.at < 120_000) {
+            res.json({
+              success: true,
+              partial: true,
+              content: partial.content,
+              format: partial.format,
+              label: partial.label,
+              language: partial.language,
             });
             return;
           }
