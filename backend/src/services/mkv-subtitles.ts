@@ -133,10 +133,6 @@ async function withUpstreamSlot<T>(
   }
 }
 
-/**
- * 带上限流退避的上游请求。返回 4xx（非 429/408）时原样交给调用方判断；
- * 429 / 5xx / 网络异常会退避重试，重试用尽后返回最后一次响应（或抛错）。
- */
 /** 上游请求的限流参数（跳读模式用更小的间隔，并在 429 时自适应放大） */
 interface UpstreamGate {
   minIntervalMs: number;
@@ -144,6 +140,10 @@ interface UpstreamGate {
   onRateLimit?: () => void;
 }
 
+/**
+ * 带上限流退避的上游请求。返回 4xx（非 429/408）时原样交给调用方判断；
+ * 429 / 5xx / 网络异常会退避重试，重试用尽后返回最后一次响应（或抛错）。
+ */
 async function fetchUpstream(
   url: string,
   headers: Record<string, string>,
