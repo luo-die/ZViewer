@@ -230,10 +230,11 @@ function looksLikeHtml(text: string): boolean {
  * 未给出 DeliveryUrl/DeliveryMethod，因此把以下差异全部展开：
  *   - 索引：容器全局 Index ↔ 字幕类型内序号（0 基）
  *   - 路径：带 mediaSourceId ↔ 用 itemId 兜底 ↔ 省略 mediaSourceId
- *   - 格式：显式扩展名 ↔ 不带扩展名 ↔ ?format= 查询参数
+ *   - 格式：原格式 ↔ vtt ↔ srt（**关键**：Emby 的字幕端点按扩展名转封装输出，
+ *     并非所有格式都支持——ASS 轨道请求 .ass 在部分服务端直接 404，
+ *     而 .vtt/.srt 可正常转出；jellyfin-web 取到的 DeliveryUrl 也是 .vtt）
  *   - 会话：带 ↔ 不带 PlaySessionId
  *   - 前缀：/emby 前缀 ↔ 无前缀（serverUrl 本身可能已含 /emby）
- *   - 投递：HLS 的 subtitles.m3u8
  */
 export function buildSubtitleCandidates(ctx: EmbySubtitleContext): string[] {
   const enc = encodeURIComponent;
@@ -264,11 +265,21 @@ export function buildSubtitleCandidates(ctx: EmbySubtitleContext): string[] {
   const maxIdx = Math.max((ctx.subtitleCount ?? 1) + 1, ctx.index + 1, 4);
   for (let i = 0; i <= maxIdx && i <= 8; i++) addIdx(i);
 
-  // 3) 各索引 × 各路径形态
+  // 3) 各索引 × 各输出格式（原格式 → vtt → srt）× 标准路径
+  const formats: string[] = [];
+  const addFmt = (f: string) => {
+    const v = f.replace(/^\./, '').toLowerCase();
+    if (v && !formats.includes(v)) formats.push(v);
+  };
+  addFmt(format);
+  addFmt('vtt');
+  addFmt('srt');
   for (const idx of idxSet) {
-    if (ms) push(`/emby/Videos/${item}/${ms}/Subtitles/${idx}/Stream.${format}`);
-    push(`/emby/Videos/${item}/${item}/Subtitles/${idx}/Stream.${format}`);
-    push(`/emby/Videos/${item}/Subtitles/${idx}/Stream.${format}`);
+    for (const fmt of formats) {
+      if (ms) push(`/emby/Videos/${item}/${ms}/Subtitles/${idx}/Stream.${fmt}`);
+      push(`/emby/Videos/${item}/${item}/Subtitles/${idx}/Stream.${fmt}`);
+      push(`/emby/Videos/${item}/Subtitles/${idx}/Stream.${fmt}`);
+    }
   }
   // 4) 主索引的其余形态（无扩展名 / format 查询参数 / 无 /emby 前缀）
   const primary = ctx.index;
@@ -356,15 +367,19 @@ export class EmbyClient {
         signal: controller.signal,
       });
       if (!res.ok) {
+        // 尽量取响应体片段：Emby 的 404 常带说明（路由不存在 / 找不到字幕流），
+        // 这是定位「字幕 404」最直接的线索
         let detail = '';
         try {
-          const j = (await res.json()) as { Message?: string; Error?: { message?: string } };
-          detail = j.Message ?? j.Error?.message ?? '';
+          const text = await res.text();
+          detail = text.replace(/\s+/g, ' ').trim().slice(0, 200);
         } catch {
           /* ignore */
         }
         throw new EmbyError(
-          detail || `Emby 请求失败: ${res.status}`,
+          detail
+            ? `Emby 请求失败: ${res.status} ${detail}`
+            : `Emby 请求失败: ${res.status}`,
           res.status,
           'EMBY_REQUEST_FAILED',
         );
@@ -447,6 +462,42 @@ export class EmbyClient {
         ServerId: admin.ServerId ?? '',
       };
     }
+  }
+
+  /**
+   * 抓取任意 Emby 端点的原始文本（诊断用，例如 web 客户端 JS 源码）。
+   * 不做 JSON 解析，返回前 maxBytes 字节的 UTF-8 文本。
+   */
+  async fetchRawText(pathOrUrl: string, maxBytes = 6 * 1024 * 1024): Promise<string> {
+    const url = /^https?:\/\//i.test(pathOrUrl)
+      ? pathOrUrl
+      : `${this.baseUrl}${pathOrUrl}`;
+    const headers: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    };
+    if (this.opts.token) headers['X-Emby-Token'] = this.opts.token;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await fetch(url, { headers, signal: controller.signal });
+      if (!res.ok) {
+        throw new EmbyError(`抓取失败: HTTP ${res.status}`, res.status);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      return buf.subarray(0, maxBytes).toString('utf-8');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 服务器公开信息 GET /emby/System/Info/Public（诊断用：确认服务端类型与版本） */
+  async systemInfoPublic(): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>({
+      path: '/emby/System/Info/Public',
+      authHeader: false,
+    });
   }
 
   /** 媒体库（媒体文件夹）列表 GET /emby/Users/{userId}/Views */
@@ -587,8 +638,9 @@ export class EmbyClient {
       playSessionId: extra?.playSessionId,
       stream,
     };
-    // 候选很多（索引 × 路径形态），限制上限避免失败路径长时间阻塞
-    const candidates = buildSubtitleCandidates(ctx).slice(0, 18);
+    // 候选很多（索引 × 格式 × 路径形态），限制上限避免失败路径长时间阻塞；
+    // 排序保证「主索引 × 原格式/vtt/srt」排在最前，正常情况 1-3 次请求内命中
+    const candidates = buildSubtitleCandidates(ctx).slice(0, 30);
 
     const failures: string[] = [];
     for (const candidate of candidates) {
@@ -636,7 +688,24 @@ export class EmbyClient {
       contentType?: string;
       preview?: string;
     }> = [];
-    for (const candidate of buildSubtitleCandidates(ctx).slice(0, 40)) {
+    // 追加 HLS 字幕播放列表（DeliveryMethod=Hls 时唯一的取字幕入口）
+    const extra: string[] = [];
+    if (ctx.mediaSourceId) {
+      const enc = encodeURIComponent;
+      extra.push(
+        `/emby/Videos/${enc(ctx.itemId)}/${enc(
+          ctx.mediaSourceId,
+        )}/Subtitles/${ctx.index}/subtitles.m3u8`,
+      );
+      if (ctx.ordinal !== undefined) {
+        extra.push(
+          `/emby/Videos/${enc(ctx.itemId)}/${enc(
+            ctx.mediaSourceId,
+          )}/Subtitles/${ctx.ordinal}/subtitles.m3u8`,
+        );
+      }
+    }
+    for (const candidate of [...buildSubtitleCandidates(ctx), ...extra].slice(0, 60)) {
       try {
         const text = await this.request<string>({
           path: candidate,

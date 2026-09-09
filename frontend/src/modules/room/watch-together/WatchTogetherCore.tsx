@@ -296,6 +296,11 @@ export function WatchTogetherCore({
     // 字幕都出现在 MediaStreams 中），切影片后自动探测并提取首选轨道——
     // 此前只能手动点「内嵌字幕轨道」逐条提取，导致"播放 Emby 资源无字幕"。
     // 延迟 1.5s：让起播请求先占住连接，避免 PlaybackInfo 探测与首帧竞争。
+    //
+    // 回退：媒体服务器的字幕接口在部分服务端取不到（404）——Emby 自家 web
+    // 播放器（libmedia/avplayer）正是**在浏览器里解容器取字幕**，因此接口
+    // 返回 0 轨时改走前端 MKV demux（与 webdav/openlist 同一条链路，
+    // 直接复用播放地址，只要它是可 Range 请求的直推流）。
     if (
       (currentMovieSourceType === 'emby' ||
         currentMovieSourceType === 'jellyfin') &&
@@ -303,8 +308,19 @@ export function WatchTogetherCore({
     ) {
       const kind = currentMovieSourceType as 'emby' | 'jellyfin'
       const movieId = currentMovieId
+      const sourceUrl = watchTogether.sourceUrl
       embeddedTimer = setTimeout(() => {
-        void subtitles.autoLoadEmbeddedTracks({ kind, movieId })
+        void (async () => {
+          const started = await subtitles.autoLoadEmbeddedTracks({ kind, movieId })
+          if (started > 0) return
+          if (!sourceUrl) return
+          // 直推流才可解容器；HLS 播放列表会探测失败并静默跳过
+          await subtitles.loadEmbeddedSubtitles(
+            currentMoviePath ?? '',
+            sourceUrl,
+            () => videoRef.current?.currentTime ?? null
+          )
+        })()
       }, 1500)
     }
     return () => clearTimeout(embeddedTimer)

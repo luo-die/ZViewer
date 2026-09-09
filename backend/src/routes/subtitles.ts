@@ -870,6 +870,140 @@ router.get(
 );
 
 /**
+ * GET /emby-web-probe?movieId=
+ *
+ * 诊断用（仅 root/admin）：把该 Emby 服务器自带 web 播放器的 JS 抓下来，
+ * 搜索它究竟用哪个地址取字幕（DeliveryUrl / Subtitles/ / subtitles.m3u8 …），
+ * 返回命中片段。这样不必让用户手动翻 DevTools。
+ */
+router.get(
+  '/emby-web-probe',
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
+      const role = req.user?.role;
+      if (role !== 'root' && role !== 'admin') {
+        res.status(403).json({ success: false, message: '无权限：仅管理员可诊断' });
+        return;
+      }
+      const movieId = Number(req.query.movieId);
+      if (!Number.isFinite(movieId)) {
+        res.status(400).json({ success: false, message: '缺少或无效的 movieId 参数' });
+        return;
+      }
+      const movie = await AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
+      if (!movie) {
+        res.status(400).json({ success: false, message: '影片不存在' });
+        return;
+      }
+      const ctx = await resolveEmbyContext(movie);
+
+      // 1) 找到 web 客户端入口页
+      const pageCandidates = [
+        '/emby/web/index.html',
+        '/web/index.html',
+        '/emby/web/',
+        '/web/',
+        '/index.html',
+        '/',
+        '/static/index.html',
+      ];
+      let pageUrl = '';
+      let html = '';
+      const pageErrors: string[] = [];
+      for (const p of pageCandidates) {
+        try {
+          html = await ctx.client.fetchRawText(p);
+          pageUrl = ctx.client.baseUrl + p;
+          break;
+        } catch (err) {
+          pageErrors.push(p + ': ' + (err instanceof Error ? err.message : String(err)));
+        }
+      }
+      if (!html) {
+        res.status(400).json({
+          success: false,
+          message: '无法获取 Emby web 客户端入口页: ' + pageErrors.join(' | '),
+        });
+        return;
+      }
+
+      // 2) 取出所有脚本地址：<script src>、modulepreload 的 <link href>、
+      //    以及内联 import()/from "..." 里的 .js 路径（SPA 常动态加载）
+      const srcs: string[] = [
+        ...[...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => m[1]),
+        ...[...html.matchAll(/<link[^>]+href=["']([^"']+\.m?js)["']/gi)].map((m) => m[1]),
+        ...[...html.matchAll(/["']([^"']*\.m?js)["']/gi)].map((m) => m[1]),
+      ];
+      const urls: string[] = [];
+      for (const s of srcs) {
+        try {
+          const abs = new URL(s, pageUrl).toString();
+          if (!urls.includes(abs)) urls.push(abs);
+        } catch {
+          /* 忽略非法地址 */
+        }
+      }
+
+      // 3) 下载脚本并搜索字幕取址相关代码
+      const PATTERNS: Array<{ name: string; re: RegExp }> = [
+        { name: 'DeliveryUrl', re: /DeliveryUrl/g },
+        { name: 'getSubtitleUrl', re: /getSubtitleUrl/g },
+        { name: 'Subtitles/', re: /Subtitles\//g },
+        { name: 'subtitles.m3u8', re: /subtitles\.m3u8/g },
+        { name: 'SubtitleProfiles', re: /SubtitleProfiles/g },
+      ];
+      const matches: Array<{ file: string; pattern: string; context: string }> = [];
+      const fetched: Array<{ url: string; size: number; error?: string }> = [];
+      for (const u of urls.slice(0, 15)) {
+        if (matches.length >= 40) break;
+        let body = '';
+        try {
+          body = await ctx.client.fetchRawText(u);
+          fetched.push({ url: u, size: body.length });
+        } catch (err) {
+          fetched.push({
+            url: u,
+            size: 0,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+        for (const { name, re } of PATTERNS) {
+          re.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          let hits = 0;
+          while ((m = re.exec(body)) && hits < 4 && matches.length < 40) {
+            hits++;
+            const start = Math.max(0, m.index - 160);
+            matches.push({
+              file: u.split('/').pop() || u,
+              pattern: name,
+              context: body.slice(start, m.index + 200).replace(/\s+/g, ' '),
+            });
+          }
+        }
+      }
+
+      res.json({
+        success: true,
+        page: pageUrl,
+        scriptCount: urls.length,
+        // 找不到任何脚本时，回传入口页片段，便于人工判断结构
+        htmlPreview: urls.length === 0 ? html.slice(0, 1200) : undefined,
+        fetched,
+        matches,
+      });
+    } catch (err) {
+      console.error('[subtitles] emby-web-probe error:', err);
+      res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : '探测 Emby web 客户端失败',
+      });
+    }
+  },
+);
+
+/**
  * GET /emby-diagnose?movieId=
  *
  * 字幕提取 404 的排查接口（仅 root/admin）：直接返回 Emby PlaybackInfo 的原始
@@ -896,6 +1030,10 @@ router.get(
         return;
       }
       const ctx = await resolveEmbyContext(movie);
+      // 服务端类型/版本（确认是 Emby 还是 Jellyfin、以及版本差异）
+      const serverInfo = await ctx.client
+        .systemInfoPublic()
+        .catch(() => null as Record<string, unknown> | null);
       // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
       const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
         subtitleProfile: true,
@@ -953,6 +1091,14 @@ router.get(
 
       res.json({
         success: true,
+        server: serverInfo
+          ? {
+              productName: serverInfo.ProductName ?? null,
+              version: serverInfo.Version ?? null,
+              serverName: serverInfo.ServerName ?? null,
+              id: serverInfo.Id ?? null,
+            }
+          : null,
         source: (movie.source || '').toLowerCase(),
         itemId: ctx.itemId,
         userId: ctx.userId,
