@@ -1003,6 +1003,11 @@ export function useSubtitles({
         }
         const deadline = Date.now() + 10 * 60 * 1000
         const startedAt = Date.now()
+        // 轮询节奏：前 15s 用 700ms 快轮询（首批 cue 通常 1s 内就绪，
+        // 后端也会把首批结果直接带在第一个响应里），之后放宽到 2s，
+        // 避免长提取（整集 1~2 分钟）期间打太多请求。
+        const pollDelayMs = (): number =>
+          Date.now() - startedAt < 15_000 ? 700 : 2000
         // 观众端广播节流：部分结果每 20s 最多广播一次，完整结果立即广播
         let lastPartialBroadcast = 0
         const allowPartialBroadcast = (): boolean => {
@@ -1032,7 +1037,7 @@ export function useSubtitles({
               console.info(
                 `[useSubtitles] 字幕已部分可用（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s），后台继续补齐…`
               )
-              await new Promise((resolve) => setTimeout(resolve, 4000))
+              await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
               continue
             }
             break
@@ -1043,7 +1048,7 @@ export function useSubtitles({
           console.info(
             `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s）`
           )
-          await new Promise((resolve) => setTimeout(resolve, 4000))
+          await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
         }
         if (!data || !data.content) {
           throw new Error('提取内嵌字幕失败')

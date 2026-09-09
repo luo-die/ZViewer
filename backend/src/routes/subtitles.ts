@@ -873,9 +873,27 @@ async function listNativeSubtitleTracks(
  * 用于媒体服务器既没有字幕端点、也没有外挂字幕文件的服务（如 UHD Media Server）。
  * 返回 null 表示不可用（非 MKV / 无文本字幕轨 / 读不到流）。
  */
+/**
+ * 轨道探测结果缓存（进程内）。
+ * 探测本身要向上游发 2~4 个请求（打开流 + 读文件头），每次切影片/重播都探一遍
+ * 会白白多等 1~2s；命中缓存则字幕请求几乎立刻发出。
+ * 失败结果只缓存 60s（可能是上游限流/网络抖动，不宜长期钉死）。
+ */
+const mkvProbeCache = new Map<
+  number,
+  { at: number; value: { tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null }
+>();
+const MKV_PROBE_TTL_MS = 10 * 60 * 1000;
+const MKV_PROBE_FAILURE_TTL_MS = 60 * 1000;
+
 async function listServerMkvTracks(
   movie: Movie,
 ): Promise<{ tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null> {
+  const cached = mkvProbeCache.get(movie.id);
+  if (cached) {
+    const ttl = cached.value ? MKV_PROBE_TTL_MS : MKV_PROBE_FAILURE_TTL_MS;
+    if (Date.now() - cached.at < ttl) return cached.value;
+  }
   try {
     const ctx = await resolveEmbyContext(movie);
     const src = ctx.client.getStaticStreamSource(ctx.itemId);
@@ -885,13 +903,15 @@ async function listServerMkvTracks(
       timeoutMs: 60_000,
     });
     const tracks = probe.tracks.filter((t) => t.isText);
-    if (tracks.length === 0) return null;
-    return { tracks, rangeSupported: probe.rangeSupported };
+    const value = tracks.length === 0 ? null : { tracks, rangeSupported: probe.rangeSupported };
+    mkvProbeCache.set(movie.id, { at: Date.now(), value });
+    return value;
   } catch (err) {
     console.warn(
       '[subtitles] 服务端 MKV 字幕探测失败:',
       err instanceof Error ? err.message : err,
     );
+    mkvProbeCache.set(movie.id, { at: Date.now(), value: null });
     return null;
   }
 }
@@ -958,6 +978,19 @@ const mkvInflight = new Set<string>();
  */
 const mkvPartial = new Map<string, MkvCachedSubtitle & { partial: true }>();
 /** 最近一次提取失败原因：轮询方立即拿到真实原因，而不是一直等到超时 */
+/**
+ * 字幕提取的读取限速（字节/秒）。
+ * 默认 8MB/s：足够在开头几秒内取到首批 cue，又不会把媒体源带宽吃满
+ * 影响起播；环境变量 MKV_EXTRACT_MAX_MBPS=0 表示不限速。
+ */
+const MKV_EXTRACT_MAX_BYTES_PER_SEC = (() => {
+  const raw = process.env.MKV_EXTRACT_MAX_MBPS;
+  if (raw === undefined) return 8 * 1024 * 1024;
+  const mbps = Number(raw);
+  if (!Number.isFinite(mbps) || mbps < 0) return 8 * 1024 * 1024;
+  return Math.round(mbps * 1024 * 1024);
+})();
+
 const mkvFailures = new Map<string, { message: string; at: number }>();
 const MKV_FAILURE_TTL_MS = 2 * 60 * 1000;
 
@@ -981,7 +1014,15 @@ function startMkvExtractionInBackground(
         [language?.trim(), (format || '').toUpperCase()].filter(Boolean).join(' · ') ||
         `轨道 ${track}`;
       const result = await extractMkvSubtitleTrack(
-        { url: src.url, headers: src.headers, timeoutMs: 900_000 },
+        {
+          url: src.url,
+          headers: src.headers,
+          timeoutMs: 900_000,
+          // 顺序读取限速：字幕提取与播放同时进行，全速拉整集会挤占
+          // 「服务器 → 媒体源」带宽导致起播卡顿；限速后开头 cue 仍秒级到达。
+          // MKV_EXTRACT_MAX_MBPS=0 可关闭限速（内网/带宽充裕时更快）。
+          maxBytesPerSec: MKV_EXTRACT_MAX_BYTES_PER_SEC,
+        },
         track,
         (partial) => {
           mkvPartial.set(cacheKey, {
@@ -1534,10 +1575,31 @@ router.get(
             });
             return;
           }
-          // 未命中缓存 → 启动后台提取并立即返回 202，前端轮询等待结果。
-          // 这样长耗时任务不会占住 HTTP 连接（避免反向代理 504），
-          // 且多个观看者共享同一次提取。
+          // 未命中缓存 → 启动后台提取，并**先等一小会儿首批 cue**：
+          // 顺序读取下第一个 Cluster 的头几 MB 内就有字幕，通常 0.5~1.5s 可拿到，
+          // 直接带回去能省掉一轮轮询（前端原本要等下一个 4s 轮询才有字幕）。
+          // 超过等待窗口仍返回 202，长任务继续在后台跑（避免反向代理 504）。
           const started = startMkvExtractionInBackground(movie, streamIndex, cacheKey);
+          const FIRST_PARTIAL_WAIT_MS = 1_500;
+          const waitUntil = Date.now() + FIRST_PARTIAL_WAIT_MS;
+          for (;;) {
+            const first = mkvPartial.get(cacheKey);
+            if (first) {
+              res.json({
+                success: true,
+                partial: true,
+                content: first.content,
+                format: first.format,
+                label: first.label,
+                language: first.language,
+              });
+              return;
+            }
+            const failureEarly = mkvFailures.get(cacheKey);
+            if (failureEarly) break;
+            if (Date.now() >= waitUntil) break;
+            await new Promise((resolve) => setTimeout(resolve, 150));
+          }
           res.status(202).json({
             success: false,
             pending: true,

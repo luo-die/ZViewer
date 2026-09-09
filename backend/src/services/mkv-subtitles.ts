@@ -156,6 +156,13 @@ export interface MkvSourceOptions {
    * 'stream'：单次请求顺序读取整个文件（提取字幕用，避免大量 Range 请求触发限流）。
    */
   mode?: 'range' | 'stream';
+  /**
+   * 顺序流模式的读取限速（字节/秒，0/未设置 = 不限速）。
+   * 字幕提取要与播放同时进行，若全速拉取整集文件会挤占「服务器 → 媒体源」
+   * 的带宽，导致起播卡顿。限速后字幕仍能在开头几秒内到达（顺序读取，
+   * 前面的 cue 先到），后台慢慢补齐，播放不受影响。
+   */
+  maxBytesPerSec?: number;
 }
 
 function isTextCodec(codecId: string): boolean {
@@ -176,6 +183,9 @@ class HttpByteReader {
   private bufStart = 0;
   private streamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private streamDone = false;
+  /** 顺序模式限速：已读字节数与起始时间（见 throttleStream） */
+  private streamBytes = 0;
+  private streamStartedAt = Date.now();
 
   private constructor(
     readonly rangeSupported: boolean,
@@ -266,6 +276,7 @@ class HttpByteReader {
       }
       if (value && value.length) {
         this.buf = this.buf.length ? Buffer.concat([this.buf, Buffer.from(value)]) : Buffer.from(value);
+        await this.throttleStream(value.length);
       }
     }
     if (this.bufStart + this.buf.length < offset + need) {
@@ -322,10 +333,27 @@ class HttpByteReader {
         this.streamDone = true;
         break;
       }
-      if (value && value.length) this.buf = Buffer.from(value);
+      if (value && value.length) {
+        this.buf = Buffer.from(value);
+        await this.throttleStream(value.length);
+      }
     }
     // 流提前结束时也把指针推到位（后续读取会命中 EOF 分支）
     this.pos += remaining;
+  }
+
+  /**
+   * 顺序模式的读取限速：按已读字节数推算「应花费时间」，超前则休眠。
+   * 只在 stream 模式生效（Range 模式本来只读少量数据）。
+   */
+  private async throttleStream(chunkBytes: number): Promise<void> {
+    this.streamBytes += chunkBytes;
+    const limit = this.opts.maxBytesPerSec ?? 0;
+    if (!limit || limit <= 0) return;
+    const elapsedMs = Date.now() - this.streamStartedAt;
+    const expectedMs = (this.streamBytes / limit) * 1000;
+    const waitMs = expectedMs - elapsedMs;
+    if (waitMs > 20) await sleep(Math.min(waitMs, 1000));
   }
 
   async close(): Promise<void> {
@@ -626,11 +654,16 @@ export async function extractMkvSubtitleTrack(
     let cuesBytes = 0;
     let sawCluster = false;
     let lastPartialAt = 0;
-    /** 边读边交付：整集要读 1~2 分钟，先让已读到的部分字幕立即可用 */
+    /**
+     * 边读边交付：整集要读 1~2 分钟，先让已读到的部分字幕立即可用。
+     * 间隔取 1.2s：开头的 cue 几乎立刻可用，播放瞬间就有字幕；
+     * 后续按同样节奏补齐，前端无需等待完整提取。
+     */
+    const PARTIAL_INTERVAL_MS = 1_200;
     const emitPartial = (): void => {
       if (!onPartial || cues.length === 0) return;
       const now = Date.now();
-      if (now - lastPartialAt < 5_000) return;
+      if (now - lastPartialAt < PARTIAL_INTERVAL_MS) return;
       lastPartialAt = now;
       const entry = tracks.find((t) => t.trackNumber === trackNumber);
       if (!entry || !isTextCodec(entry.codecId)) return;
