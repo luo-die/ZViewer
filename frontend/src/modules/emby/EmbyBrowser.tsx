@@ -6,7 +6,7 @@
  * - 左列 = 上级目录的条目（父级文件夹），点击进入
  * - 右列 = 当前目录条目（文件夹进入，文件选中/添加）
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Folder,
   Film,
@@ -16,13 +16,15 @@ import {
   Square,
   ListChecks,
   Clapperboard,
+  Search,
+  X,
 } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { Spinner } from '@/components/ui/Spinner'
 import { Text } from '@/components/ui/Typography'
 import { cn } from '@/lib/utils'
-import { browseEmbyMount } from './embyApi'
+import { browseEmbyMount, searchEmbyMount } from './embyApi'
 import type { EmbyDirectoryEntry } from './types'
 
 export interface MediaLibraryBrowserProps {
@@ -33,6 +35,8 @@ export interface MediaLibraryBrowserProps {
   selectable?: boolean
   /** 浏览函数（Emby/Jellyfin 传入各自实现），默认 Emby */
   browse?: (mountId: number, path?: string) => Promise<EmbyDirectoryEntry[]>
+  /** 搜索函数（Emby/Jellyfin 传入各自实现），默认 Emby */
+  search?: (mountId: number, query: string) => Promise<EmbyDirectoryEntry[]>
   /** 弹窗标题，默认「浏览 Emby 媒体库」 */
   title?: string
 }
@@ -70,6 +74,7 @@ export default function EmbyBrowser({
   onClose,
   onSelectFiles,
   browse = browseEmbyMount,
+  search = searchEmbyMount,
   title = '浏览 Emby 媒体库',
 }: MediaLibraryBrowserProps) {
   /** 面包屑历史栈：不含根（根 = 媒体库） */
@@ -82,7 +87,17 @@ export default function EmbyBrowser({
   const [error, setError] = useState('')
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set())
   const [multiSelectMode, setMultiSelectMode] = useState(false)
+  /** 搜索关键词：非空时右列切换为「全库搜索结果」模式 */
+  const [query, setQuery] = useState('')
+  const [searchEntries, setSearchEntries] = useState<EmbyDirectoryEntry[]>([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  /** 搜索请求序号：丢弃过期响应（快速连续输入时旧结果不得覆盖新结果） */
+  const searchSeqRef = useRef(0)
+  /** 搜索重试计数器（相同关键词重新触发 effect） */
+  const [searchNonce, setSearchNonce] = useState(0)
 
+  const searchMode = query.trim().length > 0
   const currentPath =
     crumbs.length > 0 ? crumbs[crumbs.length - 1].path : undefined
 
@@ -91,6 +106,10 @@ export default function EmbyBrowser({
       if (mountId === null) return
       setLoading(true)
       setError('')
+      // 任何导航（面包屑/目录进入）都退出搜索结果模式
+      setQuery('')
+      setSearchEntries([])
+      setSearchError('')
       try {
         const target =
           nextCrumbs.length > 0
@@ -100,12 +119,15 @@ export default function EmbyBrowser({
         setEntries(data)
         setCrumbs(nextCrumbs)
 
-        // 左列：父级目录条目（仅文件夹）
+        // 左列：上级目录条目。
+        // - 层级 >1：上一层目录的条目
+        // - 层级 =1（位于某个媒体库内）：根 = 媒体库列表，作为左列"上级"
+        //   （此前左列显示"上级目录为空"，无法在媒体库间直接切换）
         const parent =
           nextCrumbs.length > 1
             ? nextCrumbs[nextCrumbs.length - 2].path
             : undefined
-        if (parent !== undefined) {
+        if (nextCrumbs.length > 0) {
           try {
             const parentData = await browse(mountId, parent)
             setParentEntries(parentData)
@@ -125,6 +147,44 @@ export default function EmbyBrowser({
     [mountId, browse]
   )
 
+  // 关键词防抖搜索：输入停止 350ms 后请求全库搜索结果。
+  // 所有 setState 都在定时器回调内执行——effect 同步阶段直接 setState 会触发
+  // 级联渲染（react-hooks/set-state-in-effect），定时器同时承担防抖职责。
+  useEffect(() => {
+    if (!open || mountId === null) return
+    const keyword = query.trim()
+    const seq = ++searchSeqRef.current
+    const timer = setTimeout(
+      () => {
+        void (async () => {
+          if (searchSeqRef.current !== seq) return
+          if (!keyword) {
+            // 关键词清空：退出搜索模式，结果列表复位
+            setSearchEntries([])
+            setSearchError('')
+            setSearchLoading(false)
+            return
+          }
+          setSearchLoading(true)
+          setSearchError('')
+          try {
+            const data = await search(mountId, keyword)
+            if (searchSeqRef.current !== seq) return
+            setSearchEntries(data)
+          } catch (err) {
+            if (searchSeqRef.current !== seq) return
+            setSearchEntries([])
+            setSearchError(err instanceof Error ? err.message : '搜索失败')
+          } finally {
+            if (searchSeqRef.current === seq) setSearchLoading(false)
+          }
+        })()
+      },
+      keyword ? 350 : 0
+    )
+    return () => clearTimeout(timer)
+  }, [open, mountId, query, search, searchNonce])
+
   // React Compiler 严格规则误报：Modal 打开时重置浏览状态并加载媒体库。
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -134,6 +194,9 @@ export default function EmbyBrowser({
       setParentEntries([])
       setSelectedPaths(new Set())
       setMultiSelectMode(false)
+      setQuery('')
+      setSearchEntries([])
+      setSearchError('')
       void load([])
     }
   }, [open, mountId, load])
@@ -153,6 +216,18 @@ export default function EmbyBrowser({
 
   const goRoot = () => void load([])
 
+  /**
+   * 从搜索结果进入文件夹（剧集/季/合集）：
+   * 退出搜索模式，并把该条目作为当前目录（面包屑 = 该条目）。
+   * 左列会自动补上媒体库列表作为"上级"。
+   */
+  const openSearchResult = (entry: EmbyDirectoryEntry) => {
+    setQuery('')
+    setSearchEntries([])
+    setSearchError('')
+    void load([{ name: entry.name, path: entry.path }])
+  }
+
   const toggleSelection = (path: string) => {
     setSelectedPaths((prev) => {
       const next = new Set(prev)
@@ -171,10 +246,11 @@ export default function EmbyBrowser({
         .map(
           (p) =>
             entries.find((e) => e.path === p) ??
+            searchEntries.find((e) => e.path === p) ??
             parentEntries.find((e) => e.path === p)
         )
         .filter((e): e is EmbyDirectoryEntry => !!e && e.type === 'file'),
-    [selectedPaths, entries, parentEntries]
+    [selectedPaths, entries, searchEntries, parentEntries]
   )
 
   const confirmSelection = () => {
@@ -183,7 +259,12 @@ export default function EmbyBrowser({
     onClose()
   }
 
-  const renderEntry = (entry: EmbyDirectoryEntry, side: 'left' | 'right') => {
+  const renderEntry = (
+    entry: EmbyDirectoryEntry,
+    side: 'left' | 'right',
+    /** 文件夹点击行为覆盖（搜索结果进入目录时用） */
+    onOpenDirectory?: (entry: EmbyDirectoryEntry) => void
+  ) => {
     const isSelected = selectedPaths.has(entry.path)
     const isDirectory = entry.type === 'directory'
     const showCheckbox = multiSelectMode && side === 'right' && !isDirectory
@@ -204,7 +285,9 @@ export default function EmbyBrowser({
         )}
         onClick={() => {
           if (isDirectory) {
-            if (side === 'left') {
+            if (onOpenDirectory) {
+              onOpenDirectory(entry)
+            } else if (side === 'left') {
               openLeftDirectory(entry)
             } else {
               openDirectory(entry)
@@ -368,29 +451,61 @@ export default function EmbyBrowser({
                 ))}
               </div>
 
-              <Button
-                variant={multiSelectMode ? 'primary' : 'secondary'}
-                size="sm"
-                icon={<ListChecks className="h-4 w-4" />}
-                onClick={() => {
-                  setMultiSelectMode((prev) => {
-                    if (prev) setSelectedPaths(new Set())
-                    return !prev
-                  })
-                }}
-              >
-                {multiSelectMode ? '退出多选' : '多选'}
-              </Button>
+              <div className="flex items-center gap-2">
+                {/* 全库搜索：直接按名称检索，无需逐级点进媒体库/剧集/季 */}
+                <div className="relative flex items-center">
+                  <Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-[var(--md-sys-color-on-surface-variant)]" />
+                  <input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="搜索媒体库…"
+                    aria-label="搜索媒体库"
+                    className="zen-input-glow w-40 rounded-[var(--md-sys-shape-corner)] border border-[var(--md-sys-color-outline)] bg-[var(--md-sys-color-surface-container-high)] py-1.5 pl-8 pr-7 text-xs text-[var(--md-sys-color-on-surface)] placeholder:text-[var(--md-sys-color-on-surface-variant)] focus:border-[var(--md-sys-color-primary)] focus:outline-none sm:w-52"
+                  />
+                  {query && (
+                    <button
+                      type="button"
+                      aria-label="清空搜索"
+                      className="absolute right-1.5 rounded-full p-1 text-[var(--md-sys-color-on-surface-variant)] hover:bg-[var(--md-sys-color-surface-container-highest)]"
+                      onClick={() => setQuery('')}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                <Button
+                  variant={multiSelectMode ? 'primary' : 'secondary'}
+                  size="sm"
+                  icon={<ListChecks className="h-4 w-4" />}
+                  onClick={() => {
+                    setMultiSelectMode((prev) => {
+                      if (prev) setSelectedPaths(new Set())
+                      return !prev
+                    })
+                  }}
+                >
+                  {multiSelectMode ? '退出多选' : '多选'}
+                </Button>
+              </div>
             </div>
 
             <div className="grid h-[420px] grid-cols-1 gap-4 overflow-hidden rounded-2xl border border-[var(--md-sys-color-outline-variant)] backdrop-blur-sm md:grid-cols-2">
               {/* 左侧：上级目录（小屏单栏时隐藏，导航由面包屑承担） */}
               <div className="hidden min-h-0 flex-col border-r border-[var(--md-sys-color-outline-variant)] bg-[var(--md-sys-color-surface-container-low)]/60 md:flex">
                 <div className="shrink-0 border-b border-[var(--md-sys-color-outline-variant)] px-4 py-3 text-sm font-semibold uppercase tracking-wide text-[var(--md-sys-color-on-surface-variant)]">
-                  上级目录
+                  {searchMode ? '搜索' : '上级目录'}
                 </div>
                 <div className="zen-scroll min-h-0 flex-1 overflow-y-auto p-3">
-                  {currentPath ? (
+                  {searchMode ? (
+                    <div className="flex flex-col items-center gap-3 py-10 text-center">
+                      <Search className="h-8 w-8 text-[var(--md-sys-color-outline)]" />
+                      <Text className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                        正在全库搜索「{query.trim()}」
+                        <br />
+                        结果见右侧，点击文件夹可进入
+                      </Text>
+                    </div>
+                  ) : currentPath ? (
                     parentEntries.length > 0 ? (
                       parentEntries.map((entry) =>
                         entry.type === 'directory'
@@ -415,13 +530,44 @@ export default function EmbyBrowser({
                 </div>
               </div>
 
-              {/* 右侧：当前目录 */}
+              {/* 右侧：当前目录 / 搜索结果 */}
               <div className="flex min-h-0 flex-col bg-[var(--md-sys-color-surface)]/80">
                 <div className="shrink-0 border-b border-[var(--md-sys-color-outline-variant)] px-4 py-3 text-sm font-semibold uppercase tracking-wide text-[var(--md-sys-color-on-surface-variant)]">
-                  当前目录
+                  {searchMode
+                    ? searchLoading
+                      ? '搜索结果（搜索中…）'
+                      : `搜索结果（${searchEntries.length}）`
+                    : '当前目录'}
                 </div>
                 <div className="zen-scroll min-h-0 flex-1 overflow-y-auto p-3">
-                  {entries.length > 0 ? (
+                  {searchMode ? (
+                    searchError ? (
+                      <div className="flex flex-col items-center gap-3 py-8">
+                        <Text className="text-center text-sm text-[var(--md-sys-color-error)]">
+                          {searchError}
+                        </Text>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => setSearchNonce((n) => n + 1)}
+                        >
+                          重试
+                        </Button>
+                      </div>
+                    ) : searchEntries.length > 0 ? (
+                      searchEntries.map((entry) =>
+                        renderEntry(entry, 'right', openSearchResult)
+                      )
+                    ) : searchLoading ? (
+                      <div className="flex items-center justify-center py-10">
+                        <Spinner tip="搜索中..." size={24} />
+                      </div>
+                    ) : (
+                      <Text className="py-8 text-center text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                        未找到匹配条目
+                      </Text>
+                    )
+                  ) : entries.length > 0 ? (
                     entries.map((entry) => renderEntry(entry, 'right'))
                   ) : (
                     <Text className="py-8 text-center text-sm text-[var(--md-sys-color-on-surface-variant)]">
@@ -432,7 +578,7 @@ export default function EmbyBrowser({
               </div>
             </div>
 
-            {loading && entries.length > 0 && (
+            {!searchMode && loading && entries.length > 0 && (
               <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-[var(--md-sys-color-surface)]/40 backdrop-blur-md">
                 <Spinner tip="加载中..." size={28} />
               </div>

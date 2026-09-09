@@ -841,6 +841,12 @@ router.get(
           language: t.Language || null,
           title: t.DisplayTitle || null,
           label: t.DisplayTitle || t.Language || `轨道 ${t.Index}`,
+          // 自动挑选字幕轨所需信息：文本轨优先、默认轨次之、强制轨最后。
+          // IsTextSubtitleStream 部分版本不返回（undefined）→ 前端按 Codec 兜底判断。
+          isDefault: t.IsDefault === true,
+          isForced: t.IsForced === true,
+          isText: t.IsTextSubtitleStream,
+          isExternal: t.IsExternal === true,
         }));
         res.json({ success: true, tracks });
         return;

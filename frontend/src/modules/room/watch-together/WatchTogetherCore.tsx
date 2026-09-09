@@ -248,6 +248,8 @@ export function WatchTogetherCore({
   // - WebDAV/FTP/OpenList/服务器文件：在影片所在目录中搜索同名字幕文件
   // - 服务器文件/挂载源：额外探测并提取视频内嵌字幕轨道（自研前端
   //   MKV demux 提取器，与播放引擎解耦——只要文件 URL 就能跑）
+  // - Emby/Jellyfin：调媒体服务器自带的 PlaybackInfo/Subtitles 接口探测
+  //   并自动提取首选字幕轨（内嵌 + 同目录外挂字幕都覆盖）
   // 其他源类型（如 bilibili）仅清空旧字幕。
   // 观众端不搜索外挂字幕（跟随房主广播），但同样本地提取内嵌字幕
   // （seek 感知：观众跟随房主跳转后字幕秒级可用，不依赖房主广播快照）。
@@ -289,6 +291,21 @@ export function WatchTogetherCore({
           () => videoRef.current?.currentTime ?? null
         )
       }, 3000)
+    }
+    // Emby / Jellyfin：字幕轨信息由媒体服务器提供（内嵌字幕与同目录外挂
+    // 字幕都出现在 MediaStreams 中），切影片后自动探测并提取首选轨道——
+    // 此前只能手动点「内嵌字幕轨道」逐条提取，导致"播放 Emby 资源无字幕"。
+    // 延迟 1.5s：让起播请求先占住连接，避免 PlaybackInfo 探测与首帧竞争。
+    if (
+      (currentMovieSourceType === 'emby' ||
+        currentMovieSourceType === 'jellyfin') &&
+      currentMovieId != null
+    ) {
+      const kind = currentMovieSourceType as 'emby' | 'jellyfin'
+      const movieId = currentMovieId
+      embeddedTimer = setTimeout(() => {
+        void subtitles.autoLoadEmbeddedTracks({ kind, movieId })
+      }, 1500)
     }
     return () => clearTimeout(embeddedTimer)
     // eslint-disable-next-line react-hooks/exhaustive-deps

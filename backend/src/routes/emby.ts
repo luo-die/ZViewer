@@ -80,7 +80,8 @@ async function resolveEmbySession(mount: UserMount): Promise<{
 
 /** 转换 Emby item 为前端可识别的条目（isFile 标记可播放性） */
 function mapEmbyEntry(item: EmbyItem) {
-  const fileTypes = new Set(['Movie', 'Video', 'Episode', 'TvSeries']);
+  // MusicVideo 同为可直接播放的条目（搜索结果可能命中），列入可播放类型
+  const fileTypes = new Set(['Movie', 'Video', 'Episode', 'MusicVideo', 'TvSeries']);
   const isFile = fileTypes.has(item.Type) || item.IsFile === true;
   return {
     name: item.Name,
@@ -352,6 +353,60 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
     res.status(status).json({
       success: false,
       message: extractErrorMessage(err, '浏览 Emby 失败'),
+      code,
+    });
+  }
+});
+
+// 搜索 - GET /mounts/:id/search?q=&limit=
+// 在用户可见的全部媒体库中递归搜索（不依赖 ParentId），
+// 解决"挂载 Emby 后只能逐级点进媒体库、无法搜索资源库"的问题。
+router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!query) {
+      res.status(400).json({ success: false, message: '搜索关键词不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.floor(limitRaw), 200)
+      : 60;
+
+    const repo = userMountRepository();
+    const mount = await repo.findOneBy({
+      id: mountId,
+      userId: req.user!.userId,
+      type: 'emby',
+    });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveEmbySession(mount);
+    if (!session.userId) {
+      res.status(400).json({
+        success: false,
+        message: '未获取到 Emby 用户信息，请重新保存该挂载配置',
+        code: 'NO_USER',
+      });
+      return;
+    }
+    const items = await session.client.search(session.userId, query, limit);
+    res.json({ success: true, entries: items.map(mapEmbyEntry) });
+  } catch (err) {
+    console.error('[emby] search mount error:', err);
+    const code = extractErrorCode(err);
+    const status = code === 'AUTH_FAILED' ? 401 : code === 'TIMEOUT' ? 504 : 400;
+    res.status(status).json({
+      success: false,
+      message: extractErrorMessage(err, '搜索 Emby 媒体库失败'),
       code,
     });
   }

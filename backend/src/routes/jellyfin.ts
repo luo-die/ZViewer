@@ -64,7 +64,7 @@ async function resolveJellyfinSession(mount: UserMount): Promise<{
 }
 
 function mapJellyfinEntry(item: { Id: string; Name: string; Type: string; IsFolder?: boolean; IsFile?: boolean; ChildCount?: number }) {
-  const fileTypes = new Set(['Movie', 'Video', 'Episode', 'TvSeries']);
+  const fileTypes = new Set(['Movie', 'Video', 'Episode', 'MusicVideo', 'TvSeries']);
   const isFile = fileTypes.has(item.Type) || item.IsFile === true;
   return {
     name: item.Name,
@@ -275,6 +275,55 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
     const code = extractErrorCode(err);
     const status = code === 'AUTH_FAILED' ? 401 : code === 'TIMEOUT' ? 504 : 400;
     res.status(status).json({ success: false, message: extractErrorMessage(err, '浏览 Jellyfin 失败'), code });
+  }
+});
+
+// 搜索 - GET /mounts/:id/search?q=&limit=
+// 与 emby.ts 对齐：递归搜索用户可见的全部媒体库。
+router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const mountId = Number(req.params.id);
+    if (Number.isNaN(mountId)) {
+      res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!query) {
+      res.status(400).json({ success: false, message: '搜索关键词不能为空', code: 'INVALID_PARAMS' });
+      return;
+    }
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.floor(limitRaw), 200)
+      : 60;
+
+    const repo = userMountRepository();
+    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'jellyfin' });
+    if (!mount) {
+      res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+
+    const session = await resolveJellyfinSession(mount);
+    if (!session.userId) {
+      res.status(400).json({
+        success: false,
+        message: '未获取到 Jellyfin 用户信息，请重新保存该挂载配置',
+        code: 'NO_USER',
+      });
+      return;
+    }
+    const items = await session.client.search(session.userId, query, limit);
+    res.json({ success: true, entries: items.map(mapJellyfinEntry) });
+  } catch (err) {
+    console.error('[jellyfin] search mount error:', err);
+    const code = extractErrorCode(err);
+    const status = code === 'AUTH_FAILED' ? 401 : code === 'TIMEOUT' ? 504 : 400;
+    res.status(status).json({
+      success: false,
+      message: extractErrorMessage(err, '搜索 Jellyfin 媒体库失败'),
+      code,
+    });
   }
 });
 

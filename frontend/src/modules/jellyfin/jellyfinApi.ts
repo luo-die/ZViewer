@@ -126,6 +126,31 @@ export async function browseJellyfinMount(
   return data.entries || []
 }
 
+/**
+ * 搜索 Jellyfin 媒体库（递归，跨全部媒体库）。
+ * 与 searchEmbyMount 对齐（Jellyfin 是 Emby 开源分支，接口一致）。
+ */
+export async function searchJellyfinMount(
+  id: number,
+  query: string,
+  limit?: number
+): Promise<JellyfinDirectoryEntry[]> {
+  const params = new URLSearchParams({ q: query })
+  if (limit != null) params.set('limit', String(limit))
+  const res = await apiFetch(
+    `/api/jellyfin/mounts/${id}/search?${params.toString()}`
+  )
+  const data = (await res.json()) as {
+    success: boolean
+    entries?: JellyfinDirectoryEntry[]
+    message?: string
+  }
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || '搜索 Jellyfin 媒体库失败')
+  }
+  return data.entries || []
+}
+
 export async function resolveJellyfin(
   mountId: number,
   path: string

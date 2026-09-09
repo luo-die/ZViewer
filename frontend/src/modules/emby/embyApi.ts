@@ -126,6 +126,31 @@ export async function browseEmbyMount(
   return data.entries || []
 }
 
+/**
+ * 搜索 Emby 媒体库（递归，跨全部媒体库）。
+ * 用于挂载后直接按名称检索资源库，无需逐级点进媒体库/剧集/季。
+ */
+export async function searchEmbyMount(
+  id: number,
+  query: string,
+  limit?: number
+): Promise<EmbyDirectoryEntry[]> {
+  const params = new URLSearchParams({ q: query })
+  if (limit != null) params.set('limit', String(limit))
+  const res = await apiFetch(
+    `/api/emby/mounts/${id}/search?${params.toString()}`
+  )
+  const data = (await res.json()) as {
+    success: boolean
+    entries?: EmbyDirectoryEntry[]
+    message?: string
+  }
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || '搜索 Emby 媒体库失败')
+  }
+  return data.entries || []
+}
+
 export async function resolveEmby(
   mountId: number,
   path: string

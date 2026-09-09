@@ -43,6 +43,15 @@ export interface EmbyMediaStream {
   Language?: string;
   DisplayTitle?: string;
   IsExternal?: boolean;
+  /** 默认轨（字幕/音轨选择时优先） */
+  IsDefault?: boolean;
+  /** 强制轨（仅显示外语字幕/歌曲翻译） */
+  IsForced?: boolean;
+  /**
+   * 是否为文本字幕（true=可转 SRT/ASS/VTT，false=PGS/VOBSUB 等位图字幕）。
+   * 部分 Emby 版本不返回该字段（undefined），此时按 Codec 判断。
+   */
+  IsTextSubtitleStream?: boolean;
   DeliveryMethod?: string; // 'External' | 'Embedded' | 'Hls' ...
   DeliveryUrl?: string;
 }
@@ -277,14 +286,24 @@ export class EmbyClient {
     return res.Items ?? [];
   }
 
-  /** 搜索 GET /emby/Users/{userId}/Items?SearchTerm= */
-  async search(userId: string, term: string): Promise<EmbyItem[]> {
+  /**
+   * 搜索媒体库 GET /emby/Users/{userId}/Items?SearchTerm=
+   *
+   * Recursive=true 在用户可见的全部媒体库中搜索，不依赖 ParentId——
+   * 这正是"挂载后无法搜索资源库"的缺口：只能逐级点进媒体库/剧集/季。
+   * IncludeItemTypes 只保留媒体条目（电影/剧集/季/单集/合集/媒体库），
+   * 避免 Person、播放列表、音频等非视频结果污染列表。
+   * Series/Season 等文件夹型条目一并返回，前端可继续下钻。
+   */
+  async search(userId: string, term: string, limit = 60): Promise<EmbyItem[]> {
     const res = await this.request<{ Items?: EmbyItem[] }>({
       path: `/emby/Users/${encodeURIComponent(userId)}/Items`,
       query: {
         SearchTerm: term,
-        Fields: 'ChildCount,MediaSources,Path',
         Recursive: 'true',
+        IncludeItemTypes: 'Movie,Series,Season,Episode,Video,MusicVideo,BoxSet,CollectionFolder',
+        Fields: 'ChildCount,MediaSources,Path',
+        Limit: limit,
       },
     });
     return res.Items ?? [];

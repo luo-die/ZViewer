@@ -5,7 +5,7 @@
  */
 import EmbyBrowser from '@/modules/emby/EmbyBrowser'
 import type { EmbyDirectoryEntry } from '@/modules/emby/types'
-import { browseJellyfinMount } from './jellyfinApi'
+import { browseJellyfinMount, searchJellyfinMount } from './jellyfinApi'
 
 interface JellyfinBrowserProps {
   mountId: number | null
@@ -33,6 +33,12 @@ export default function JellyfinBrowser({
         browseJellyfinMount as (
           mountId: number,
           path?: string
+        ) => Promise<EmbyDirectoryEntry[]>
+      }
+      search={
+        searchJellyfinMount as (
+          mountId: number,
+          query: string
         ) => Promise<EmbyDirectoryEntry[]>
       }
       title="浏览 Jellyfin 媒体库"

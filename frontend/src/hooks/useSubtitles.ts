@@ -32,6 +32,17 @@ export interface EmbeddedTrackInfo {
   trackNumber?: number
   /** 前端 MKV demux 提取的轨道为 true；Emby/Jellyfin 轨道为 false */
   frontend?: boolean
+  /** Emby/Jellyfin：默认轨（自动挑选时优先） */
+  isDefault?: boolean
+  /** Emby/Jellyfin：强制轨（仅外语/歌曲字幕，自动挑选时靠后） */
+  isForced?: boolean
+  /**
+   * Emby/Jellyfin：是否为文本字幕。false = 位图字幕（PGS/VOBSUB），
+   * 无法转文本；undefined = 服务端未返回，按 codecName 兜底判断。
+   */
+  isText?: boolean
+  /** Emby/Jellyfin：外挂字幕文件（与视频同目录） */
+  isExternal?: boolean
 }
 
 /**
@@ -63,6 +74,62 @@ function mapOutputFormat(format: string): SubtitleFormat {
     default:
       return 'srt'
   }
+}
+
+/**
+ * 位图字幕编码（PGS/VOBSUB/DVB 等）：内容为图像，无法转成文本字幕。
+ * 自动挑选字幕轨时跳过——否则提取出来是一条空轨。
+ */
+const IMAGE_SUBTITLE_CODECS = new Set([
+  'pgs',
+  'pgssub',
+  'hdmv_pgs',
+  'hdmv_pgs_subtitle',
+  'dvdsub',
+  'dvd_subtitle',
+  'vobsub',
+  'dvb_subtitle',
+  'dvbsub',
+  'xsub',
+  's_graphical',
+  's_image',
+])
+
+function isImageSubtitleCodec(codec: string | null | undefined): boolean {
+  return !!codec && IMAGE_SUBTITLE_CODECS.has(codec.trim().toLowerCase())
+}
+
+/** 中文字幕特征：语言码（zh/chi/zho/chs/cht/cn 前缀）或标题中的中文关键词。 */
+const CHINESE_LANG_RE = /^(zh|chi|zho|chs|cht|cn)/i
+const CHINESE_TEXT_RE = /中文|简体|繁体|中字|国语|粤语|双语|字幕组/i
+
+function isChineseTrack(track: EmbeddedTrackInfo): boolean {
+  const lang = (track.language ?? '').trim()
+  if (lang && (CHINESE_LANG_RE.test(lang) || CHINESE_TEXT_RE.test(lang))) {
+    return true
+  }
+  return CHINESE_TEXT_RE.test(`${track.title ?? ''} ${track.label ?? ''}`)
+}
+
+/**
+ * 从可用轨道中挑选自动加载的首选字幕：
+ * 中文字幕 > 默认轨（非强制）> 非强制轨 > 第一条文本轨。
+ * 位图字幕（PGS/VOBSUB）与 isText=false 的轨道直接排除；
+ * 全部为位图字幕时返回 undefined（此时不建轨，交给用户手动选择）。
+ */
+function pickPreferredEmbeddedTrack(
+  tracks: EmbeddedTrackInfo[]
+): EmbeddedTrackInfo | undefined {
+  const textTracks = tracks.filter(
+    (t) => t.isText !== false && !isImageSubtitleCodec(t.codecName)
+  )
+  if (textTracks.length === 0) return undefined
+  return (
+    textTracks.find(isChineseTrack) ??
+    textTracks.find((t) => t.isDefault && !t.isForced) ??
+    textTracks.find((t) => !t.isForced) ??
+    textTracks[0]
+  )
 }
 
 /** 生成内封字幕轨道的展示标签。 */
@@ -771,6 +838,33 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
     [isHost, broadcast]
   )
 
+  /**
+   * 自动加载媒体服务器（Emby/Jellyfin）的字幕轨：
+   * 探测轨道 → 挑选首选（中文 > 默认 > 非强制 > 首条文本轨）→ 提取内容建轨。
+   *
+   * 这是「播放 Emby 资源时没有字幕」的修复点：此前 emby/jellyfin 源只能由
+   * 用户手动打开设置面板点「内嵌字幕轨道」再逐条提取，切换影片后永远默认无字幕。
+   * Emby 的 MediaStreams 同时覆盖内嵌字幕与同目录外挂字幕（IsExternal），
+   * 因此一条路径即可覆盖两种字幕来源。
+   *
+   * @returns 成功建轨数量（0 = 无可用文本字幕轨）
+   */
+  const autoLoadEmbeddedTracks = useCallback(
+    async (source: EmbeddedSource): Promise<number> => {
+      if (!isHost) return 0
+      try {
+        const tracks = await listEmbeddedTracks(source)
+        const pick = pickPreferredEmbeddedTrack(tracks)
+        if (!pick) return 0
+        return await extractEmbeddedTrack(source, pick)
+      } catch (err) {
+        console.error('[useSubtitles] auto load embedded tracks failed:', err)
+        return 0
+      }
+    },
+    [isHost, listEmbeddedTracks, extractEmbeddedTrack]
+  )
+
   const setFontSize = useCallback(
     (size: number) => {
       // 观众本地调字号：标记偏好，后续房主广播不覆盖此选择
@@ -946,6 +1040,7 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
     loadEmbeddedSubtitles,
     listEmbeddedTracks,
     extractEmbeddedTrack,
+    autoLoadEmbeddedTracks,
     setFontSize,
     setOffset,
     setShiftX,
