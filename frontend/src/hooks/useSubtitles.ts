@@ -48,6 +48,11 @@ export interface EmbeddedTrackInfo {
    * 提取时后端会改用原生接口下载字幕文件，而不是 Emby 兼容层的字幕端点。
    */
   native?: boolean
+  /**
+   * 由「服务端 MKV 解容器」得到的轨道（index = MKV TrackNumber）：
+   * 提取时后端直接从原始容器里解出字幕，不依赖媒体服务器字幕端点。
+   */
+  mkv?: boolean
 }
 
 /**
@@ -787,13 +792,14 @@ export function useSubtitles({ roomId, isHost }: UseSubtitlesOptions) {
         }
       }
 
-      // Emby/Jellyfin：后端调用其自带 Subtitles Stream 端点；
-      // track.native=true 时改用第三方服务的「原生 API」下载字幕文件
+      // Emby/Jellyfin：后端按轨道来源选择取字幕方式——
+      // track.mkv=true → 服务端 MKV 解容器；track.native=true → 第三方服务原生 API；
+      // 否则走 Emby 兼容层的 Subtitles Stream 端点
       if (source.kind !== 'emby' && source.kind !== 'jellyfin') return 0
-      const nativeFlag = track.native ? '&native=1' : ''
+      const sourceFlag = track.mkv ? '&mkv=1' : track.native ? '&native=1' : ''
       try {
         const res = await apiFetch(
-          `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}${nativeFlag}`
+          `/api/subtitles/embedded-extract?movieId=${source.movieId}&index=${track.index}${sourceFlag}`
         )
         const data = (await res.json()) as {
           success: boolean

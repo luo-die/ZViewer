@@ -60,6 +60,12 @@ import {
 import { EmbyClient, createEmbyClientFromMount } from '../services/emby-client';
 // 第三方 Emby 兼容服务的原生 API 字幕兜底（其兼容层常常没有字幕端点）
 import { createNativeApiFromMount } from '../services/emby-native';
+// 服务端 MKV 解容器取字幕（不依赖 ffmpeg / 浏览器 / Range）
+import {
+  probeMkvSubtitleTracks,
+  extractMkvSubtitleTrack,
+  type MkvSubtitleTrackInfo,
+} from '../services/mkv-subtitles';
 
 const router = Router();
 
@@ -861,6 +867,38 @@ async function listNativeSubtitleTracks(
   }
 }
 
+/**
+ * 服务端 MKV 解容器：列出影片原始容器里的文本字幕轨。
+ * 用于媒体服务器既没有字幕端点、也没有外挂字幕文件的服务（如 UHD Media Server）。
+ * 返回 null 表示不可用（非 MKV / 无文本字幕轨 / 读不到流）。
+ */
+async function listServerMkvTracks(
+  movie: Movie,
+): Promise<{ tracks: MkvSubtitleTrackInfo[]; rangeSupported: boolean } | null> {
+  try {
+    const ctx = await resolveEmbyContext(movie);
+    const src = ctx.client.getStaticStreamSource(ctx.itemId);
+    const probe = await probeMkvSubtitleTracks({
+      url: src.url,
+      headers: src.headers,
+      timeoutMs: 60_000,
+    });
+    const tracks = probe.tracks.filter((t) => t.isText);
+    if (tracks.length === 0) return null;
+    return { tracks, rangeSupported: probe.rangeSupported };
+  } catch (err) {
+    console.warn(
+      '[subtitles] 服务端 MKV 字幕探测失败:',
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+}
+
+/** 提取结果缓存：同一影片同一轨重复请求直接复用（解容器需读整文件，代价高） */
+const mkvExtractCache = new Map<string, { content: string; format: string; label: string; language: string | null; at: number }>();
+const MKV_CACHE_TTL_MS = 60 * 60 * 1000;
+
 /** Emby 字幕 codec → 提取后缀与前端解析格式。
  *  注意：Emby 的 Subtitles Stream 端点按扩展名路由转封装输出，
  *  裸 `/Stream`（无扩展名）会 404——srt 也必须显式带 `.srt` 后缀。 */
@@ -902,11 +940,42 @@ router.get(
       const source = (movie.source || '').toLowerCase();
 
       if (source === 'emby' || source === 'jellyfin') {
+        // 1) 第三方兼容服务的原生 API：外挂字幕以独立文件下发
+        const nativeTracks = await listNativeSubtitleTracks(movie);
+        if (nativeTracks && nativeTracks.length > 0) {
+          res.json({ success: true, tracks: nativeTracks, native: true });
+          return;
+        }
+
+        // 2) 服务端解容器：MKV 内嵌字幕（媒体服务器没有字幕端点时的可靠路径）
+        const mkvProbe = await listServerMkvTracks(movie);
+        if (mkvProbe) {
+          res.json({
+            success: true,
+            mkv: true,
+            rangeSupported: mkvProbe.rangeSupported,
+            tracks: mkvProbe.tracks.map((t) => ({
+              index: t.trackNumber,
+              codecName: t.codecId,
+              language: t.language ?? null,
+              title: t.name ?? null,
+              label:
+                t.name?.trim() ||
+                [t.language?.trim(), t.format.toUpperCase()].filter(Boolean).join(' · ') ||
+                `轨道 ${t.trackNumber}`,
+              isText: true,
+              mkv: true,
+            })),
+          });
+          return;
+        }
+
+        // 3) 回退 Emby 兼容层 PlaybackInfo
         const ctx = await resolveEmbyContext(movie);
         // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
-      const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
-        subtitleProfile: true,
-      });
+        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+          subtitleProfile: true,
+        });
         const mediaSource = playback.MediaSources[0];
         const subtitleStreams = (mediaSource?.MediaStreams ?? []).filter(
           (s) => s.Type === 'Subtitle',
@@ -1208,9 +1277,15 @@ router.get(
         }
       })();
 
+      // 服务端解容器探测：MKV 内嵌文本字幕轨 + 数据源是否支持 Range
+      const mkvProbe = await listServerMkvTracks(movie);
+
       res.json({
         success: true,
         native: nativeProbe,
+        mkv: mkvProbe
+          ? { ok: true, rangeSupported: mkvProbe.rangeSupported, tracks: mkvProbe.tracks }
+          : { ok: false },
         server: serverInfo
           ? {
               productName: serverInfo.ProductName ?? null,
@@ -1260,6 +1335,49 @@ router.get(
       const source = (movie.source || '').toLowerCase();
 
       if (source === 'emby' || source === 'jellyfin') {
+        // 服务端解容器路径：index 为 MKV TrackNumber（embedded-tracks 返回 mkv=true）
+        if (req.query.mkv === '1') {
+          const cacheKey = `${movie.id}:${streamIndex}`;
+          const cached = mkvExtractCache.get(cacheKey);
+          if (cached && Date.now() - cached.at < MKV_CACHE_TTL_MS) {
+            res.json({
+              success: true,
+              content: cached.content,
+              format: cached.format,
+              label: cached.label,
+              language: cached.language,
+            });
+            return;
+          }
+          const ctx = await resolveEmbyContext(movie);
+          const src = ctx.client.getStaticStreamSource(ctx.itemId);
+          const result = await extractMkvSubtitleTrack(
+            { url: src.url, headers: src.headers, timeoutMs: 300_000 },
+            streamIndex,
+          );
+          const label =
+            result.track.name?.trim() ||
+            [result.track.language?.trim(), result.format.toUpperCase()]
+              .filter(Boolean)
+              .join(' · ') ||
+            `轨道 ${streamIndex}`;
+          mkvExtractCache.set(cacheKey, {
+            content: result.content,
+            format: result.format,
+            label,
+            language: result.track.language ?? null,
+            at: Date.now(),
+          });
+          res.json({
+            success: true,
+            content: result.content,
+            format: result.format,
+            label,
+            language: result.track.language ?? null,
+          });
+          return;
+        }
+
         // 原生 API 路径：index 为原生字幕数组下标（embedded-tracks 返回 native=true）
         if (req.query.native === '1') {
           const mount = await findMountForMovie(movie);

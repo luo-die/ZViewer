@@ -492,6 +492,28 @@ export class EmbyClient {
     }
   }
 
+  /**
+   * 原始文件直推流地址与请求头（服务端解容器取字幕用）。
+   * 不经过转码：MKV 内嵌字幕只能从原始容器里解出来。
+   */
+  getStaticStreamSource(itemId: string): {
+    url: string;
+    headers: Record<string, string>;
+  } {
+    const url = new URL(
+      `${this.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/stream`,
+    );
+    url.searchParams.set('static', 'true');
+    if (this.opts.token) url.searchParams.set('api_key', this.opts.token);
+    const headers: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    };
+    if (this.opts.token) headers['X-Emby-Token'] = this.opts.token;
+    return { url: url.toString(), headers };
+  }
+
   /** 服务器公开信息 GET /emby/System/Info/Public（诊断用：确认服务端类型与版本） */
   async systemInfoPublic(): Promise<Record<string, unknown>> {
     return this.request<Record<string, unknown>>({

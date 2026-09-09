@@ -317,17 +317,15 @@ export function WatchTogetherCore({
           : `/api/jellyfin/stream?movieId=${movieId}&static=1`
       embeddedTimer = setTimeout(() => {
         void (async () => {
-          const started = await subtitles.autoLoadEmbeddedTracks({
-            kind,
-            movieId,
-          })
-          if (started > 0) return
-          // 优先用原文件直推流；探测失败（非 MKV / 直链 CORS）则静默跳过
-          await subtitles.loadEmbeddedSubtitles(
+          // 1) 浏览器端解容器：渐进式，首段到达即出字幕（起播体验最好）
+          const browserStarted = await subtitles.loadEmbeddedSubtitles(
             currentMoviePath ?? '',
             demuxUrl || sourceUrl,
             () => videoRef.current?.currentTime ?? null
           )
+          if (browserStarted > 0) return
+          // 2) 后端兜底：第三方服务原生 API 的外挂字幕 / 服务端 MKV 解容器
+          await subtitles.autoLoadEmbeddedTracks({ kind, movieId })
         })()
       }, 1500)
     }
