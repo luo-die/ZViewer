@@ -50,6 +50,7 @@ import {
   RoomSettingsHandler,
   RoomDisconnectHandler,
   RegisterHostHandler,
+  roomSessionService,
   roomStateService,
 } from './modules/room';
 import {
@@ -219,6 +220,11 @@ async function bootstrap() {
   // P3-Opt#13：从 DB 恢复所有活跃房间的运行时状态（movies、currentMovieId、播放记忆）
   await roomStateService.initFromDb();
 
+  // 重启后不可能还有 socket 存活：把 DB 里残留的「活跃 session」全部收尾。
+  // 否则房间人数会把幽灵会话算进去——表现为「房间明明只有一个人，
+  // 却提示观看人数已达上限」（放在状态恢复之后，避免影响恢复逻辑）。
+  await roomSessionService.endAllActiveSessions('服务器启动');
+
   // 头像目录已在 ensureDataDirs() 中创建（config/uploads/avatars），
   // 此处保留防御性检查以兼容旧版手动部署场景
   if (!fs.existsSync(AVATARS_DIR)) {
@@ -378,6 +384,13 @@ async function bootstrap() {
   // 注入 io：playbackMemoryService.isHostOnline 据此校验 hostSocketId 的
   // socket 是否实际在线（后端重启后 DB 恢复的旧 socket id 已失效）
   playbackMemoryService.setIo(io);
+  // 幽灵会话清理：异常断线/强杀时 disconnect 可能丢失，导致人数虚高；
+  // 每 2 分钟核对一次 socket 是否仍在线
+  roomSessionService.setIo(io);
+  setInterval(() => {
+    void roomSessionService.sweepZombieSessions();
+  }, 2 * 60 * 1000);
+  void roomSessionService.sweepZombieSessions();
 
   app.use('/api/rooms', createRoomsRouter(io));
 

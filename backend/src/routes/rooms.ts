@@ -86,18 +86,25 @@ export function createRoomsRouter(io: SocketIOServer): Router {
         const [allViewers, allSharers] = await Promise.all([
           sessionRepo.find({
             where: { roomId: In(roomIds), role: 'viewer', endedAt: IsNull() },
-            select: ['roomId'],
+            select: ['roomId', 'socketId'],
           }),
           sessionRepo.find({
             where: { roomId: In(roomIds), role: 'sharer', endedAt: IsNull() },
-            select: ['roomId'],
+            select: ['roomId', 'socketId'],
           }),
         ]);
+        // 只统计 socket 仍在线会话：DB 里的「活跃」标记可能滞后（服务器重启
+        // 残留、异常断线），否则房间列表会显示虚高的人数
         const viewerCountMap = new Map<string, number>();
         for (const v of allViewers) {
+          if (!io.sockets.sockets.has(v.socketId)) continue;
           viewerCountMap.set(v.roomId, (viewerCountMap.get(v.roomId) || 0) + 1);
         }
-        const sharerSet = new Set(allSharers.map((s) => s.roomId));
+        const sharerSet = new Set(
+          allSharers
+            .filter((s) => io.sockets.sockets.has(s.socketId))
+            .map((s) => s.roomId),
+        );
 
         const result = rooms.map((room) => ({
               id: room.id,

@@ -21,6 +21,61 @@ import { playbackMemoryService } from '../playback-memory';
  * 房间 Session 服务。
  */
 export class RoomSessionService {
+  /** 注入 io：判断 session 对应的 socket 是否仍在线（清理幽灵会话用） */
+  private io: SocketIOServer | null = null;
+
+  setIo(io: SocketIOServer): void {
+    this.io = io;
+  }
+
+  /**
+   * 结束所有仍标记为活跃的 session。
+   *
+   * 服务器重启后，DB 里残留的「活跃 session」不可能再对应任何 socket；
+   * 若不清理，房间人数会把幽灵会话算进去——表现为「房间明明只有一个人，
+   * 却提示观看人数已达上限」。
+   */
+  async endAllActiveSessions(reason: string): Promise<number> {
+    const sessionRepo = AppDataSource.getRepository(Session);
+    const active = await sessionRepo.findBy({ endedAt: IsNull() });
+    if (active.length === 0) return 0;
+    const now = new Date();
+    for (const s of active) {
+      s.endedAt = now;
+      roomPermissionService.invalidatePermissionCache(s.socketId, s.roomId);
+    }
+    await sessionRepo.save(active);
+    console.log(
+      `[room-session] 已清理 ${active.length} 条残留活跃会话（${reason}）`,
+    );
+    return active.length;
+  }
+
+  /**
+   * 清理幽灵会话：socket 已不在线、但 session 仍是活跃（异常断线、进程被
+   * 强杀、网络中断等导致 disconnect 事件丢失）。定期跑一遍，避免人数虚高。
+   */
+  async sweepZombieSessions(): Promise<number> {
+    if (!this.io) return 0;
+    const sessionRepo = AppDataSource.getRepository(Session);
+    const active = await sessionRepo.findBy({ endedAt: IsNull() });
+    const zombies = active.filter(
+      (s) => !this.io!.sockets.sockets.has(s.socketId),
+    );
+    if (zombies.length === 0) return 0;
+    const now = new Date();
+    for (const s of zombies) {
+      s.endedAt = now;
+      roomPermissionService.invalidatePermissionCache(s.socketId, s.roomId);
+    }
+    await sessionRepo.save(zombies);
+    for (const s of zombies) {
+      this.io.to(s.roomId).emit('viewer-left', { viewerSocketId: s.socketId });
+    }
+    console.log(`[room-session] 已清理 ${zombies.length} 条幽灵会话`);
+    return zombies.length;
+  }
+
   /**
    * 注册房主（首次或重连）。
    *
@@ -213,7 +268,11 @@ export class RoomSessionService {
    */
   async getViewerCount(roomId: string): Promise<number> {
     const viewers = await this.getViewers(roomId);
-    return viewers.length;
+    // 已注入 io 时只统计「socket 仍在线」的观众：DB 里的活跃标记可能滞后
+    // （异常断线/重启残留），若直接按行数判定人数上限，会出现「房间只有一个人
+    // 却提示人数已达上限」的假满员。
+    if (!this.io) return viewers.length;
+    return viewers.filter((s) => this.io!.sockets.sockets.has(s.socketId)).length;
   }
 
   /**
