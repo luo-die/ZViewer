@@ -21,6 +21,12 @@ import type { PlayerSource } from '@/modules/player/types'
 export interface TranscodeCapability {
   available: boolean
   version: string | null
+  /** 服务端选中的视频编码器（h264_nvenc / libx264 …；未探测到为 null） */
+  encoder: string | null
+  /** 该编码器是否为硬件编码（NVENC/QSV/AMF/VideoToolbox/VAAPI） */
+  hardware: boolean
+  /** 服务端 HLS 分片时长（秒），用于前端估算等待/缓冲 */
+  segmentSeconds: number | null
 }
 
 let cachedCapability: TranscodeCapability | null = null
@@ -36,12 +42,29 @@ export function fetchTranscodeCapability(): Promise<TranscodeCapability> {
           success?: boolean
           available?: boolean
           version?: string | null
+          encoder?: string | null
+          hardware?: boolean
+          segmentSeconds?: number | null
         }
         const capability: TranscodeCapability = {
           available: res.ok && data.success === true && data.available === true,
           version: data.version ?? null,
+          encoder: data.encoder ?? null,
+          hardware: data.hardware === true,
+          segmentSeconds:
+            typeof data.segmentSeconds === 'number'
+              ? data.segmentSeconds
+              : null,
         }
         cachedCapability = capability
+        if (capability.available) {
+          console.info(
+            `[server-transcode] 服务端转码可用：ffmpeg ${capability.version ?? '未知版本'}` +
+              (capability.encoder
+                ? `，视频编码器 ${capability.encoder}${capability.hardware ? '（硬件）' : '（CPU）'}`
+                : '')
+          )
+        }
         return capability
       })
       .catch((err) => {
@@ -49,6 +72,9 @@ export function fetchTranscodeCapability(): Promise<TranscodeCapability> {
         const capability: TranscodeCapability = {
           available: false,
           version: null,
+          encoder: null,
+          hardware: false,
+          segmentSeconds: null,
         }
         cachedCapability = capability
         return capability
@@ -137,11 +163,21 @@ export async function createTranscodeSession(opts: {
     success: boolean
     sessionId?: string
     playlistUrl?: string
+    mode?: string
+    encoder?: string
+    fps?: number
     message?: string
   }
   if (!res.ok || !data.success || !data.playlistUrl) {
     throw new Error(data.message || '服务端转码会话创建失败')
   }
+  // 服务端已决定 remux（直通）/ transcode，以及实际用的编码器——打出来便于排障：
+  // remux 说明源本身是 H.264 8bit，几乎零 CPU；transcode 则看是硬编还是软编。
+  console.info(
+    `[server-transcode] 会话已创建：${data.mode ?? '-'}` +
+      `${data.encoder ? ` / ${data.encoder}` : ''}` +
+      `${data.fps ? ` / ${data.fps}fps` : ''}（${data.sessionId ?? '-'}）`
+  )
   activeSessionId = data.sessionId ?? null
   activeRoomId = opts.roomId ?? null
   return { sessionId: data.sessionId ?? '', playlistUrl: data.playlistUrl }

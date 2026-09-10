@@ -142,3 +142,110 @@ export async function getFfmpegVersion(): Promise<string | null> {
   cachedVersion = output ? parseVersion(output) : null;
   return cachedVersion;
 }
+
+// ==================== 视频编码器探测（硬件加速） ====================
+
+/**
+ * H.264 编码器候选：**前面的优先**。
+ *
+ * 服务端转码是实时性场景（一边转一边播），硬件编码器能把 CPU 占用从
+ * 「吃满数核」降到接近零，直接决定能不能边转边流畅播放。
+ * 顺序：NVENC（N 卡）→ QSV（Intel 核显）→ AMF（A 卡）→ VideoToolbox（macOS）
+ * → VAAPI（Linux 通用）→ libx264（纯 CPU 兜底，任何环境都有）。
+ */
+const ENCODER_CANDIDATES = [
+  'h264_nvenc',
+  'h264_qsv',
+  'h264_amf',
+  'h264_videotoolbox',
+  'h264_vaapi',
+] as const;
+
+export interface ResolvedVideoEncoder {
+  /** ffmpeg 的 -c:v 取值 */
+  encoder: string;
+  /** 是否硬件编码器（false = libx264 纯 CPU） */
+  hardware: boolean;
+}
+
+/** 已选定的编码器（进程内缓存：探测一次要跑一次编码测试，不该反复做） */
+let cachedEncoder: ResolvedVideoEncoder | null = null;
+let encoderInflight: Promise<ResolvedVideoEncoder> | null = null;
+
+/** 跑一次极小的测试编码：能被列出但实际不可用（无驱动/无设备）的编码器会在这里失败 */
+function testEncoder(cmd: string, encoder: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(
+      cmd,
+      [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-f', 'lavfi',
+        '-i', 'testsrc=d=0.1:s=64x64:r=10',
+        '-frames:v', '1',
+        '-c:v', encoder,
+        '-f', 'null',
+        '-',
+      ],
+      { timeout: 15000, windowsHide: true, maxBuffer: 512 * 1024 },
+      (err) => resolve(!err),
+    );
+  });
+}
+
+/**
+ * 选择实际可用的视频编码器（优先硬件，带测试编码验证）。
+ *
+ * - `TRANSCODE_VIDEO_ENCODER` 环境变量可强制指定（如 `h264_nvenc`、`libx264`），
+ *   指定值同样会做一次测试编码，失败则回退自动探测；
+ * - 自动探测顺序见 ENCODER_CANDIDATES；
+ * - VAAPI 在 Linux 上需要 `TRANSCODE_VAAPI_DEVICE`（默认 /dev/dri/renderD128），
+ *   测试时用 `-vaapi_device` 挂上，真正编码时同样要挂。
+ */
+export async function resolveVideoEncoder(): Promise<ResolvedVideoEncoder> {
+  if (cachedEncoder) return cachedEncoder;
+  if (encoderInflight) return encoderInflight;
+
+  encoderInflight = (async (): Promise<ResolvedVideoEncoder> => {
+    const fallback: ResolvedVideoEncoder = { encoder: 'libx264', hardware: false };
+    const ffmpegPath = await resolveFfmpegPath();
+    if (!ffmpegPath) return fallback;
+
+    const forced = (process.env.TRANSCODE_VIDEO_ENCODER || '').trim();
+    if (forced) {
+      const ok = await testEncoder(ffmpegPath, forced);
+      if (ok) {
+        console.log(`[transcode] 使用指定编码器：${forced}`);
+        return { encoder: forced, hardware: forced !== 'libx264' };
+      }
+      console.warn(
+        `[transcode] TRANSCODE_VIDEO_ENCODER=${forced} 不可用，回退自动探测`,
+      );
+    }
+
+    for (const candidate of ENCODER_CANDIDATES) {
+      // VAAPI 需要显式设备节点，测试与编码都依赖它
+      if (candidate === 'h264_vaapi' && process.platform === 'win32') continue;
+      const ok = await testEncoder(ffmpegPath, candidate);
+      if (ok) {
+        console.log(`[transcode] 检测到硬件编码器：${candidate}（转码将走 GPU）`);
+        return { encoder: candidate, hardware: true };
+      }
+    }
+
+    console.log('[transcode] 未检测到可用硬件编码器，使用 libx264（CPU）');
+    return fallback;
+  })();
+
+  try {
+    cachedEncoder = await encoderInflight;
+    return cachedEncoder;
+  } finally {
+    encoderInflight = null;
+  }
+}
+
+/** 已探测到的编码器（同步读取；未探测时为 null） */
+export function getCachedVideoEncoder(): ResolvedVideoEncoder | null {
+  return cachedEncoder;
+}

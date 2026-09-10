@@ -21,16 +21,33 @@ import type { MutableRefObject, RefObject } from 'react'
 import { useRoomStore } from '@/store/roomStore'
 import { message } from '@/components/ui/message'
 import { safePlay } from '@/modules/sync-playback/safePlay'
-import { isServerTranscodeUrl } from '@/modules/player/services/server-transcode'
+import {
+  isServerTranscodeUrl,
+  getCachedTranscodeCapability,
+} from '@/modules/player/services/server-transcode'
 
 /** 缓冲领先多少秒才恢复播放（够播一小段，避免刚够一帧又卡） */
-const RESUME_AHEAD_SEC = 4
+const FALLBACK_RESUME_AHEAD_SEC = 4
 /** 轮询间隔 */
 const POLL_MS = 1500
 /** 等待超过该时长仍无新分片 → 认为转码已异常，提示并解除托管 */
 const GIVE_UP_MS = 90_000
 /** 用户手动播放后的冷却期（期间不再自动暂停） */
 const USER_OVERRIDE_COOLDOWN_MS = 30_000
+
+/**
+ * 恢复播放所需的缓冲领先量。
+ *
+ * 默认「一个分片 + 1s」：服务端分片时长可用 `TRANSCODE_SEGMENT_SECONDS` 调整，
+ * 按分片长度等待能保证恢复播放后至少还有一个完整分片可播，不会刚播一秒又卡。
+ */
+function resolveResumeAheadSec(): number {
+  const segmentSeconds = getCachedTranscodeCapability()?.segmentSeconds
+  if (typeof segmentSeconds === 'number' && segmentSeconds > 0) {
+    return Math.max(2, Math.ceil(segmentSeconds) + 1)
+  }
+  return FALLBACK_RESUME_AHEAD_SEC
+}
 
 export function useTranscodeEdgeSync({
   videoRef,
@@ -55,6 +72,7 @@ export function useTranscodeEdgeSync({
     let notified = false
     let waitStartedAt = 0
     let cooldownUntil = 0
+    const resumeAheadSec = resolveResumeAheadSec()
 
     const bufferedAhead = (): number => {
       const buffered = video.buffered
@@ -101,7 +119,7 @@ export function useTranscodeEdgeSync({
           }
           return
         }
-        if (bufferedAhead() >= RESUME_AHEAD_SEC) {
+        if (bufferedAhead() >= resumeAheadSec) {
           stopWaiting(true)
           return
         }
@@ -121,7 +139,7 @@ export function useTranscodeEdgeSync({
       startWaiting()
     }
     const onProgress = (): void => {
-      if (waitingRef.current && bufferedAhead() >= RESUME_AHEAD_SEC) {
+      if (waitingRef.current && bufferedAhead() >= resumeAheadSec) {
         stopWaiting(true)
       }
     }

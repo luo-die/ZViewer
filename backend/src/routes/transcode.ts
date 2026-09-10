@@ -38,15 +38,21 @@ import {
 } from '../middleware/auth';
 import {
   createSession,
+  defaultTranscodeThreads,
+  getHlsSegmentSeconds,
   getSession,
   listSessions,
   stopSession,
   stopSessionsForRoom,
   touchSession,
-  type TranscodeMode,
   type TranscodeSession,
 } from '../services/transcode/session';
-import { getFfmpegVersion, resolveFfmpegPath } from '../services/transcode/ffmpeg';
+import {
+  getCachedVideoEncoder,
+  getFfmpegVersion,
+  resolveFfmpegPath,
+  resolveVideoEncoder,
+} from '../services/transcode/ffmpeg';
 
 const router = Router();
 
@@ -219,6 +225,7 @@ function parsePositiveNumber(value: unknown): number | null {
 
 // ==================== GET /capability ====================
 // 前端在决定是否走服务端转码前先探测一次：没有 ffmpeg 就直接退回浏览器端管线。
+// 顺带回报实际选中的视频编码器（硬件/CPU）与 CPU 核心数，便于前端展示与排障。
 router.get('/capability', async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const ffmpegPath = await resolveFfmpegPath();
@@ -227,7 +234,26 @@ router.get('/capability', async (_req: AuthenticatedRequest, res: Response): Pro
       return;
     }
     const version = await getFfmpegVersion();
-    res.json({ success: true, available: true, version });
+    // 编码器探测会实际试跑一次极小的 testsrc 编码（结果有缓存）。
+    // 已探测过就直接回报；没探测过则后台预热、本次不阻塞 capability 响应。
+    let encoder: string | null = null;
+    let hardware = false;
+    const cached = getCachedVideoEncoder();
+    if (cached) {
+      encoder = cached.encoder;
+      hardware = cached.hardware;
+    } else {
+      void resolveVideoEncoder().catch(() => undefined);
+    }
+    res.json({
+      success: true,
+      available: true,
+      version,
+      encoder,
+      hardware,
+      threads: defaultTranscodeThreads(),
+      segmentSeconds: getHlsSegmentSeconds(),
+    });
   } catch (err) {
     console.error('[transcode] capability error:', err);
     res.json({ success: true, available: false, version: null });
@@ -319,12 +345,18 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
       // 归属房间：同房间新建会话会回收旧会话（切影片不再残留 ffmpeg）
       ownerKey: roomKey,
       movieId: movie.id,
+      // 源探测缓存键：影片 ID 稳定，重复起播/拖动不再重复跑 ffprobe
+      probeKey: `movie:${movie.id}`,
     });
 
     res.json({
       success: true,
       sessionId: session.id,
       playlistUrl: `/api/transcode/${session.id}/index.m3u8`,
+      // 诊断信息：前端可在控制台/提示里显示实际编码方式（remux 直通 / 硬编 / 软编）
+      mode: session.mode,
+      encoder: session.encoder,
+      fps: session.fps,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -17,6 +17,7 @@ import {
   isRelativeUrl,
   buildProxyUrl,
 } from '../services/url-proxy'
+import { isServerTranscodeUrl } from '../services/server-transcode'
 
 /** Safari 等原生 HLS 支持检测 */
 function canPlayNativeHls(video: HTMLVideoElement): boolean {
@@ -141,6 +142,11 @@ export const hlsEngine: PlayerEngine = {
     // 可利用 ProxyLoader 拦截跨域请求。仅当 hls.js 不支持时（如 iOS Safari
     // 不支持 MSE）才回退到原生 HLS。
     if (Hls.isSupported()) {
+      // 服务端转码源（/api/transcode/...）：本质是「边转边播」的直播列表，
+      // 播放器参数要按直播调——默认的 liveSyncDurationCount=3 会让 hls.js
+      // 从「列表末尾往前 3 个分片」起播（4s 分片就是白等 12s），而转码器
+      // 一开始往往只写出了 2~3 个分片，等于把起播时间又往后拖。
+      const isTranscode = isServerTranscodeUrl(targetUrl)
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
@@ -149,9 +155,22 @@ export const hlsEngine: PlayerEngine = {
         // 已播数据永不清理，长视频播放 1-2 小时后 MSE SourceBuffer 累积到 GB 级内存。
         // 前向缓冲 30s 保证平滑，硬上限 120s 兜底极低码率，已播仅保留 90s
         // （seek 回看 90s 内秒开，更早的位置会重新拉取分片）。
-        maxBufferLength: 30,
+        // 转码源来自本机（延迟极低、供给稳定），多缓冲一点更抗卡顿。
+        maxBufferLength: isTranscode ? 60 : 30,
         maxMaxBufferLength: 120,
-        backBufferLength: 90,
+        backBufferLength: isTranscode ? 30 : 90,
+        ...(isTranscode
+          ? {
+              // 起播位置贴着转码边界（4s 分片 = 最多等 8s，而不是 12s）
+              liveSyncDurationCount: 2,
+              // 分片晚一点写出时自动重试，而不是直接判为播放失败
+              fragLoadingMaxRetry: 6,
+              fragLoadingRetryDelay: 500,
+              fragLoadingMaxRetryTimeout: 8000,
+              manifestLoadingMaxRetry: 3,
+              levelLoadingMaxRetry: 3,
+            }
+          : {}),
       })
 
       // 先注册事件监听器，再调用 attachMedia
