@@ -18,6 +18,10 @@ import { movieService } from '../movie.service';
 import { movieBroadcasterService } from '../movie-broadcaster.service';
 import type { MovieDto } from '../../shared';
 
+/** 播放问题上报的节流窗口（同一房间+同一影片+同一类型，窗口内只转达一次） */
+const ISSUE_REPORT_WINDOW_MS = 60_000;
+const issueReportTimes = new Map<string, number>();
+
 /**
  * 影片列表事件处理器。
  *
@@ -27,11 +31,63 @@ import type { MovieDto } from '../../shared';
  * - play-movie { roomId, movieId }：房主切换当前播放影片
  * - request-movie-list { roomId }：请求房间影片列表
  * - request-current-movie { roomId }：请求当前正在播放的影片 ID
+ * - report-playback-issue { roomId, movieId, kind, codec }：观众上报播放问题
+ *   （如「有声音没画面」——观众自己无法修复，需转达房主切换转码方式）
  */
 export class MovieListHandler implements SocketEventHandler {
   readonly name = 'MovieListHandler';
 
   register(socket: Socket, io: SocketIOServer): void {
+    // 观众上报播放问题 → 广播给房间（前端只在房主端提示）
+    socket.on(
+      'report-playback-issue',
+      async (
+        payload: {
+          roomId: string;
+          movieId?: number | null;
+          kind?: string;
+          codec?: string | null;
+        },
+        callback?: AckCallback,
+      ) => {
+        try {
+          if (!payload?.roomId) {
+            return safeAck(callback, { success: false, message: '缺少 roomId' });
+          }
+          if (!(await roomPermissionService.isInRoom(socket, payload.roomId))) {
+            return safeAck(callback, { success: false, message: '不在该房间中' });
+          }
+
+          const kind = payload.kind === 'no-picture' ? 'no-picture' : 'unknown';
+          const key = `${payload.roomId}:${payload.movieId ?? 'any'}:${kind}`;
+          const now = Date.now();
+          const last = issueReportTimes.get(key);
+          if (last !== undefined && now - last < ISSUE_REPORT_WINDOW_MS) {
+            // 窗口内重复上报（多个观众同时遇到）不再转达，避免提示刷屏
+            return safeAck(callback, { success: true, data: { throttled: true } });
+          }
+          issueReportTimes.set(key, now);
+          if (issueReportTimes.size > 500) issueReportTimes.clear();
+
+          io.to(payload.roomId).emit('playback-issue', {
+            roomId: payload.roomId,
+            movieId: payload.movieId ?? null,
+            kind,
+            codec: payload.codec ?? null,
+            username: socket.data.username ?? null,
+            at: now,
+          });
+          console.log(
+            `[report-playback-issue] room=${payload.roomId} movie=${payload.movieId ?? '-'} kind=${kind} codec=${payload.codec ?? '-'}`,
+          );
+          return safeAck(callback, { success: true });
+        } catch (err) {
+          console.error('[report-playback-issue] error:', err);
+          return safeAck(callback, { success: false, message: '上报失败' });
+        }
+      },
+    );
+
     // 添加影片到房间播放列表
     socket.on(
       'add-movie',

@@ -50,7 +50,11 @@ import {
   isPlaysVideoSupported,
 } from '@/modules/player/engines/playsvideo-engine'
 import { isIOSDevice } from '@/lib/fullscreen-utils'
-import { buildDeviceUnsupportedMessage } from '@/modules/player/services/server-transcode'
+import {
+  buildDeviceUnsupportedMessage,
+  getCachedTranscodeCapability,
+  isRoomTranscodeServerMode,
+} from '@/modules/player/services/server-transcode'
 
 import {
   isBrowserPlayableFormat,
@@ -88,6 +92,71 @@ function raceWithTimeout<T>(
  * 判定为「该编码浏览器解不了」，回退原生直连。
  */
 const FIRST_FRAME_TIMEOUT_MS = 12_000
+
+/**
+ * 「有声音没画面」通用看门狗超时（毫秒）。
+ *
+ * 背景（安卓设备常见）：视频轨编码是设备解不了的（HEVC / 10bit H.264 / AV1），
+ * 而 AAC 音轨能正常解码——浏览器会照常播放声音、容器也解析成功，但视频轨
+ * 永远不出帧：**有声音、黑屏、且不触发任何 error 事件**。旧实现的首帧看门狗
+ * 只对 playsvideo 管线生效，原生直连（Android 上最常见的那条路）完全不设防，
+ * 用户只能看到无边无际的黑屏。
+ *
+ * 这里对所有引擎统一兜底：超时后若「已经在播（进度在走 / 已有可渲染数据）」
+ * 却始终没有解出帧，就明确告知用户是编码不受支持，并给出可行的解决路径。
+ */
+const NO_PICTURE_TIMEOUT_MS = 12_000
+
+/** 本会话内已判定「该源解不出画面」的地址（避免反复等 12s 再报同一件事） */
+const noPictureUrls = new Map<string, number>()
+const NO_PICTURE_MARK_TTL_MS = 30 * 60_000
+
+function hasNoPictureMark(url: string): boolean {
+  const at = noPictureUrls.get(url)
+  if (at === undefined) return false
+  if (Date.now() - at > NO_PICTURE_MARK_TTL_MS) {
+    noPictureUrls.delete(url)
+    return false
+  }
+  return true
+}
+
+function markNoPicture(url: string): void {
+  if (!url) return
+  if (noPictureUrls.size > 200) noPictureUrls.clear()
+  noPictureUrls.set(url, Date.now())
+}
+
+/** 是否已解出画面：有可渲染数据（readyState ≥ 2）且解出了帧（videoWidth > 0） */
+function hasPicture(video: HTMLVideoElement): boolean {
+  return video.readyState >= 2 && video.videoWidth > 0
+}
+
+/**
+ * 「有声音没画面」的用户文案。
+ *
+ * 已开启服务端转码却仍不出画 → 说明重编码也没救回来（片源本身有问题）；
+ * 未开启 → 引导房主切到服务端（服务器 ffmpeg 重编码为 H.264 就能播）。
+ */
+function describeNoPicture(source: PlayerSource): string {
+  const codec = (source.videoCodec || '').toLowerCase()
+  const codecLabel = codec ? codec.toUpperCase() : '该视频编码'
+  if (isRoomTranscodeServerMode()) {
+    return (
+      `有声音但没画面：当前设备无法解码该视频（${codecLabel}）。` +
+      '服务端转码已开启仍未出画，可尝试重载影片或换一个片源。'
+    )
+  }
+  const capability = getCachedTranscodeCapability()
+  const hint =
+    capability && !capability.available
+      ? '请改用 H.264（AVC）片源；服务器安装 ffmpeg 后也可开启「服务端转码」'
+      : '可在播放列表把「转码方式」切到「服务端」（服务器会重新编码为 H.264 后即可播放）；若你不是房主，请让房主切换'
+  return (
+    `有声音但没画面：当前设备无法解码该视频编码（${codecLabel}，常见于 HEVC / 10bit / AV1）。` +
+    hint
+  )
+}
 
 /**
  * 设备不具备浏览器端转码能力时的说明文案。
@@ -462,6 +531,71 @@ export function usePlayerSource(
   }, [attachPlaysVideoFallback])
 
   /**
+   * 通用「有声音没画面」看门狗：任何引擎 attach 成功后都挂上。
+   *
+   * 与 playsvideo 首帧看门狗的分工：
+   * - playsvideo 那条走的是「12s 未出画 → 回退原生直连」（管线本身可能有问题）；
+   * - 本函数走的是「已经在播却始终没有帧 → 明确告知编码不受支持」，
+   *   覆盖原生直连 / HLS / FLV / DASH 这些没有回退目标的情况。
+   *
+   * 触发条件刻意收紧，避免慢网络误报：必须已经出过数据或进度在走，
+   * 且不在暂停态、仍在播放同一个源。
+   */
+  const armNoPictureWatch = useCallback(
+    (video: HTMLVideoElement, source: PlayerSource): void => {
+      const url = source.url
+      // 本会话已判定过：不再让用户白等一轮
+      if (hasNoPictureMark(url)) return
+      const stop = (): void => {
+        video.removeEventListener('loadeddata', onProgress)
+        video.removeEventListener('timeupdate', onProgress)
+        clearTimeout(timer)
+      }
+      const onProgress = (): void => {
+        if (appliedSourceUrlRef.current !== url) {
+          stop()
+          return
+        }
+        if (hasPicture(video)) {
+          // 出画即成功，彻底解除
+          noPictureUrls.delete(url)
+          stop()
+        }
+      }
+      const timer = setTimeout(() => {
+        stop()
+        if (appliedSourceUrlRef.current !== url) return
+        if (!mountedRef.current) return
+        if (hasPicture(video)) return
+        // 只有「确实在播」才判定：进度已推进或已有可渲染数据；暂停中不报
+        const progressed = video.currentTime > 0.3 || video.readyState >= 2
+        if (!progressed) return
+        if (video.paused) return
+        markNoPicture(url)
+        console.warn(
+          `[usePlayerSource] ${Math.round(
+            NO_PICTURE_TIMEOUT_MS / 1000
+          )}s 内始终未出画（进度在走、有声音），判定为视频编码不受支持`,
+          { url: url.slice(0, 80), videoCodec: source.videoCodec }
+        )
+        // code 供上层识别：观众端会据此把问题转达给房主（观众自己修不了，
+        // 需要房主把「转码方式」切到服务端重编码为 H.264）
+        const noPictureError = new Error(describeNoPicture(source)) as Error & {
+          code?: string
+          videoCodec?: string | null
+        }
+        noPictureError.code = 'NO_PICTURE'
+        noPictureError.videoCodec = source.videoCodec ?? null
+        onPlaybackErrorRef.current?.(noPictureError)
+      }, NO_PICTURE_TIMEOUT_MS)
+
+      video.addEventListener('loadeddata', onProgress)
+      video.addEventListener('timeupdate', onProgress)
+    },
+    []
+  )
+
+  /**
    * 管线失败后的原生直连兜底（attach 期异常 / 首帧看门狗共用）。
    *
    * 条件：容器本身浏览器可开（mkv/mp4/webm/mov），且本次不是「管线强制回退」
@@ -499,14 +633,19 @@ export function usePlayerSource(
           `[usePlayerSource] ${reason}，已回退原生直连播放（音频可能不受支持）`
         )
         registerPlaybackErrorWatch(video, source, 'direct')
+        // 直连兜底后同样挂「有声音没画面」看门狗：
+        // 管线回退到原生往往正是因为编码解不了（HEVC 等），
+        // 原生同样解不了时用户依旧只有声音，必须给出明确提示。
+        armNoPictureWatch(video, source)
         return true
       } catch (err) {
         console.warn('[usePlayerSource] 原生直连兜底同样失败:', err)
         return false
       }
     },
-    [cleanup, applyAttachResult, registerPlaybackErrorWatch]
+    [cleanup, applyAttachResult, registerPlaybackErrorWatch, armNoPictureWatch]
   )
+
   /**
    * playsvideo 首帧看门狗。
    *
@@ -688,6 +827,10 @@ export function usePlayerSource(
         // 也不会有画面。这里起一个首帧看门狗，超时自动回退原生直连。
         if (engine.type === 'playsvideo' && !source.forcePlaysVideo) {
           armFirstFrameWatch(video, source)
+        } else {
+          // 原生直连 / HLS / FLV / DASH：没有可回退的目标，直接挂
+          // 「有声音没画面」看门狗，超时后明确告知编码不受支持
+          armNoPictureWatch(video, source)
         }
       } catch (err) {
         // 加载失败时回滚 appliedSourceUrlRef，允许下次重试
@@ -702,6 +845,7 @@ export function usePlayerSource(
       attachDirectFallback,
       registerPlaybackErrorWatch,
       armFirstFrameWatch,
+      armNoPictureWatch,
     ]
   )
   // 更新稳定自引用（commit 后同步，供 token 刷新重试递归调用；

@@ -37,11 +37,16 @@ import type { ResolvedSource } from '@/modules/bilibili/types'
 import { safePlay } from '../safePlay'
 import { executeSeek } from '../services'
 import type { SeekToResult } from '../services'
+import { useSocket } from '@/hooks/useSocket'
 
 interface ViewerLocalOverride {
   movieId: number
   resolved: ResolvedSource
 }
+
+/** 「有声音没画面」上报节流（同一房间+影片 60s 内只上报一次） */
+const NO_PICTURE_REPORT_INTERVAL_MS = 60_000
+const noPictureReportTimes = new Map<string, number>()
 
 /**
  * 确保观众端按本地解析偏好获得独立的 B站 源。
@@ -310,6 +315,12 @@ export function useVideoSource({
   watchTogether,
   isHostRef,
 }: UseVideoSourceOptions): UseVideoSourceReturn {
+  const { socket } = useSocket()
+  // socket 的稳定引用：handlePlaybackError 用它上报播放问题
+  const socketRef = useRef(socket)
+  useEffect(() => {
+    socketRef.current = socket
+  }, [socket])
   // 播放期错误提示（usePlayerSource 统一判定后回调）：
   // B站源由 useWatchTogether 的 stalled/error 自动重载链路负责，此处过滤
   const handlePlaybackError = useCallback(
@@ -318,6 +329,28 @@ export function useVideoSource({
       if (state.sourceType === 'bilibili') return
       if (suppressEventsRef.current) return
       message.error(err.message)
+
+      // 「有声音没画面」= 该设备的视频解码器解不了这个编码，本机无法自救，
+      // 唯一出路是房主把「转码方式」切到服务端（服务器重编码 H.264）。
+      // 这里上报给房间，由房主端提示他切换；同一影片 60s 内只报一次。
+      const code = (err as Error & { code?: string }).code
+      if (code === 'NO_PICTURE') {
+        const store = useRoomStore.getState()
+        const movieId = store.currentMovieId
+        const key = `${store.roomId}:${movieId ?? 'any'}`
+        const last = noPictureReportTimes.get(key) ?? 0
+        if (Date.now() - last > NO_PICTURE_REPORT_INTERVAL_MS) {
+          noPictureReportTimes.set(key, Date.now())
+          socketRef.current?.emit('report-playback-issue', {
+            roomId: store.roomId,
+            movieId,
+            kind: 'no-picture',
+            codec:
+              (err as Error & { videoCodec?: string | null }).videoCodec ??
+              null,
+          })
+        }
+      }
     },
     [suppressEventsRef]
   )

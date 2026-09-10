@@ -151,6 +151,39 @@ export function MovieListPanel({
     roomTranscodeMode === 'server' && serverTranscodeAvailable
 
   /**
+   * 观众上报的播放问题 → 房主端提示切换转码方式。
+   *
+   * 「有声音没画面」是观众设备的视频解码器解不了该编码（HEVC / 10bit / AV1），
+   * 观众本机无法自救，唯一出路是房主把「转码方式」切到服务端（重编码 H.264）。
+   * 后端已按 房间+影片 做 60s 节流，多个观众同时遇到也只提示一次。
+   */
+  useEffect(() => {
+    if (!socket || !isHost) return
+    const handlePlaybackIssue = (payload: {
+      roomId?: string
+      kind?: string
+      codec?: string | null
+      username?: string | null
+    }) => {
+      if (!payload) return
+      if (payload.roomId && payload.roomId !== roomId) return
+      if (payload.kind !== 'no-picture') return
+      const who = payload.username ? `${payload.username} ` : '有观众'
+      const codecLabel = payload.codec
+        ? payload.codec.toUpperCase()
+        : '该视频编码'
+      message.warning(
+        `${who}反馈「有声音没画面」：其设备解不了 ${codecLabel}。把上方「转码方式」切到「服务端」即可让其正常观看。`,
+        { duration: 10000 }
+      )
+    }
+    socket.on('playback-issue', handlePlaybackIssue)
+    return () => {
+      socket.off('playback-issue', handlePlaybackIssue)
+    }
+  }, [socket, isHost, roomId])
+
+  /**
    * 房主切换转码方式。
    *
    * 必须等后端 ack 并**先写入本地 store 再重新解析**：早期实现是先 emit

@@ -103,6 +103,7 @@ The playlist header has a single **"Transcode mode"** control (merging the forme
 - **Auto** (default): MKV / DTS are remuxed/audio-transcoded **in the browser** — **zero server CPU and bandwidth**. This is the cheapest path for desktop Chrome/Edge, Android and iPad.
 - **Server**: server ffmpeg produces **HLS**; iPhone/iPad use Safari's native HLS player, so MKV/DTS work without MSE. **When the host wants to share with iOS devices, switch to this mode**: the host re-resolves the current movie and broadcasts the HLS source, so every member (iPhones included) follows immediately.
 - Viewers have **no** transcoding controls of their own: server transcoding burns the host's CPU and bandwidth and must not be enabled by a viewer. When a viewer's device cannot play, the error message tells them to ask the host to switch to "Server".
+- **Automatic "audio but no picture" detection**: some Android devices cannot decode HEVC / 10-bit / AV1 video tracks while the AAC audio plays fine — sound, black screen, and no error event at all. Every engine now runs a 12 s no-picture watchdog that (1) explains to that viewer that the codec is unsupported and (2) **reports it to the host**, whose UI shows "a viewer has audio but no picture — switch Transcode mode to Server", which fixes it for them.
 
 #### Server transcode details
 
