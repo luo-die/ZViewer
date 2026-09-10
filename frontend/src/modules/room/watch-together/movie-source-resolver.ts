@@ -22,10 +22,8 @@ import { appendAuthToken } from '@/modules/player/services/url-proxy'
 import {
   createTranscodeSession,
   fetchTranscodeCapability,
-  pickTranscodeMode,
   shouldUseServerTranscode,
 } from '@/modules/player/services/server-transcode'
-import type { PlayerSource } from '@/modules/player/types'
 import {
   resolveAniSubsEpisode,
   buildAniSubsProxyUrl,
@@ -422,26 +420,20 @@ export async function resolveMovieSource({
   // 产出后端 ffmpeg 的 HLS 播放列表——桌面走 hls.js，iPhone 走 Safari
   // 原生 HLS，因此不需要 MediaSource 也能播 MKV / DTS 这类源。
   // 房主开启后本函数解析出 HLS 源并随状态广播给全房间。
-  const transcodeDecisionSource: PlayerSource = {
-    url: movie.url,
-    format: (movie.format as MediaFormat | undefined) ?? undefined,
-    videoCodec: movie.videoCodec ?? undefined,
-    audioCodec: movie.audioCodec ?? undefined,
-  }
   await fetchTranscodeCapability()
   if (shouldUseServerTranscode()) {
     try {
-      const mode = pickTranscodeMode(transcodeDecisionSource)
       // 起点按 30s 取整：会话键含 start，粗粒度取整让同房间成员复用同一会话
       const rawStart = recovery?.currentTime ?? 0
       const start = rawStart > 60 ? Math.floor(rawStart / 30) * 30 : undefined
+      // 模式（remux / transcode）交由服务端 ffprobe 探测决定：
+      // 源是 HEVC/AV1/10bit 时必须真转码，否则安卓等设备依旧只有声音没画面
       const { playlistUrl } = await createTranscodeSession({
         movieId: movie.id,
-        mode,
         start,
       })
       console.info(
-        `[movie-source-resolver] 使用服务端转码（${mode}${start ? ` @${start}s` : ''}）`
+        `[movie-source-resolver] 使用服务端转码${start ? `（起点 ${start}s）` : ''}`
       )
       return {
         sourceUrl: appendAuthToken(playlistUrl),

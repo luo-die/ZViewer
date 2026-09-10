@@ -280,12 +280,118 @@ function findReusableSession(sessionKey: string): TranscodeSession | null {
 }
 
 /**
+ * 用 ffprobe 判断源视频轨能否安全直通（remux），否则必须真转码。
+ *
+ * 背景（线上问题：切了服务端转码，安卓依旧只有声音没画面）：
+ * 旧实现由前端按 `movie.videoCodec` 猜模式，而挂载类片源（WebDAV/OpenList/
+ * FTP/Emby…）这个字段常年为空 → 猜成 remux → **HEVC 原样透传**，
+ * 安卓/旧 iOS 依然解不了视频轨，症状与不开转码时一模一样。
+ *
+ * 判定规则（服务端转码的语义就是「兼容模式」，宁可多花 CPU 也要能播）：
+ * - `h264` + `yuv420p`（8bit）→ copy 直通：几乎所有设备都能硬解，零 CPU；
+ * - 其余（hevc / av1 / vp9 / 10bit / mpeg4 / 探测失败）→ libx264 重编码。
+ *
+ * ffprobe 只读文件头，通常几十毫秒；结果按输入地址缓存。
+ */
+const probeModeCache = new Map<string, TranscodeMode>();
+
+async function decideModeForInput(inputUrl: string): Promise<TranscodeMode> {
+  const cached = probeModeCache.get(inputUrl);
+  if (cached) return cached;
+  const result = await probeVideoCodec(inputUrl);
+  // 探测不出信息时按「必须转码」处理：兼容优先，避免又回到 HEVC 直通的老坑
+  const mode: TranscodeMode =
+    result.codec === 'h264' && (!result.pixFmt || result.pixFmt === 'yuv420p')
+      ? 'remux'
+      : 'transcode';
+  probeModeCache.set(inputUrl, mode);
+  if (probeModeCache.size > 200) probeModeCache.clear();
+  console.log(
+    `[transcode] 源探测：codec=${result.codec ?? '-'} pix_fmt=${result.pixFmt ?? '-'} → ${mode}`,
+  );
+  return mode;
+}
+
+/** 调 ffprobe 读取首条视频轨的 codec_name / pix_fmt（失败返回空） */
+async function probeVideoCodec(
+  inputUrl: string,
+): Promise<{ codec: string | null; pixFmt: string | null }> {
+  const ffmpegPath = await resolveFfmpegPath();
+  if (!ffmpegPath) return { codec: null, pixFmt: null };
+  // ffprobe 与 ffmpeg 同目录（FFMPEG_PATH 指向 exe 时同样适用）
+  const ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
+  return await new Promise((resolve) => {
+    let settled = false;
+    const done = (value: { codec: string | null; pixFmt: string | null }) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      const child = spawn(
+        ffprobePath,
+        [
+          '-v', 'error',
+          '-select_streams', 'v:0',
+          '-show_entries', 'stream=codec_name,pix_fmt',
+          '-of', 'json',
+          inputUrl,
+        ],
+        { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      );
+      let out = '';
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => {
+        out += chunk;
+        if (out.length > 64 * 1024) out = out.slice(0, 64 * 1024);
+      });
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+        done({ codec: null, pixFmt: null });
+      }, 8000);
+      child.on('error', () => {
+        clearTimeout(timer);
+        done({ codec: null, pixFmt: null });
+      });
+      child.on('close', () => {
+        clearTimeout(timer);
+        try {
+          const parsed = JSON.parse(out) as {
+            streams?: { codec_name?: string; pix_fmt?: string }[];
+          };
+          const stream = parsed.streams?.[0];
+          done({
+            codec: stream?.codec_name?.toLowerCase() ?? null,
+            pixFmt: stream?.pix_fmt?.toLowerCase() ?? null,
+          });
+        } catch {
+          done({ codec: null, pixFmt: null });
+        }
+      });
+    } catch {
+      done({ codec: null, pixFmt: null });
+    }
+  });
+}
+
+/**
  * 创建（或复用）一个 HLS 转码会话。
  *
  * @throws 当本机没有可用 ffmpeg 时抛出 message 为 `FFMPEG_MISSING` 的 Error。
  */
 export async function createSession(opts: CreateSessionOptions): Promise<TranscodeSession> {
-  const mode: TranscodeMode = opts.mode === 'transcode' ? 'transcode' : 'remux';
+  // 显式指定则尊重；未指定 / 'auto' 时由 ffprobe 探测源编码决定
+  // （源是 HEVC/AV1/10bit 必须真转码，否则安卓等设备仍只有声音没画面）
+  const mode: TranscodeMode =
+    opts.mode === 'transcode'
+      ? 'transcode'
+      : opts.mode === 'remux'
+        ? 'remux'
+        : await decideModeForInput(opts.inputUrl);
   const startTime = normalizeStartTime(opts.startTime);
 
   // 1. 复用：同一「影片 + 模式 + 起点」已有会话时直接返回

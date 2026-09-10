@@ -230,7 +230,8 @@ router.get('/capability', async (_req: AuthenticatedRequest, res: Response): Pro
 });
 
 // ==================== POST /session ====================
-// body: { movieId: number, mode?: 'remux' | 'transcode', start?: number }
+// body: { movieId: number, mode?: 'auto' | 'remux' | 'transcode', start?: number }
+// mode 缺省/auto：由服务端 ffprobe 探测源视频编码决定（HEVC/AV1/10bit → 真转码）
 router.post('/session', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const body = (req.body ?? {}) as { movieId?: unknown; mode?: unknown; start?: unknown };
@@ -241,8 +242,9 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
       return;
     }
 
-    // 模式缺省按 remux（只换容器，几乎不耗 CPU）
-    const mode: TranscodeMode = body.mode === 'transcode' ? 'transcode' : 'remux';
+    // 仅显式指定 remux/transcode 时透传，其余（缺省/auto/非法值）交给服务端探测
+    const requestedMode: 'remux' | 'transcode' | null =
+      body.mode === 'remux' || body.mode === 'transcode' ? body.mode : null;
     const start = parsePositiveNumber(body.start) ?? 0;
 
     const movie = await AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
@@ -293,9 +295,12 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
 
     const session = await createSession({
       inputUrl,
-      mode,
+      // 显式指定时透传；未指定则交给服务端 ffprobe 判定：源是 HEVC/AV1/10bit
+      // 时必须真转码，否则安卓等设备切了「服务端」依旧只有声音没画面
+      mode: requestedMode ?? undefined,
       startTime: start,
-      sessionKey: `${movie.id}:${mode}:${start}`,
+      // key 不含 mode：模式由服务端探测决定，同一影片+起点只应有一个会话
+      sessionKey: `${movie.id}:${start}`,
     });
 
     res.json({

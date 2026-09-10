@@ -83,7 +83,7 @@ export function shouldUseServerTranscode(): boolean {
 /** 转码方式：浏览器解不了视频编码时需要重编码，否则只需重封装 */
 export function pickTranscodeMode(source: PlayerSource): 'remux' | 'transcode' {
   const video = (source.videoCodec || '').toLowerCase()
-  if (!video) return 'remux'
+  if (!video) return 'transcode'
   const browserNativeVideo = [
     'avc',
     'h264',
@@ -94,31 +94,23 @@ export function pickTranscodeMode(source: PlayerSource): 'remux' | 'transcode' {
     'h265',
   ]
   if (!browserNativeVideo.includes(video)) return 'transcode'
-  // HEVC：只有 Safari/iOS 系能原生解，其他浏览器需要重编码
-  if ((video === 'hevc' || video === 'h265') && !browserSupportsHevc()) {
-    return 'transcode'
-  }
   return 'remux'
 }
 
-let hevcSupport: boolean | null = null
-function browserSupportsHevc(): boolean {
-  if (hevcSupport !== null) return hevcSupport
-  try {
-    const probe = document.createElement('video')
-    hevcSupport =
-      probe.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') !== '' ||
-      probe.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') !== ''
-  } catch {
-    hevcSupport = false
-  }
-  return hevcSupport
+/** 该地址是否为本服务端转码产出的 HLS 播放列表 */
+export function isServerTranscodeUrl(url: string | null | undefined): boolean {
+  return !!url && url.includes('/api/transcode/')
 }
 
-/** 发起（或复用）一次服务端转码会话，返回带鉴权的 HLS 播放列表地址 */
+/**
+ * 发起（或复用）一次服务端转码会话，返回带鉴权的 HLS 播放列表地址。
+ *
+ * 不再由前端指定 remux/transcode：源编码（HEVC/AV1/10bit 等）前端常常拿不到，
+ * 猜成 remux 会把 HEVC 原样透传，安卓依旧只有声音没画面。交由服务端
+ * ffprobe 探测决定（h264 8bit → 直通，其余 → 重编码 H.264）。
+ */
 export async function createTranscodeSession(opts: {
   movieId: number
-  mode: 'remux' | 'transcode'
   start?: number
 }): Promise<{ sessionId: string; playlistUrl: string }> {
   const res = await apiFetch('/api/transcode/session', {

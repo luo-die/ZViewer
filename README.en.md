@@ -107,8 +107,10 @@ The playlist header has a single **"Transcode mode"** control (merging the forme
 
 #### Server transcode details
 
-- Two modes are chosen automatically: `remux` (video passthrough, almost no CPU) and `transcode` (re-encode to H.264 when the browser cannot decode the video codec); audio is always converted to AAC.
-- Segments go to `config/transcode/<session id>/`, reclaimed after 15 minutes idle (process + directory) and cleaned up on shutdown; sessions are reused by "movie + mode + start (rounded to 30 s)".
+- **The mode is decided server-side by ffprobe** (the client no longer guesses): an `h264 + yuv420p` (8-bit) source is remuxed (`-c:v copy`, zero CPU); anything else (HEVC / AV1 / 10-bit / probe failure) is re-encoded to H.264. Audio is always converted to AAC.
+  > Earlier versions had the client guess from `movie.videoCodec`, which is usually empty for mounted sources → it guessed `remux` → **HEVC was passed through unchanged**, so Android devices still had audio but no picture even after switching to "Server". The server now probes the source with `ffprobe` (server log: `[transcode] 源探测：codec=… pix_fmt=… → remux|transcode`).
+- **Transcode progress is synchronised**: because ffmpeg produces segments sequentially, catching up with the produced edge is no longer mistaken for a stalled picture — the host pauses and shows "server is transcoding, waiting for the next segments…", then resumes automatically once the buffer is 4 s ahead (pause/play are broadcast, so the whole room waits and continues together); viewers only see the notice.
+- Segments go to `config/transcode/<session id>/`, reclaimed after 15 minutes idle (process + directory) and cleaned up on shutdown; sessions are reused by "movie + start (rounded to 30 s)".
 - **Install ffmpeg**: put it on `PATH`, or point `FFMPEG_PATH` at the binary. Without it the "Server" option is hidden and the API answers 503 with an installation hint.
 - Forward seeking is limited by ffmpeg producing segments sequentially.
 

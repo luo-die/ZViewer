@@ -23,6 +23,7 @@ import {
   safePlay,
 } from '@/modules/sync-playback'
 import { wasUserPaused } from '@/modules/player/services/pause-intent'
+import { useTranscodeEdgeSync } from './useTranscodeEdgeSync'
 import {
   createSuppressRef,
   resetSuppression,
@@ -205,6 +206,10 @@ export function useWatchTogether({
     // eslint-disable-next-line react-hooks/set-state-in-effect -- 外部信号触发的重载，非渲染期派生状态
     retryLoadMovie()
   }, [pendingMovieReload, retryLoadMovie])
+
+  // 服务端转码播放的进度同步：播到 ffmpeg 产出边界时房主暂停等待、
+  // 缓冲领先后续播（pause/play 会广播给全房间），避免「卡一下再跳」
+  useTranscodeEdgeSync({ videoRef, isHostRef })
 
   useEffect(() => {
     isHostRef.current = isHost

@@ -12,6 +12,7 @@ import type {
 import { SOCKET_EVENT } from '../constants'
 import { safePlay } from '../safePlay'
 import { wasUserPaused } from '@/modules/player/services/pause-intent'
+import { isServerTranscodeUrl } from '@/modules/player/services/server-transcode'
 import {
   executeSeek,
   mergeStateDiff,
@@ -513,8 +514,15 @@ export function useViewerHeartbeat({
       // 画面卡死检测：房主在播、本地也处于播放态，但 currentTime 连续 3 次
       // 心跳（约 15s）没有前进 —— 典型表现是「声音还在、画面卡住」
       // （视频轨拉流中断而音频缓冲还在播）。自动重载一次，60s 冷却。
+      //
+      // 例外：服务端转码源。ffmpeg 顺序产出分片，播放追到产出边界时本就会
+      // 停住等新分片（由 useTranscodeEdgeSync 统一托管等待与续播），
+      // 这里若判成卡死并重载，就会变成「卡一下再跳一下」，必须跳过。
       const now = Date.now()
       const stall = stallRef.current
+      const isTranscodeSource = isServerTranscodeUrl(
+        useRoomStore.getState().watchTogether.sourceUrl
+      )
       if (payload.isPlaying && !video.paused) {
         if (Math.abs(video.currentTime - stall.time) < 0.05) {
           stall.count += 1
@@ -522,7 +530,11 @@ export function useViewerHeartbeat({
           stall.count = 0
           stall.time = video.currentTime
         }
-        if (stall.count >= 3 && now - stall.lastReloadAt > 60_000) {
+        if (
+          stall.count >= 3 &&
+          !isTranscodeSource &&
+          now - stall.lastReloadAt > 60_000
+        ) {
           stall.count = 0
           stall.lastReloadAt = now
           console.warn(
