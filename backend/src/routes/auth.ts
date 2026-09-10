@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
-import { AppDataSource } from '../data-source';
+import { AppDataSource, flushDatabase } from '../data-source';
 import { User } from '../entities/User';
 import { getSystemSettings } from '../index';
 import {
@@ -132,8 +132,9 @@ router.post(
         status: isOpen ? 'active' : 'pending',
       });
       await userRepository().save(user);
-      // 显式触发 autoSave，确保注册用户立即写入文件
-      await (AppDataSource.driver as import('typeorm/driver/sqljs/SqljsDriver').SqljsDriver).autoSave().catch(() => {});
+      // 显式落盘，确保注册用户立即写入文件
+      // （sql.js 已改为 1s 防抖保存，关键写入需显式刷盘，见 data-source.ts）
+      await flushDatabase();
 
       if (isOpen) {
         const tokens = generateTokens(user.id, user.role, user.username);
@@ -429,8 +430,9 @@ router.patch(
 
       user.passwordHash = await bcrypt.hash(newPassword, 10);
       await userRepo.save(user);
-      // 显式触发 autoSave，确保密码修改立即写入文件
-      await (AppDataSource.driver as import('typeorm/driver/sqljs/SqljsDriver').SqljsDriver).autoSave().catch(() => {});
+      // 显式落盘，确保密码修改立即写入文件
+      // （sql.js 已改为 1s 防抖保存，关键写入需显式刷盘，见 data-source.ts）
+      await flushDatabase();
       // V5：改密后使此前签发的所有 token 立即失效（含被盗的 refresh token）。
       // 客户端下次请求会收到 401，凭新密码重新登录获取新 token。
       await invalidateUserTokens(user.id);
@@ -489,8 +491,9 @@ router.patch(
 
       user.username = trimmedUsername;
       await userRepo.save(user);
-      // 显式触发 autoSave，确保用户名修改立即写入文件
-      await (AppDataSource.driver as import('typeorm/driver/sqljs/SqljsDriver').SqljsDriver).autoSave().catch(() => {});
+      // 显式落盘，确保用户名修改立即写入文件
+      // （sql.js 已改为 1s 防抖保存，关键写入需显式刷盘，见 data-source.ts）
+      await flushDatabase();
       writeAuditLog({
         actorUserId: user.id,
         actorUsername: user.username,

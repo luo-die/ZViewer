@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import type { RefObject, MutableRefObject } from 'react'
 import { useSocket } from '@/hooks/useSocket'
 import { message } from '@/components/ui/message'
@@ -112,6 +112,20 @@ export function useViewerStateSync({
   // （socket 重连窗口），主动请求全量状态自愈，避免 diff 合并基线错位
   const lastSeqRef = useRef(0)
 
+  /**
+   * 事件是否属于当前房间。
+   *
+   * 服务端在加入新房间时会让 socket 离开旧房间（room-session.leaveOtherRooms），
+   * 但切换瞬间仍可能有旧房间的在途广播到达；若不加判断就会把上一个房间的
+   * 播放状态应用到本房间的播放器（表现为「切房间后放的却是上一个房间的内容，
+   * 刷新一下才好」）。payload 未带 roomId（旧版服务端）时按当前房间处理，兼容。
+   */
+  const belongsToRoom = useCallback(
+    (payloadRoomId?: unknown): boolean =>
+      typeof payloadRoomId !== 'string' || payloadRoomId === roomId,
+    [roomId]
+  )
+
   useEffect(() => {
     if (!socket || isHostRef.current) return
 
@@ -192,7 +206,12 @@ export function useViewerStateSync({
         // （房主切清晰度/换片时观众从房主当前进度起播，避免长缓冲）。
         // 已被更新的 attach 取代：不再应用旧源
         if (attachSeqRef.current !== attachSeq) return
-        await applySourceToVideo(video, state, state.currentTime || undefined, blobs)
+        await applySourceToVideo(
+          video,
+          state,
+          state.currentTime || undefined,
+          blobs
+        )
         // 应用期间又来了更新的换源：本次结果作废（不写缓存、不调进度/播放）
         if (attachSeqRef.current !== attachSeq) return
         // applySourceToVideo 后视频元素可能已替换，重新获取
@@ -259,6 +278,7 @@ export function useViewerStateSync({
     }
 
     const handleState = (payload: StatePayload) => {
+      if (!belongsToRoom((payload as { roomId?: unknown }).roomId)) return
       // 跳号检测：seq > lastSeq + 1 说明错失了中间广播（socket 重连窗口等），
       // diff 合并基线已错位 → 强制丢弃 diff 用全量 state，并请求全量状态自愈。
       if (typeof payload.seq === 'number' && payload.seq > 0) {
@@ -335,6 +355,7 @@ export function useViewerStateSync({
     }
 
     const handleControl = (payload: ControlPayload) => {
+      if (!belongsToRoom((payload as { roomId?: unknown }).roomId)) return
       const video = videoRef.current
       if (!video) return
 
@@ -394,6 +415,7 @@ export function useViewerStateSync({
   }, [
     socket,
     roomId,
+    belongsToRoom,
     videoRef,
     setWatchTogether,
     applySourceToVideo,
@@ -447,11 +469,16 @@ export function useViewerHeartbeat({
     if (!socket || isHostRef.current) return
 
     const handleHeartbeat = (payload: {
+      roomId?: string
       currentTime: number
       isPlaying: boolean
       playbackRate?: number
       suppressed?: boolean
     }) => {
+      // 旧房间的在途心跳同样要丢弃，否则会把上一个房间的播放进度/状态应用到本房间
+      // （本 Hook 未接 roomId 参数，直接读 store 中的当前房间号，永远是最新值）
+      const currentRoomId = useRoomStore.getState().roomId
+      if (payload.roomId && payload.roomId !== currentRoomId) return
       const video = videoRef.current
       if (!video) return
       if (suppressEventsRef.current) return
@@ -499,7 +526,7 @@ export function useViewerHeartbeat({
           stall.count = 0
           stall.lastReloadAt = now
           console.warn(
-            "[useViewerStateSync] 画面卡住（进度长时间不前进），自动重载视频源"
+            '[useViewerStateSync] 画面卡住（进度长时间不前进），自动重载视频源'
           )
           void reloadVideo(video)
         }
@@ -574,7 +601,9 @@ export function useViewerHeartbeat({
         payload.source === 'host' &&
         typeof payload.currentTime === 'number'
       ) {
+        // roomId 透传给 handleHeartbeat，由它统一做旧房间过滤
         handleHeartbeat({
+          roomId: (payload as { roomId?: string }).roomId,
           currentTime: payload.currentTime,
           isPlaying: !!payload.isPlaying,
           playbackRate: payload.playbackRate,

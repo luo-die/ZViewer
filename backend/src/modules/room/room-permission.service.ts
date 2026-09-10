@@ -248,11 +248,23 @@ export class RoomPermissionService {
    * 检查房间是否存在且为活跃状态，且为 watch-together 模式。
    *
    * 修复旧架构中同步播放事件不校验 room.mode 的问题。
+   *
+   * 性能（复用 isRoomHost / isInRoom 的 5s 缓存）：watch-together-state /
+   * watch-together-control 每条事件（每房间 2Hz）都会调用本方法，原先每次都查
+   * Room 表；房间模式变更处会主动失效缓存。
    */
   async isWatchTogetherRoom(roomId: string): Promise<boolean> {
+    // 用固定前缀 'room' 占位 socketId 位置，保持 key 仍是 `sid:roomId:method`
+    // 格式，可被 invalidatePermissionCache(undefined, roomId) 的扫描清理掉。
+    const key = this.cacheKey('room', roomId, 'isWatchTogetherRoom');
+    const cached = this.getCached(key);
+    if (cached !== null) return cached;
+
     const roomRepo = AppDataSource.getRepository(Room);
     const room = await roomRepo.findOneBy({ roomId, status: 'active' });
-    return !!room && room.mode === 'watch-together';
+    const result = !!room && room.mode === 'watch-together';
+    this.setCache(key, result);
+    return result;
   }
 
   /**
@@ -266,17 +278,31 @@ export class RoomPermissionService {
 
   /**
    * 检查用户是否被禁言。
+   *
+   * 性能：评论/弹幕发送都会调用本方法，按「roomId + userId」缓存 5s；
+   * 禁言/解禁（viewerService.setMuted）会主动失效该房间的缓存，
+   * 保证被禁言后立即生效、解禁后立即恢复。
    */
   async isMuted(roomId: string, userId: number): Promise<boolean> {
+    // 同样保持 `sid:roomId:method` 三段格式：前缀 'mute' 占位 socketId，
+    // 第三段放 userId，这样 invalidatePermissionCache(undefined, roomId) 也能清理。
+    const key = this.cacheKey('mute', roomId, String(userId));
+    const cached = this.getCached(key);
+    if (cached !== null) return cached;
+
     const roomRepo = AppDataSource.getRepository(Room);
     const room = await roomRepo.findOneBy({ roomId });
-    if (!room) return false;
-    try {
-      const muted: string[] = JSON.parse(room.mutedViewers || '[]');
-      return muted.includes(String(userId));
-    } catch {
-      return false;
+    let result = false;
+    if (room) {
+      try {
+        const muted: string[] = JSON.parse(room.mutedViewers || '[]');
+        result = muted.includes(String(userId));
+      } catch {
+        result = false;
+      }
     }
+    this.setCache(key, result);
+    return result;
   }
 
   /**

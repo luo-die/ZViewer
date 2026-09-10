@@ -6,12 +6,18 @@ import {
   UpdateDateColumn,
   ManyToOne,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Room } from './Room';
 
 export type SessionRole = 'sharer' | 'viewer';
 
 @Entity()
+// 索引（synchronize 会自动建索引）：权限校验/在线人数统计都按
+// 「roomId + endedAt IS NULL」或「socketId + endedAt IS NULL」查询，
+// 无索引时会全表扫描，房间与人多后每次心跳都要扫一遍。
+@Index(['roomId', 'endedAt'])
+@Index(['socketId', 'endedAt'])
 export class Session {
   @PrimaryGeneratedColumn()
   id!: number;

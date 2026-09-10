@@ -747,7 +747,13 @@ export function WatchTogetherCore({
       .catch((err) => {
         console.error('[WatchTogether] load danmaku error:', err)
       })
-  }, [watchTogether.cid, watchTogether.sourceType, setDefaultTrack, videoRef, isHost])
+  }, [
+    watchTogether.cid,
+    watchTogether.sourceType,
+    setDefaultTrack,
+    videoRef,
+    isHost,
+  ])
 
   // 弹幕开关重新开启时，重新加载当前时间轴弹幕并 seek 到当前时间
   useEffect(() => {
@@ -1535,10 +1541,7 @@ export function WatchTogetherCore({
       const target = e.target as Node
       // portal 到 body 的浮动菜单（如 FontPicker 下拉）虽在 anchor 外，
       // 但点击它们不应关闭设置面板（否则菜单瞬间卸载无法选中）
-      if (
-        target instanceof Element &&
-        target.closest?.('[data-portal-menu]')
-      ) {
+      if (target instanceof Element && target.closest?.('[data-portal-menu]')) {
         return
       }
       if (
@@ -1942,8 +1945,8 @@ export function WatchTogetherCore({
               subtitleEnabled={subtitles.subtitleEnabled}
               subtitleTracks={subtitles.subtitleTracks}
               activeTrackIndex={subtitles.activeTrackIndex}
-        secondaryTrackIndex={subtitles.secondaryTrackIndex}
-        onChangeSecondaryTrack={subtitles.setSecondaryTrack}
+              secondaryTrackIndex={subtitles.secondaryTrackIndex}
+              onChangeSecondaryTrack={subtitles.setSecondaryTrack}
               subtitleFontSize={subtitles.subtitleFontSize}
               subtitleOffset={subtitles.subtitleOffset}
               subtitleShiftX={subtitles.subtitleShiftX}
@@ -1970,7 +1973,7 @@ export function WatchTogetherCore({
               onChangeSubtitleStrokeWidth={subtitles.setStrokeWidth}
               onChangeSubtitleShadowBlur={subtitles.setShadowBlur}
               onChangeSubtitleFontFamily={subtitles.setFontFamily}
-        onResetSubtitleStyle={subtitles.resetSubtitleStyle}
+              onResetSubtitleStyle={subtitles.resetSubtitleStyle}
               onAutoSearchSubtitles={
                 currentMovieId != null && isHost
                   ? () => subtitles.searchAutoSubtitles(currentMovieId)

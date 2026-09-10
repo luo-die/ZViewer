@@ -31,6 +31,7 @@ import type { RefObject, MutableRefObject } from 'react'
 import {
   selectEngine,
   shouldUsePlaysVideo,
+  requiresPlaysVideoPipeline,
   resetVideoElement,
   resolveProxyUrl,
   isLocalUrl,
@@ -44,6 +45,11 @@ import type {
 import { refreshAccessToken } from '@/lib/api'
 import { formatVideoLoadError } from '@/modules/player/utils'
 import { markPlaysVideoFailure } from '@/modules/player/playsvideo-preference'
+import {
+  describePlaysVideoSupport,
+  isPlaysVideoSupported,
+} from '@/modules/player/engines/playsvideo-engine'
+import { isIOSDevice } from '@/lib/fullscreen-utils'
 
 import {
   isBrowserPlayableFormat,
@@ -81,6 +87,23 @@ function raceWithTimeout<T>(
  * 判定为「该编码浏览器解不了」，回退原生直连。
  */
 const FIRST_FRAME_TIMEOUT_MS = 12_000
+
+/**
+ * 设备不具备浏览器端转码能力时的说明文案。
+ *
+ * iPhone 17.1 以下是原理性缺失（没有 MSE / ManagedMediaSource），
+ * 必须让用户知道「换片源」或「换设备/浏览器」才是出路，
+ * 而不是反复去拨「浏览器转码引擎」开关。
+ */
+function unsupportedPipelineMessage(reason: string): string {
+  const iosHint = isIOSDevice()
+    ? 'iPhone/iPad 需 iOS 17.1 及以上才支持浏览器端转码'
+    : '请改用 Chrome / Edge 等支持 MediaSource 的浏览器'
+  return (
+    `${reason}。该片源需要浏览器端重封装/转码才能播放（如 MKV 容器、DTS/AC3 音轨）。` +
+    `${iosHint}；若无法升级，请改用 MP4（H.264 + AAC）片源。`
+  )
+}
 
 /**
  * 判断引擎错误是否为本站 API 媒体地址的鉴权失效（401/403）。
@@ -162,6 +185,13 @@ type PlaysVideoFallbackOutcome =
   | { kind: 'attached' }
   /** 引擎被两级开关禁用（系统级 / 影片级任一关闭） */
   | { kind: 'disabled' }
+  /**
+   * 本设备/浏览器根本不具备运行条件（无 MSE/MMS）。
+   *
+   * 与 `disabled` 必须分开：iPhone（< iOS 17.1）上引导用户「去系统设置
+   * 开启浏览器转码引擎」是死路——开了也跑不起来。此时应给平台级说明。
+   */
+  | { kind: 'unsupported' }
   /** 组件已卸载（影片切换重挂载），无需任何处理 */
   | { kind: 'unmounted' }
   /** 管线 attach 失败 */
@@ -331,7 +361,14 @@ export function usePlayerSource(
               watchedSource,
               { time: atTime, playing: wasPlaying }
             )
-            if (outcome.kind === 'disabled') {
+            if (outcome.kind === 'unsupported') {
+              // 本设备没有 MSE/MMS：管线根本不可能运行，给平台级说明而非开关引导
+              onPlaybackErrorRef.current?.(
+                new Error(
+                  unsupportedPipelineMessage(describePlaysVideoSupport())
+                )
+              )
+            } else if (outcome.kind === 'disabled') {
               // 引擎被两级开关禁用：无回退路径，提示开启引导
               onPlaybackErrorRef.current?.(
                 new Error(
@@ -395,7 +432,12 @@ export function usePlayerSource(
       const pipelineSource: PlayerSource = { ...source, forcePlaysVideo: true }
       const pipelineEngine = selectEngine(pipelineSource)
       if (pipelineEngine.type === 'direct') {
-        // 引擎被两级开关（系统级 / 影片级）禁用：尊重用户选择不启动管线
+        // 选中 direct 有两种截然不同的原因，必须分开提示：
+        // - 本设备没有 MSE/MMS（iPhone < 17.1 等）→ 无解，给平台说明；
+        // - 两级开关关闭 → 尊重用户选择，引导开启开关。
+        if (!isPlaysVideoSupported()) {
+          return { kind: 'unsupported' }
+        }
         return { kind: 'disabled' }
       }
       cleanup()
@@ -609,6 +651,12 @@ export function usePlayerSource(
               err
             )
             const outcome = await attachPlaysVideoFallback(video, source)
+            if (outcome.kind === 'unsupported') {
+              throw new Error(
+                unsupportedPipelineMessage(describePlaysVideoSupport()),
+                { cause: err }
+              )
+            }
             if (outcome.kind === 'disabled') {
               // 引擎被两级开关禁用（系统级/影片级任一关闭）：尊重用户
               // 选择不启动管线，回退路径不存在，直接抛出带开启引导的
@@ -716,12 +764,34 @@ export function usePlayerSource(
       // 但 avi/ts/wmv 可由 playsvideo 重封装为 fMP4 播放，因此不能一律拒绝——
       // 仅当「playsvideo 不会接管本源」时才判定为不可播。
       // 预检放在更新 appliedSourceUrlRef 之前，失败时不污染"已应用"标记。
+      //
+      // 设备没有 MSE/MMS（iPhone < 17.1 等）时，浏览器端转码在原理上不可用：
+      // 对「必须重封装/转码」的源直接给出平台级说明，不做注定失败的
+      // 原生尝试（否则用户只会看到「源不可用」这类误导文案）。
+      const pipelineNeeded = requiresPlaysVideoPipeline(source)
       if (
-        source.format &&
         !isBrowserPlayableFormat(source.format) &&
         !shouldUsePlaysVideo(source)
       ) {
+        if (pipelineNeeded && !isPlaysVideoSupported()) {
+          throw new Error(
+            unsupportedPipelineMessage(describePlaysVideoSupport())
+          )
+        }
         throw new Error(getUnsupportedFormatMessage(source.format))
+      }
+      if (pipelineNeeded && !isPlaysVideoSupported()) {
+        throw new Error(unsupportedPipelineMessage(describePlaysVideoSupport()))
+      }
+      if (source.format === 'flv' && !isPlaysVideoSupported()) {
+        // FLV 拉流（OBS 推流模式）同样依赖 MSE，iPhone 上必然失败：
+        // 说清楚替代方案，避免用户反复重试。
+        throw new Error(
+          `当前设备不支持 FLV 直播拉流（需要 MediaSource）：` +
+            `${describePlaysVideoSupport()}。` +
+            `${isIOSDevice() ? 'iPhone/iPad 建议改用「屏幕共享（WebRTC）」模式观看' : '请改用 Chrome / Edge 观看'}，` +
+            '或让推流端输出 HLS。'
+        )
       }
 
       await enqueue(async () => {

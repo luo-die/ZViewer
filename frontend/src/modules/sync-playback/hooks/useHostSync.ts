@@ -27,7 +27,11 @@ export interface UseHostSyncOptions {
   isHostRef: MutableRefObject<boolean>
   videoRef: RefObject<HTMLVideoElement | null>
   suppressEventsRef: MutableRefObject<boolean>
-  setWatchTogether: (state: WatchTogetherState) => void
+  /**
+   * 透传给 useVideoEventBindings：支持局部更新（roomStore 的 setWatchTogether
+   * 本身就是 Partial 语义，内部做字段合并 + 等值短路）。
+   */
+  setWatchTogether: (updates: Partial<WatchTogetherState>) => void
 }
 
 export interface UseHostSyncReturn {

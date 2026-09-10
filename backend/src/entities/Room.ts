@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToMany,
+  Index,
 } from 'typeorm';
 import { Session } from './Session';
 import { Movie } from './Movie';
@@ -14,6 +15,9 @@ export type RoomMode = 'screen-share' | 'watch-together';
 export type ShareMethod = 'webrtc' | 'stream-push';
 
 @Entity()
+// 索引（synchronize 会自动建索引）：定期清理不活跃房间按
+// 「status = 'active' AND lastAccessedAt < 阈值」查询，无索引时全表扫描。
+@Index(['status', 'lastAccessedAt'])
 export class Room {
   @PrimaryGeneratedColumn()
   id!: number;

@@ -50,16 +50,13 @@ export class HeartbeatHandler implements SocketEventHandler {
               console.error('[host-heartbeat] applyHostHeartbeat error:', err);
             });
 
-          // 转发心跳给房间内其他成员（不含发送者、不含 roomId）
-          // 保留旧事件兼容已连接客户端
-          socket.to(payload.roomId).emit('host-heartbeat', {
-            currentTime: payload.currentTime,
-            isPlaying: payload.isPlaying,
-            playbackRate: payload.playbackRate,
-            suppressed: payload.suppressed,
-          });
-          // 统一心跳协议（#14）：新增 sync-heartbeat 事件，viewer 端按 source 字段区分
+          // 转发心跳给房间内其他成员（不含发送者）
+          // 带 roomId：客户端切房间后仍可能收到旧房间残余广播，接收端据此过滤
+          // 统一心跳协议（#14）：只发 sync-heartbeat。
+          // 旧 host-heartbeat 转发已删除：前端（useViewerStateSync）只监听
+          // sync-heartbeat（source: 'host'），双发会导致同一心跳被处理两遍。
           socket.to(payload.roomId).emit('sync-heartbeat', {
+            roomId: payload.roomId,
             source: 'host',
             currentTime: payload.currentTime,
             isPlaying: payload.isPlaying,

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Send, MessageSquareQuote, MessagesSquare } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
@@ -55,11 +55,9 @@ export function CommentPanel({
   commentsOnly = false,
 }: CommentPanelProps) {
   const currentUser = useAuthStore((state) => state.user)
-  // 读取 watch-together 模式下的当前播放进度，用于 send-danmaku 持久化实时弹幕记录
-  // screen-share 模式下 currentTime 始终为 0，无影响
-  const videoCurrentTime = useRoomStore(
-    (state) => state.watchTogether.currentTime
-  )
+  // 这里刻意不订阅 watchTogether.currentTime：浮点进度每秒变多次，
+  // 订阅它会把整个评论面板（含长列表）拖进高频重渲染。
+  // 实时弹幕需要的进度在「发送时」用 useRoomStore.getState() 现取（见 handleSend）。
   const [comments, setComments] = useState<CommentItem[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -149,7 +147,13 @@ export function CommentPanel({
         if (asDanmaku) {
           socket.emit(
             'send-danmaku',
-            { roomId, content, videoTime: videoCurrentTime },
+            {
+              roomId,
+              content,
+              // 发送时现取最新进度（不订阅，避免高频重渲染）；
+              // screen-share 模式下 currentTime 始终为 0，无影响
+              videoTime: useRoomStore.getState().watchTogether.currentTime,
+            },
             (danmakuResponse: SendCommentResponse) => {
               setSending(false)
               if (danmakuResponse.success) {
@@ -168,6 +172,71 @@ export function CommentPanel({
   }
 
   const handleSendComment = () => handleSend(sendAsDanmaku)
+
+  // 评论列表渲染较重（每条含头像、时间、正文，条数可能上百），
+  // 用 useMemo 缓存：只有 comments 数组变化时才重建，输入框/发送状态等
+  // 其他 state 变化不再重复构造整棵列表。
+  const commentList = useMemo(
+    () =>
+      comments.map((comment, idx) => (
+        <div
+          key={comment.id}
+          className={cn(
+            'zen-comment-enter rounded-[var(--md-sys-shape-corner)] border p-2 transition-all hover:shadow-sm hover:-translate-y-0.5',
+            comment.isDanmaku
+              ? 'border-[var(--md-sys-color-primary)] bg-[var(--md-sys-color-primary-container)]'
+              : 'border-transparent bg-[var(--glass-bg)] hover:border-[var(--md-sys-color-outline-variant)]'
+          )}
+          style={
+            {
+              '--item-delay': `${Math.min(idx, 8) * 40}ms`,
+            } as React.CSSProperties
+          }
+        >
+          <div className="flex items-start gap-1.5">
+            <Avatar
+              size="sm"
+              fallback={
+                <span className="text-[9px] font-medium">
+                  {getInitials(comment.username)}
+                </span>
+              }
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1">
+                  <Text
+                    className="text-[11px] font-medium leading-tight"
+                    style={{ color: 'var(--md-sys-color-primary)' }}
+                  >
+                    {comment.username}
+                  </Text>
+                  {comment.isDanmaku && (
+                    <span
+                      className="inline-flex items-center gap-0.5 rounded-full px-1 py-0.5 text-[9px] font-medium leading-none"
+                      style={{
+                        backgroundColor: 'var(--md-sys-color-primary)',
+                        color: 'var(--md-sys-color-on-primary)',
+                      }}
+                    >
+                      <MessageSquareQuote className="h-2.5 w-2.5" />
+                      弹幕
+                    </span>
+                  )}
+                </div>
+                <Text type="secondary" className="text-[9px] leading-none">
+                  {formatIsoTime(comment.createdAt)}
+                </Text>
+              </div>
+              <Text className="mt-0.5 break-words text-xs leading-snug">
+                {comment.content}
+              </Text>
+            </div>
+          </div>
+        </div>
+      )),
+    [comments]
+  )
 
   return (
     <div className="glass-card flex min-h-0 flex-1 flex-col gap-3 overflow-hidden rounded-[var(--md-sys-shape-corner)] p-4">
@@ -208,67 +277,7 @@ export function CommentPanel({
                     </Text>
                   </div>
                 )}
-                {comments.map((comment, idx) => (
-                  <div
-                    key={comment.id}
-                    className={cn(
-                      'zen-comment-enter rounded-[var(--md-sys-shape-corner)] border p-2 transition-all hover:shadow-sm hover:-translate-y-0.5',
-                      comment.isDanmaku
-                        ? 'border-[var(--md-sys-color-primary)] bg-[var(--md-sys-color-primary-container)]'
-                        : 'border-transparent bg-[var(--glass-bg)] hover:border-[var(--md-sys-color-outline-variant)]'
-                    )}
-                    style={
-                      {
-                        '--item-delay': `${Math.min(idx, 8) * 40}ms`,
-                      } as React.CSSProperties
-                    }
-                  >
-                    <div className="flex items-start gap-1.5">
-                      <Avatar
-                        size="sm"
-                        fallback={
-                          <span className="text-[9px] font-medium">
-                            {getInitials(comment.username)}
-                          </span>
-                        }
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center justify-between gap-1.5">
-                          <div className="flex items-center gap-1">
-                            <Text
-                              className="text-[11px] font-medium leading-tight"
-                              style={{ color: 'var(--md-sys-color-primary)' }}
-                            >
-                              {comment.username}
-                            </Text>
-                            {comment.isDanmaku && (
-                              <span
-                                className="inline-flex items-center gap-0.5 rounded-full px-1 py-0.5 text-[9px] font-medium leading-none"
-                                style={{
-                                  backgroundColor:
-                                    'var(--md-sys-color-primary)',
-                                  color: 'var(--md-sys-color-on-primary)',
-                                }}
-                              >
-                                <MessageSquareQuote className="h-2.5 w-2.5" />
-                                弹幕
-                              </span>
-                            )}
-                          </div>
-                          <Text
-                            type="secondary"
-                            className="text-[9px] leading-none"
-                          >
-                            {formatIsoTime(comment.createdAt)}
-                          </Text>
-                        </div>
-                        <Text className="mt-0.5 break-words text-xs leading-snug">
-                          {comment.content}
-                        </Text>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                {commentList}
               </Space>
             </div>
             <Space className="w-full" size="sm">

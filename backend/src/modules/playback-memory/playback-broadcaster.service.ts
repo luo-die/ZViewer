@@ -2,13 +2,13 @@
  * 播放状态定时广播服务（服务器心跳）。
  *
  * 旧架构：房主每 2s 广播 host-heartbeat，房主断开后观众 6s 超时暂停。
- * 新架构：服务器每 2s 广播 server-heartbeat + 推算后的播放状态，
+ * 新架构：服务器每 2s 广播 sync-heartbeat（source: 'server'）+ 推算后的播放状态，
  *         房主断开后服务器继续广播，观众可继续观看。
  *
  * 核心逻辑：
  * - 每 2s 遍历所有有播放状态的房间
  * - 推算当前 currentTime（基于 lastUpdatedAt + isPlaying + playbackRate）
- * - 广播 server-heartbeat 事件给房间所有成员
+ * - 广播 sync-heartbeat 事件给房间所有成员
  * - 若房主在线，则跳过广播（房主自己会广播 watch-together-state）
  *   仅在房主断开期间接管广播
  *
@@ -84,12 +84,12 @@ export class PlaybackBroadcasterService {
         const state = await playbackMemoryService.getAdvancedPlayback(roomId);
         if (!state) continue;
 
-        this.io.to(roomId).emit('server-heartbeat', {
-          roomId,
-          state,
-        });
-        // 统一心跳协议（#14）：新增 sync-heartbeat 事件（source: 'server'）
+        // 统一心跳协议（#14）：只发 sync-heartbeat。
+        // 前端（useServerHeartbeat / useViewerStateSync）只监听 sync-heartbeat——旧
+        // server-heartbeat 一旦同时发出，同一份状态会被处理两遍（store 双写 + 渲染翻倍），
+        // 故删除旧事件，仅保留 sync-heartbeat（source: 'server'）。
         this.io.to(roomId).emit('sync-heartbeat', {
+          roomId,
           source: 'server',
           state,
         });

@@ -4,6 +4,7 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
+  Index,
 } from 'typeorm';
 
 /**
@@ -13,6 +14,9 @@ import {
  * 时间偏移、显示隐藏状态等。房主添加/修改后同步给房间内所有成员。
  */
 @Entity()
+// 索引（synchronize 会自动建索引）：轨道始终按 roomId 查询/删除，
+// 无索引时每次读写弹幕轨道都要全表扫描（items 字段可达数 MB，代价很高）。
+@Index(['roomId'])
 export class DanmakuTrack {
   @PrimaryGeneratedColumn()
   id!: number;

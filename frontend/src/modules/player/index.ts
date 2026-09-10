@@ -32,8 +32,16 @@ export { directEngine } from './engines/direct-engine'
 export {
   playsVideoEngine,
   isPlaysVideoSupported,
+  getPlaysVideoSupport,
+  describePlaysVideoSupport,
 } from './engines/playsvideo-engine'
-export { selectEngine, shouldUsePlaysVideo } from './engine-selector'
+export type { PlaysVideoSupport } from './engines/playsvideo-engine'
+export {
+  selectEngine,
+  shouldUsePlaysVideo,
+  requiresPlaysVideoPipeline,
+  browserCanOpenMatroska,
+} from './engine-selector'
 
 // 浏览器转码引擎本机偏好（播放列表开关；仅本机生效，不同步）
 export {

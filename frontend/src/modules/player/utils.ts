@@ -31,6 +31,11 @@ export function formatVideoLoadError(code?: number): string {
 /**
  * 在切换 MediaSource / blob URL 前彻底重置 video 元素，
  * 避免旧的 MediaSource 仍在 attached 状态导致 Format error。
+ *
+ * 只 removeAttribute + load()，**不要**再赋 `src = ''`：Safari（含 iOS）
+ * 会把空字符串按相对 URL 解析成当前文档地址，触发一次多余的页面请求，
+ * 并在部分版本上抛出一个伪 error 事件，把我们自己的播放期错误监听
+ * 骗进「播放中断」分支。
  */
 export function resetVideoElement(video: HTMLVideoElement): void {
   try {
@@ -39,8 +44,11 @@ export function resetVideoElement(video: HTMLVideoElement): void {
     // ignore
   }
   video.removeAttribute('src')
-  video.src = ''
-  video.load()
+  try {
+    video.load()
+  } catch {
+    // ignore
+  }
 }
 
 /**

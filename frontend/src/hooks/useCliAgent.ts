@@ -8,6 +8,13 @@ export const CLI_DEFAULT_PORT = 9333
 export const CLI_HEALTH_URL = `http://127.0.0.1:${CLI_DEFAULT_PORT}/health`
 /** 健康检查轮询间隔（毫秒） */
 const HEALTH_POLL_INTERVAL_MS = 5000
+/**
+ * 代理列表兜底轮询间隔（毫秒）。
+ * 代理上下线有 cli-agent-available / cli-agent-unavailable 事件实时推送，
+ * 轮询只用于兜底「首次发现」（如挂载时机错过事件），因此放长到 15s，
+ * 且房间内已有已知代理时不再轮询。
+ */
+const AGENT_POLL_INTERVAL_MS = 15000
 
 /**
  * 当前页面是否运行在浏览器本地环境。
@@ -59,18 +66,19 @@ interface CliAgentsPayload {
  */
 export function useCliAgent(roomId: string | undefined) {
   const { socket, connected } = useSocket()
-  const {
-    localOnline,
-    agents,
-    localError,
-    isLoadingAgents,
-    setLocalOnline,
-    setAgents,
-    addAgent,
-    removeAgent,
-    setIsLoadingAgents,
-    reset,
-  } = useCliAgentStore()
+  // 逐字段订阅（原来的 useCliAgentStore() 是无 selector 的整体订阅：
+  // 任何一处 store 写入都会让所有调用本 hook 的组件重渲染）。
+  // action 引用在 zustand 里是稳定的，不会引起额外重渲染。
+  const localOnline = useCliAgentStore((s) => s.localOnline)
+  const agents = useCliAgentStore((s) => s.agents)
+  const localError = useCliAgentStore((s) => s.localError)
+  const isLoadingAgents = useCliAgentStore((s) => s.isLoadingAgents)
+  const setLocalOnline = useCliAgentStore((s) => s.setLocalOnline)
+  const setAgents = useCliAgentStore((s) => s.setAgents)
+  const addAgent = useCliAgentStore((s) => s.addAgent)
+  const removeAgent = useCliAgentStore((s) => s.removeAgent)
+  const setIsLoadingAgents = useCliAgentStore((s) => s.setIsLoadingAgents)
+  const reset = useCliAgentStore((s) => s.reset)
 
   const healthAbortRef = useRef<AbortController | null>(null)
   const healthTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -145,17 +153,20 @@ export function useCliAgent(roomId: string | undefined) {
     }
   }, [roomId, checkHealth, reset, setLocalOnline])
 
-  // 1b. 定期向后端刷新代理列表，避免 CLI 重连或前端挂载时机导致 agents 为空。
-  // 同时用户启用 CLI 后也能更快感知到代理上线。
+  // 1b. 兜底拉取代理列表：15s 一次，且「房间内已有已知代理」时跳过。
+  // 代理上下线由 socket 事件实时推送，原 3s 轮询在列表就绪后纯属无效请求。
+  // （无房间时本 effect 直接 return，interval 根本不会建立。）
   const agentsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   useEffect(() => {
     if (!socket || !connected || !roomId) return
 
-    // 立即拉取一次，再启动 3 秒轮询
+    // 立即拉取一次，再启动兜底轮询
     listAgents()
     agentsTimerRef.current = setInterval(() => {
+      // 已知代理：交给事件驱动，跳过本轮（离线/重连导致列表清空后会自动恢复轮询）
+      if (useCliAgentStore.getState().agents.length > 0) return
       listAgents()
-    }, 3000)
+    }, AGENT_POLL_INTERVAL_MS)
 
     return () => {
       if (agentsTimerRef.current) {

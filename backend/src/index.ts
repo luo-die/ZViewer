@@ -8,11 +8,12 @@ import { createServer as createHttpsServer } from 'https';
 import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import compression from 'compression';
 import path from 'node:path';
 import fs from 'node:fs';
 import bcrypt from 'bcryptjs';
 import { IsNull, LessThan } from 'typeorm';
-import { AppDataSource } from './data-source';
+import { AppDataSource, flushDatabase, installDebouncedSave } from './data-source';
 import { Room } from './entities/Room';
 import { Session } from './entities/Session';
 import { User } from './entities/User';
@@ -37,6 +38,8 @@ import ftpRoutes from './routes/ftp';
 import embyRoutes from './routes/emby';
 import jellyfinRoutes from './routes/jellyfin';
 import subtitlesRoutes from './routes/subtitles';
+import transcodeRoutes from './routes/transcode';
+import { disposeTranscodeSessions } from './services/transcode/session';
 import updaterRoutes from './routes/updater';
 import statsRoutes from './routes/stats';
 import clientLogsRoutes from './routes/client-logs';
@@ -215,6 +218,9 @@ async function bootstrap() {
 
   await AppDataSource.initialize();
   console.log('TypeORM Data Source has been initialized.');
+  // sql.js 落盘改为 1s 防抖（见 data-source.ts）：必须在 initialize() 之后安装，
+  // 否则 autoSave:false 下没有任何自动落盘。
+  installDebouncedSave();
   await seedRootAdmin();
   ensureUploadsRoot();
 
@@ -250,6 +256,44 @@ async function bootstrap() {
   );
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
+
+  // HTTP 压缩（压缩包 1.8+ 在 Node 有 brotli 时优先协商 br，否则回退 gzip）：
+  // 前端 JS bundle 约 3.4MB，未压缩时全量明文下发，压缩后约 0.94MB，
+  // 首屏传输量下降约 70%，是本项目最大的一笔带宽/加载优化。
+  // 必须跳过媒体/流式代理路径：视频、FLV 本身已是压缩格式，再压一遍纯属
+  // 浪费 CPU，并且会破坏 Range/Content-Range 语义与首帧延迟。
+  // 说明：filter 由 compression 在写响应头时调用（此时 Content-Type 已知），
+  // 因此这里回退到官方 compression.filter 继续做「是否可压缩」判断。
+  const NO_COMPRESS_PATH_PATTERNS: RegExp[] = [
+    /^\/api\/stream\/proxy/, // B站 CDN 媒体代理（含 /proxy-image、/proxy-ftp）
+    /^\/api\/stream\/[^/]+\/proxy/, // 番剧源媒体代理（anime / anisubs / kazumi）
+    /^\/api\/[^/]+\/proxy/, // 各挂载类型媒体代理（webdav/ftp/emby/jellyfin/openlist/server-files）
+    /^\/api\/[^/]+\/stream/, // 各挂载类型按 movieId 的流代理
+    /^\/api\/server-files\/raw/, // 本地文件原始字节流
+    /^\/live(\/|$)/, // NMS HTTP-FLV 拉流代理
+  ];
+  app.use(
+    compression({
+      // 小于 1KB 的响应不压缩（压缩后的头部开销大于收益），与默认值一致，
+      // 显式写出以免日后被误改。
+      threshold: 1024,
+      filter: (req: express.Request, res: express.Response) => {
+        if (NO_COMPRESS_PATH_PATTERNS.some((re) => re.test(req.path))) {
+          return false;
+        }
+        // SSE（更新进度 /api/system/update/*-stream）同样必须跳过：
+        // gzip 会缓冲输出，进度事件要等缓冲区满或结束才到前端，进度条会卡住。
+        const contentType = res.getHeader('Content-Type');
+        if (
+          typeof contentType === 'string' &&
+          contentType.includes('text/event-stream')
+        ) {
+          return false;
+        }
+        return compression.filter(req, res);
+      },
+    }),
+  );
 
   // 轻量请求流量日志：记录所有 /api/ 请求的方法、路径、状态码、响应大小、耗时
   // 用于排查带宽来源（区分代理流量 /api/stream/proxy vs 解析流量 /api/stream/resolve-bilibili）
@@ -306,6 +350,8 @@ async function bootstrap() {
   app.use('/api/jellyfin', jellyfinRoutes);
   app.use('/api/ftp', ftpRoutes);
   app.use('/api/subtitles', subtitlesRoutes);
+  // 服务端转码（ffmpeg → HLS）：给跑不了浏览器端转码的客户端兜底
+  app.use('/api/transcode', transcodeRoutes);
   app.use('/api/system/update', updaterRoutes);
   app.use('/api/stats', statsRoutes);
   app.use('/api/stream-push', streamPushRouter);
@@ -329,18 +375,35 @@ async function bootstrap() {
   const hasFrontendDist = fs.existsSync(frontendDist);
   if (hasFrontendDist) {
     console.log(`[static] 提供前端静态文件: ${frontendDist}`);
-    // ffmpeg.wasm 核心文件（~32MB）与 JASSUB 字体等大体积资源：
-    // 强缓存（immutable + 1 年），配合文件名/ETag 变化自动失效。
-    // 避免每次初始化 wasm 引擎都重新下载 32MB 核心。
+    // 构建产物（frontend/dist/assets/*：JS bundle、CSS、ffmpeg-core.wasm ~32MB 等）
+    // 文件名带内容哈希，内容一变文件名必变，因此可以安全强缓存 1 年（immutable）：
+    // 避免每次进入房间都重新下载/校验 32MB wasm 与 3.4MB bundle。
+    // 注：旧代码把大体积 wasm 挂在 /ffmpeg（指向 frontend/dist/ffmpeg），
+    // 该目录实际不存在（wasm 实际在 assets/ 下），随本次改动一并删除。
     app.use(
-      '/ffmpeg',
-      express.static(path.join(frontendDist, 'ffmpeg'), {
-        fallthrough: false,
+      '/assets',
+      express.static(path.join(frontendDist, 'assets'), {
         maxAge: '1y',
         immutable: true,
+        index: false,
       })
     );
-    app.use(express.static(frontendDist));
+    // 其余静态文件（favicon、封面图、cli exe 等）文件名不含哈希，不做长缓存，
+    // 交给 ETag / Last-Modified 校验即可。
+    // index: false —— 不在这里直接返回 index.html，统一走文件末尾的 SPA 回退，
+    // 以便对入口 HTML 强制 no-store。
+    app.use(
+      express.static(frontendDist, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          // HTML 入口（index.html）绝不能缓存：前端发版后必须立刻拿到新的壳，
+          // 否则用户会继续引用已被删除的旧 hash 资源导致白屏。
+          if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store');
+          }
+        },
+      })
+    );
     // SPA 回退延迟到所有 API 路由注册之后（见文件末尾）
   } else {
     console.warn(`[static] 警告：前端构建产物不存在: ${frontendDist}`);
@@ -515,6 +578,9 @@ async function bootstrap() {
         res.status(404).json({ success: false, message: 'API 路径不存在' });
         return;
       }
+      // 入口 HTML 禁止缓存（含浏览器启发式缓存）：必须每次回源校验，
+      // 否则发版后用户仍加载旧 index.html，引用已失效的 hash 资源。
+      res.setHeader('Cache-Control', 'no-store');
       res.sendFile(path.join(frontendDist, 'index.html'));
     });
   }
@@ -560,10 +626,24 @@ async function bootstrap() {
     } catch (err) {
       console.error('[flushAllDirty] error:', err);
     }
+    // 再把内存数据库整体落盘一次：防抖落盘可能还留着未写盘的变更（最多 1s 窗口），
+    // 直接退出会丢数据，故退出前强制刷一次。
+    try {
+      await flushDatabase(true);
+    } catch (err) {
+      console.error('[flushDatabase] error:', err);
+    }
     try {
       stopNms();
     } catch (err) {
       console.error('[NMS] graceful shutdown error:', err);
+    }
+    // 结束所有服务端转码会话（杀掉 ffmpeg 子进程并清理临时分片目录），
+    // 否则退出后可能残留孤儿进程与磁盘占用。
+    try {
+      await disposeTranscodeSessions();
+    } catch (err) {
+      console.error('[transcode] graceful shutdown error:', err);
     }
     process.exit(0);
   };

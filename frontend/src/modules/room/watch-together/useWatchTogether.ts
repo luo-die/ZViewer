@@ -192,6 +192,20 @@ export function useWatchTogether({
     setRetryToken((t) => t + 1)
   }, [])
 
+  /**
+   * 「按当前设置重新解析当前影片」信号（如播放列表切换服务端转码开关）。
+   *
+   * 与 triggerEngineReload 不同：那个只重新 attach 同一个源，而服务端转码
+   * 会改变源地址（本地直链 → 后端 HLS 播放列表），必须重跑 resolveMovieSource
+   * 才能生效，故走 retryLoadMovie（清除 lastLoadedMovieRef + 递增令牌）。
+   */
+  const pendingMovieReload = useRoomStore((s) => s.pendingMovieReload)
+  useEffect(() => {
+    if (pendingMovieReload === 0) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- 外部信号触发的重载，非渲染期派生状态
+    retryLoadMovie()
+  }, [pendingMovieReload, retryLoadMovie])
+
   useEffect(() => {
     isHostRef.current = isHost
   }, [isHost])
@@ -332,7 +346,12 @@ export function useWatchTogether({
   useEffect(() => {
     if (!socket) return
 
-    const handleMovieList = (payload: { movies: MovieDto[] }) => {
+    const handleMovieList = (payload: {
+      roomId?: string
+      movies: MovieDto[]
+    }) => {
+      // 旧房间残余广播直接丢弃（切房间后短时间内可能到达）
+      if (payload.roomId && payload.roomId !== roomId) return
       // 后端广播的 movie-list 事件仅作实时刷新：直接覆盖本地缓存
       // 防御性检查：仅接受属于当前房间的影片，避免切换房间时旧房间的事件
       // 残留导致新房间显示其他房间的视频
@@ -343,7 +362,12 @@ export function useWatchTogether({
       setMovies(filtered.map(mapDtoToMovie))
     }
 
-    const handleCurrentMovie = (payload: { movieId: number | null }) => {
+    const handleCurrentMovie = (payload: {
+      roomId?: string
+      movieId: number | null
+    }) => {
+      // 旧房间的 current-movie 携带的是别的房间的影片 id，必须丢弃
+      if (payload.roomId && payload.roomId !== roomId) return
       // 房主刷新恢复期间，recovery 已通过 register-host 回调写入 currentMovieId，
       // 不接受后端 current-movie 事件的覆盖（后端 roomStateService 可能因状态丢失
       // 或预览模式残留返回 null，导致 recovery 被清空）。
@@ -354,6 +378,7 @@ export function useWatchTogether({
 
     // 观众端：接收房主广播的预览源，直接加载播放（不经过影片列表）
     const handlePreviewSource = (payload: {
+      roomId?: string
       source: {
         url: string
         title?: string
@@ -367,6 +392,8 @@ export function useWatchTogether({
       }
     }) => {
       if (isHostRef.current) return
+      // 旧房间的预览源广播同样丢弃（切房间瞬间的在途事件）
+      if (payload.roomId && payload.roomId !== roomId) return
       const video = videoRef.current
       if (!video) return
 

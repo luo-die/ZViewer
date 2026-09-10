@@ -25,6 +25,7 @@
     "basic-ftp": "^6.0.1",
     "bcryptjs": "^3.0.3",
     "cheerio": "^1.2.0",
+    "compression": "^1.7.5",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -43,6 +44,7 @@
     "xpath": "^0.0.34"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.0",
     "@types/express": "^5.0.6",
     "@types/node": "^26.1.0",
     "@types/opencc-js": "^1.0.3",

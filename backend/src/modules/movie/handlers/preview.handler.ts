@@ -53,6 +53,7 @@ export class PreviewHandler implements SocketEventHandler {
           // 预览源清除当前影片标记，仅广播播放状态
           roomStateService.setCurrentMovie(payload.roomId, null);
           io.to(payload.roomId).emit('preview-source', {
+            roomId: payload.roomId,
             source: payload.source,
           });
           safeAck(callback, { success: true });

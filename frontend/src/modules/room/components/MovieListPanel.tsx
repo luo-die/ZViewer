@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
 import {
   Play,
+  Server,
   Trash2,
   Film,
   Monitor,
@@ -17,6 +18,11 @@ import { Modal } from '@/components/ui/Modal'
 import { message } from '@/components/ui/message'
 import { useSocket } from '@/hooks/useSocket'
 import { useRoomStore, type Movie } from '@/store/roomStore'
+import {
+  fetchTranscodeCapability,
+  setServerTranscodeOverride,
+  useServerTranscodeOverride,
+} from '@/modules/player/services/server-transcode'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
 import {
   usePlaysvideoLocalOverride,
@@ -96,6 +102,7 @@ export function MovieListPanel({
     (state) => state.triggerViewerSourceReload
   )
   const triggerEngineReload = useRoomStore((state) => state.triggerEngineReload)
+  const triggerMovieReload = useRoomStore((state) => state.triggerMovieReload)
   const viewerCliResolvedSource = useRoomStore(
     (state) => state.viewerCliResolvedSource
   )
@@ -106,6 +113,26 @@ export function MovieListPanel({
   const [pageLoadingId, setPageLoadingId] = useState<number | null>(null)
   const [bilibiliVip, setBilibiliVip] = useState(false)
   const isScreenShare = mode === 'screen-share'
+  // 一键清除播放列表
+  const clearMovies = useRoomStore((state) => state.clearMovies)
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
+  const [clearing, setClearing] = useState(false)
+
+  const handleClearMovies = async () => {
+    if (!roomId) return
+    setClearing(true)
+    try {
+      const removed = await clearMovies(roomId)
+      message.success(
+        removed > 0 ? `已清空播放列表（${removed} 部影片）` : '播放列表已是空的'
+      )
+      setClearConfirmOpen(false)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '清空播放列表失败')
+    } finally {
+      setClearing(false)
+    }
+  }
 
   // 浏览器转码引擎（playsvideo）：本机偏好，只存 localStorage，
   // 面向所有观看者开放（不区分房主/房管/观众），切换后不影响其他人。
@@ -129,6 +156,35 @@ export function MovieListPanel({
       next === 'on'
         ? '已启用浏览器转码引擎（仅本机生效）'
         : '已关闭浏览器转码引擎（仅本机，强制原生直连）'
+    )
+  }
+
+  // 服务端转码（ffmpeg → HLS）：本机偏好，只在后端具备 ffmpeg 时展示。
+  // 与浏览器转码引擎不同，它会改变源地址（本地文件 → 后端 HLS 播放列表），
+  // 因此切换后要触发「重新解析当前影片」而不是单纯重新 attach。
+  const serverTranscodeOverride = useServerTranscodeOverride()
+  const serverTranscodeEnabled = serverTranscodeOverride === 'on'
+  const [serverTranscodeAvailable, setServerTranscodeAvailable] =
+    useState(false)
+  useEffect(() => {
+    let cancelled = false
+    void fetchTranscodeCapability().then((capability) => {
+      if (!cancelled) setServerTranscodeAvailable(capability.available)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const handleToggleServerTranscode = () => {
+    const next: 'on' | 'off' = serverTranscodeEnabled ? 'off' : 'on'
+    setServerTranscodeOverride(next)
+    // 重新解析当前影片：源地址会随之在本地直链与后端 HLS 之间切换
+    if (currentMovieId != null) triggerMovieReload()
+    message.success(
+      next === 'on'
+        ? '已启用服务端转码（由服务器 ffmpeg 转换，消耗服务器 CPU/带宽）'
+        : '已关闭服务端转码（优先浏览器端/原生播放）'
     )
   }
 
@@ -453,13 +509,97 @@ export function MovieListPanel({
         </div>
       )}
 
-      <Input
-        size="sm"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        placeholder="搜索影片…"
-        className="px-2.5"
-      />
+      {/* 服务端转码开关：设备解不了（iPhone < 17.1、MKV/DTS 等）时的兜底，
+          由后端 ffmpeg 输出 HLS（iOS 可走 Safari 原生 HLS）。仅后端装了
+          ffmpeg 时展示；本机生效，切换后重新解析当前影片。 */}
+      {!isScreenShare && serverTranscodeAvailable && (
+        <div
+          className="flex items-center justify-between gap-2 rounded-[var(--md-sys-shape-corner)] px-2.5 py-2"
+          style={{
+            backgroundColor:
+              'color-mix(in srgb, var(--md-sys-color-surface-container-high) calc(var(--glass-strength) * 100%), transparent)',
+          }}
+        >
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <Server
+                className="h-3.5 w-3.5 shrink-0"
+                style={{ color: 'var(--md-sys-color-tertiary)' }}
+              />
+              <Text className="text-xs font-medium">服务端转码</Text>
+              <span
+                className="shrink-0 rounded px-1 py-px text-[10px] font-medium"
+                style={{
+                  backgroundColor:
+                    'color-mix(in srgb, var(--md-sys-color-tertiary) 16%, transparent)',
+                  color: 'var(--md-sys-color-tertiary)',
+                }}
+                title="只影响本机，不会同步给房间内其他人"
+              >
+                仅本机
+              </span>
+            </div>
+            <Text
+              type="secondary"
+              className="mt-0.5 block text-[10px] leading-snug"
+            >
+              开启：由服务器 ffmpeg 转换为 HLS 播放（兼容性最好，iPhone 也能看
+              MKV/DTS）。关闭：优先浏览器端/原生播放，仅在必要时自动兜底。
+            </Text>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={serverTranscodeEnabled}
+            aria-label="服务端转码"
+            onClick={handleToggleServerTranscode}
+            title={
+              '服务端转码：' +
+              (serverTranscodeEnabled ? '已开启' : '已关闭') +
+              '（仅本机生效，不同步给其他人）'
+            }
+            className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors"
+            style={{
+              backgroundColor: serverTranscodeEnabled
+                ? 'var(--md-sys-color-tertiary)'
+                : 'var(--md-sys-color-outline)',
+            }}
+          >
+            <span
+              className="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
+              style={{
+                transform: serverTranscodeEnabled
+                  ? 'translateX(18px)'
+                  : 'translateX(2px)',
+              }}
+            />
+          </button>
+        </div>
+      )}
+
+      {/* 搜索 + 一键清除：清空按钮仅房主/房管可见，需二次确认 */}
+      <div className="flex items-center gap-2">
+        <Input
+          size="sm"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="搜索影片…"
+          className="flex-1 px-2.5"
+        />
+        {(isHost || canManage) && movies.length > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="shrink-0 px-2"
+            icon={<Trash2 className="h-3.5 w-3.5" />}
+            onClick={() => setClearConfirmOpen(true)}
+            title={`清空播放列表（当前 ${movies.length} 部影片）`}
+            aria-label="清空播放列表"
+          >
+            清空
+          </Button>
+        )}
+      </div>
 
       {/* 影片列表滚动区域 — pl-2.5 平衡左右剩余宽度，
           scrollbar-gutter:stable 占右侧 10px，pl-2.5 补左侧 10px，
@@ -703,6 +843,38 @@ export function MovieListPanel({
         <div className="flex max-h-[70vh] flex-col gap-2.5 overflow-hidden">
           {movieListContent}
         </div>
+      </Modal>
+
+      {/* 一键清除确认 */}
+      <Modal
+        open={clearConfirmOpen}
+        onClose={() => setClearConfirmOpen(false)}
+        title="清空播放列表"
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setClearConfirmOpen(false)}
+              disabled={clearing}
+            >
+              取消
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              loading={clearing}
+              onClick={() => void handleClearMovies()}
+            >
+              清空
+            </Button>
+          </div>
+        }
+      >
+        <Text className="text-sm">
+          确定要清空当前播放列表吗？将删除全部 {movies.length}{' '}
+          部影片（含正在播放的这一部），其他房间成员会同步看到清空结果。此操作不可撤销。
+        </Text>
       </Modal>
     </div>
   )

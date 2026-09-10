@@ -93,9 +93,51 @@ export function shouldUsePlaysVideo(source: PlayerSource): boolean {
   if (source.forcePlaysVideo) return true
   const format = source.format
   if (format && (REMUX_ONLY_FORMATS as string[]).includes(format)) return true
-  if (format === 'mkv') return !source.mkvFastPath
+  if (format === 'mkv') {
+    // MKV 快速路径（原生直通）只在本浏览器真能打开 Matroska 时才有意义：
+    // Safari（含 iOS）/Firefox 拿到 MKV 必然 NotSupportedError，
+    // 先试一次原生只是白白多一轮加载失败与提示抖动。
+    if (!source.mkvFastPath) return true
+    return !browserCanOpenMatroska()
+  }
 
   return !!source.audioCodec && needsBrowserTranscode(source.audioCodec)
+}
+
+/**
+ * 判断该源是否**必须**经 playsvideo 重封装/转码才能播放。
+ *
+ * 只看编解码与容器，不看开关、不看设备能力——供「设备是否具备运行条件」
+ * 的提示与降级决策复用（见 usePlayerSource 的预检）。
+ */
+export function requiresPlaysVideoPipeline(source: PlayerSource): boolean {
+  const format = source.format
+  if (format && (REMUX_ONLY_FORMATS as string[]).includes(format)) return true
+  if (format === 'mkv') return !source.mkvFastPath
+  return !!source.audioCodec && needsBrowserTranscode(source.audioCodec)
+}
+
+/**
+ * 当前浏览器能否原生打开 Matroska（MKV）容器。
+ *
+ * 只有 Chromium 系（Chrome/Edge 91+）在内置解码器可用时会应答
+ * `video/x-matroska`；Safari（含 iOS）与 Firefox 一律返回空串——
+ * 即 MKV 快速路径在它们身上是「注定失败的一次原生尝试」。
+ * 结果与浏览器能力一样在会话内不变，故缓存一次。
+ */
+let cachedMatroskaSupport: boolean | null = null
+export function browserCanOpenMatroska(): boolean {
+  if (cachedMatroskaSupport !== null) return cachedMatroskaSupport
+  if (typeof document === 'undefined') return (cachedMatroskaSupport = false)
+  try {
+    const probe = document.createElement('video')
+    cachedMatroskaSupport =
+      probe.canPlayType('video/x-matroska; codecs="avc1.42E01E, mp4a.40.2"') !==
+      ''
+  } catch {
+    cachedMatroskaSupport = false
+  }
+  return cachedMatroskaSupport
 }
 
 /**

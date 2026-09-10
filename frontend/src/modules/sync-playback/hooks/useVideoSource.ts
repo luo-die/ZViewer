@@ -209,8 +209,7 @@ function toPlayerSource(
     // 在 shouldUsePlaysVideo 中决定是否启用 playsvideo 管线。
     // 影片记录是权威来源：服务器回放的初始状态可能缺少该字段（历史数据），
     // 缺省会被当作「启用」，从而误走转码管线（MKV+HEVC/FLAC 会失败黑屏）。
-    playsvideoEnabled:
-      storeMovie?.playsvideoEnabled ?? state.playsvideoEnabled,
+    playsvideoEnabled: storeMovie?.playsvideoEnabled ?? state.playsvideoEnabled,
     // 挂载直链模式：直连失败不回退服务器代理，直接提示错误
     noProxyFallback: state.noProxyFallback,
     // 传入后端权威时长：B站 fMP4 流的 mvhd.duration 为 0，

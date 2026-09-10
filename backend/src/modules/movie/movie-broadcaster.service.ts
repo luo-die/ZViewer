@@ -45,7 +45,7 @@ export class MovieBroadcasterService {
       !movies.some((m) => m.id === currentMovieId || String(m.id) === String(currentMovieId))
     ) {
       roomStateService.setCurrentMovie(roomId, null);
-      io.to(roomId).emit('current-movie', { movieId: null });
+      io.to(roomId).emit('current-movie', { roomId, movieId: null });
     }
 
     // 广播给房间内所有成员

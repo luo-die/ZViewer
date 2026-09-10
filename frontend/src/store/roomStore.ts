@@ -242,6 +242,8 @@ interface RoomState {
    * 不广播、不写库。
    */
   pendingEngineReload: number
+  /** 「重新解析并加载当前影片」信号计数（见 triggerMovieReload） */
+  pendingMovieReload: number
   /**
    * MSE 流重新加载（seek 到未缓冲区域）状态。
    * - isReloading=true 期间进度条显示 reloadTargetTime 而非 video.currentTime（避免归零）
@@ -325,6 +327,13 @@ interface RoomState {
    * （如播放列表的「浏览器转码引擎」开关）——房主与观众都消费该信号。
    */
   triggerEngineReload: () => void
+  /**
+   * 触发「按当前设置重新解析并加载当前影片」。
+   *
+   * 与 triggerEngineReload（只重新 attach 同一个源）不同：本信号会重跑
+   * resolveMovieSource，用于「服务端转码」这类**会改变源地址**的本机设置。
+   */
+  triggerMovieReload: () => void
   reset: () => void
   // REST API
   fetchMovies: (roomId: string) => Promise<void>
@@ -389,6 +398,8 @@ interface RoomState {
     }
   ) => Promise<void>
   removeMovie: (roomId: string, movieId: number) => Promise<void>
+  /** 清空播放列表（一键清除；仅 root / 房间创建者可调用） */
+  clearMovies: (roomId: string) => Promise<number>
   reorderMovies: (roomId: string, orderedIds: number[]) => Promise<void>
 }
 
@@ -426,6 +437,7 @@ const defaultState = {
   pendingReloadBilibili: 0,
   pendingViewerSourceReload: 0,
   pendingEngineReload: 0,
+  pendingMovieReload: 0,
   isReloading: false,
   reloadTargetTime: null,
   bufferProgress: null as {
@@ -518,9 +530,23 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   setIsSharing: (value) => set({ isSharing: value }),
   setIsPaused: (value) => set({ isPaused: value }),
   setWatchTogether: (updates) =>
-    set((state) => ({
-      watchTogether: { ...state.watchTogether, ...updates },
-    })),
+    set((state) => {
+      // 等值短路：全部字段与当前值相同则返回空补丁，保留 watchTogether 的
+      // 原对象引用。播放期 timeupdate 每秒多次写入进度，若每次都造新对象，
+      // 所有订阅 watchTogether 的组件（含整个 WatchTogetherCore 子树）都会
+      // 被无谓重渲染。
+      const prev = state.watchTogether as unknown as Record<string, unknown>
+      const next = updates as unknown as Record<string, unknown>
+      let changed = false
+      for (const key of Object.keys(next)) {
+        if (prev[key] !== next[key]) {
+          changed = true
+          break
+        }
+      }
+      if (!changed) return {}
+      return { watchTogether: { ...state.watchTogether, ...updates } }
+    }),
   setMovies: (movies) => set({ movies }),
   setCurrentMovieId: (id) => set({ currentMovieId: id }),
   setPendingQualityChange: (value) => set({ pendingQualityChange: value }),
@@ -538,6 +564,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   triggerEngineReload: () =>
     set((state) => ({
       pendingEngineReload: state.pendingEngineReload + 1,
+    })),
+  triggerMovieReload: () =>
+    set((state) => ({
+      pendingMovieReload: state.pendingMovieReload + 1,
     })),
   setReloadingState: (isReloading, targetTime) =>
     set({ isReloading, reloadTargetTime: targetTime }),
@@ -621,6 +651,24 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       set({ currentMovieId: null })
     }
     // movies 列表由后端广播 movie-list 事件刷新
+  },
+
+  clearMovies: async (roomId) => {
+    const res = await apiFetch(
+      `/api/rooms/${encodeURIComponent(roomId)}/movies`,
+      { method: 'DELETE' }
+    )
+    const data = await parseResponse<{
+      success: boolean
+      removed?: number
+      message?: string
+    }>(res)
+    if (!res.ok || !data.success) {
+      throw new Error(data.message || '清空播放列表失败')
+    }
+    // 本地立即清空：不等 socket 广播，避免按钮点完还有残留卡片
+    set({ movies: [], currentMovieId: null })
+    return data.removed ?? 0
   },
 
   reorderMovies: async (roomId, orderedIds) => {

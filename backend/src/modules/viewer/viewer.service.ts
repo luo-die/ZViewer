@@ -14,6 +14,7 @@ import { Room } from '../../entities/Room';
 import { User } from '../../entities/User';
 import type { ViewerDto } from '../shared';
 import { roomSessionService } from '../room/room-session.service';
+import { roomPermissionService } from '../room/room-permission.service';
 
 /**
  * 观众服务（单例）。
@@ -131,6 +132,11 @@ export class ViewerService {
 
     room.mutedViewers = JSON.stringify(mutedList);
     await roomRepo.save(room);
+
+    // 失效该房间的权限缓存：isMuted 结果按 roomId+userId 缓存 5s，
+    // 不主动清理会让「刚被禁言的人」在 TTL 窗口内继续能发评论/弹幕，
+    // 解禁同理要立即生效。
+    roomPermissionService.invalidatePermissionCache(undefined, roomId);
   }
 }
 

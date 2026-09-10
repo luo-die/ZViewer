@@ -86,7 +86,10 @@ export class MovieListHandler implements SocketEventHandler {
               String(currentMovieId) === String(payload.movieId))
           ) {
             roomStateService.setCurrentMovie(payload.roomId, null);
-            io.to(payload.roomId).emit('current-movie', { movieId: null });
+            io.to(payload.roomId).emit('current-movie', {
+              roomId: payload.roomId,
+              movieId: null,
+            });
           }
 
           safeAck(callback, { success: true });
@@ -121,7 +124,10 @@ export class MovieListHandler implements SocketEventHandler {
           }
 
           roomStateService.setCurrentMovie(payload.roomId, payload.movieId);
-          io.to(payload.roomId).emit('current-movie', { movieId: payload.movieId });
+          io.to(payload.roomId).emit('current-movie', {
+            roomId: payload.roomId,
+            movieId: payload.movieId,
+          });
           safeAck(callback, { success: true });
         } catch (err) {
           console.error('[play-movie] error:', err);
@@ -143,7 +149,7 @@ export class MovieListHandler implements SocketEventHandler {
           }
 
           const movies = roomStateService.getMovies(payload.roomId);
-          socket.emit('movie-list', { movies });
+          socket.emit('movie-list', { roomId: payload.roomId, movies });
           safeAck(callback, { success: true });
         } catch (err) {
           console.error('[request-movie-list] error:', err);
@@ -165,7 +171,7 @@ export class MovieListHandler implements SocketEventHandler {
           }
 
           const movieId = roomStateService.getCurrentMovieId(payload.roomId);
-          socket.emit('current-movie', { movieId });
+          socket.emit('current-movie', { roomId: payload.roomId, movieId });
           safeAck(callback, { success: true });
         } catch (err) {
           console.error('[request-current-movie] error:', err);

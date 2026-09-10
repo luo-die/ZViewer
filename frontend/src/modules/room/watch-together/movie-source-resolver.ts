@@ -18,6 +18,14 @@ import { getBilibiliParseOptions } from '@/modules/bilibili/parseOptions'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
 import type { QualityOption } from './resolveSource'
 import { buildServerFileProxyUrl } from '@/modules/server-files/serverFilesApi'
+import { appendAuthToken } from '@/modules/player/services/url-proxy'
+import {
+  createTranscodeSession,
+  fetchTranscodeCapability,
+  pickTranscodeMode,
+  shouldUseServerTranscode,
+} from '@/modules/player/services/server-transcode'
+import type { PlayerSource } from '@/modules/player/types'
 import {
   resolveAniSubsEpisode,
   buildAniSubsProxyUrl,
@@ -408,6 +416,52 @@ export async function resolveMovieSource({
     // ani-subs 番剧源：URL 短期有效，每次播放都通过 sourceMeta 重新解析
     // recovery 场景下也强制重新解析，因为旧 URL 大概率已过期
     return resolveAnimeOnline(movie)
+  }
+
+  // 服务端转码兜底 / 强制：
+  // - 设备没有 MSE/MMS（iPhone < iOS 17.1 等）且本源必须重封装/转码时自动启用；
+  // - 播放列表「服务端转码」开关为 on 时强制启用。
+  // 产出的是后端 ffmpeg 给的 HLS 播放列表：桌面走 hls.js，iPhone 走 Safari
+  // 原生 HLS，因此不需要 MediaSource 也能播 MKV / DTS 这类源。
+  const transcodeDecisionSource: PlayerSource = {
+    url: movie.url,
+    format: (movie.format as MediaFormat | undefined) ?? undefined,
+    videoCodec: movie.videoCodec ?? undefined,
+    audioCodec: movie.audioCodec ?? undefined,
+  }
+  await fetchTranscodeCapability()
+  if (shouldUseServerTranscode(transcodeDecisionSource)) {
+    try {
+      const mode = pickTranscodeMode(transcodeDecisionSource)
+      // 起点按 30s 取整：会话键含 start，粗粒度取整让同房间成员复用同一会话
+      const rawStart = recovery?.currentTime ?? 0
+      const start = rawStart > 60 ? Math.floor(rawStart / 30) * 30 : undefined
+      const { playlistUrl } = await createTranscodeSession({
+        movieId: movie.id,
+        mode,
+        start,
+      })
+      console.info(
+        `[movie-source-resolver] 使用服务端转码（${mode}${start ? ` @${start}s` : ''}）`
+      )
+      return {
+        sourceUrl: appendAuthToken(playlistUrl),
+        format: 'hls',
+        videoCodec: movie.videoCodec,
+        audioCodec: movie.audioCodec,
+        duration: movie.duration || 0,
+        currentQn: movie.currentQn,
+        acceptQuality: movie.acceptQuality,
+        headers: undefined,
+        reusedRecoveryUrl: false,
+        playsvideoEnabled: false,
+      }
+    } catch (err) {
+      console.warn(
+        '[movie-source-resolver] 服务端转码不可用，回退原生/浏览器端播放:',
+        err
+      )
+    }
   }
 
   // 非 B站 源：直接使用影片记录字段（Movie 类型不含 headers，见 roomStore）

@@ -124,6 +124,11 @@ export class RoomSettingsHandler implements SocketEventHandler {
 
           await roomRepo.update({ roomId: payload.roomId }, { mode: payload.mode });
 
+          // 失效该房间的权限缓存：isWatchTogetherRoom 结果缓存在
+          // roomPermissionService 里（5s TTL），不主动清理会让切换模式后的
+          // 同步播放事件在 TTL 窗口内继续使用旧模式的判断结果。
+          roomPermissionService.invalidatePermissionCache(undefined, payload.roomId);
+
           // 广播给房间内所有成员
           io.to(payload.roomId).emit('room-mode-changed', { mode: payload.mode });
 

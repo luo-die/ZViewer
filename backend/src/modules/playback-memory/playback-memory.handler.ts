@@ -54,9 +54,13 @@ export class PlaybackMemoryHandler implements SocketEventHandler {
             socket.id,
           );
 
-          // 广播给房间内其他成员（不含 roomId，接收端按 socket 所在房间处理）
+          // 广播给房间内其他成员。
+          // 必须带上 roomId：客户端在同一标签页切换房间时（socket 不重连）
+          // 可能仍收到旧房间的残余广播，接收端据此丢弃非当前房间的事件
+          // （否则表现为「在新房间点了播放，放的却是上一个房间的内容」）。
           // seq 为房主侧递增序号，透传给观众用于跳号检测（错失广播时拉全量自愈）
           socket.to(payload.roomId).emit('watch-together-state', {
+            roomId: payload.roomId,
             state: payload.state,
             diff: payload.diff,
             seq: payload.seq,
@@ -129,8 +133,9 @@ export class PlaybackMemoryHandler implements SocketEventHandler {
             });
           }
 
-          // 立即广播给观众（低延迟）
+          // 立即广播给观众（低延迟）；带 roomId 供接收端过滤旧房间残余广播
           socket.to(payload.roomId).emit('watch-together-control', {
+            roomId: payload.roomId,
             action: payload.action,
             value: payload.value,
           });

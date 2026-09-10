@@ -225,11 +225,11 @@ export function RealtimeDanmakuCard() {
   const triggerDanmakuRefresh = useDanmakuStore(
     (state) => state.triggerDanmakuRefresh
   )
-  // currentTime 降为整数秒，避免房主广播频率（0.5-1s）中浮点变化每秒触发重渲染。
-  const rawCurrentTime = useRoomStore(
-    (state) => state.watchTogether.currentTime
+  // currentTime 在 selector 内取整：订阅到的是「整数秒」，浮点进度变化不会
+  // 触发本组件重渲染（放在 selector 外面取整毫无意义——浮点值变化照样先通知一次）。
+  const currentTime = useRoomStore((state) =>
+    Math.floor(state.watchTogether.currentTime)
   )
-  const currentTime = Math.floor(rawCurrentTime)
 
   const listRef = useRef<HTMLDivElement>(null)
   const modalListRef = useRef<HTMLDivElement>(null)

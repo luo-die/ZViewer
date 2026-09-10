@@ -66,55 +66,81 @@ import {
  */
 const READY_TIMEOUT_MS = 60_000
 
-/** TEMP-DIAG：临时诊断 hook，定位 endOfStream 调用来源（修复后移除） */
-let diagInstalled = false
-function installMediaSourceDiagnostics(): void {
-  if (diagInstalled || typeof MediaSource === 'undefined') return
-  diagInstalled = true
-  const proto = MediaSource.prototype as unknown as Record<string, unknown>
-  const wrap = (name: string, extra: () => unknown) => {
-    const orig = proto[name] as (...a: unknown[]) => unknown
-    if (typeof orig !== 'function') return
-    proto[name] = function (this: MediaSource, ...args: unknown[]) {
-      console.error(
-        `[MS-DIAG] ${name} readyState=${this.readyState}`,
-        new Error('trace'),
-        extra()
-      )
-      return orig.apply(this, args)
-    }
-  }
-  wrap('endOfStream', () => '')
-  wrap('removeSourceBuffer', () => '')
-  const origSetDuration = Object.getOwnPropertyDescriptor(
-    MediaSource.prototype,
-    'duration'
-  )?.set
-  if (origSetDuration) {
-    Object.defineProperty(MediaSource.prototype, 'duration', {
-      set(this: MediaSource, v: number) {
-        console.error(
-          `[MS-DIAG] duration=${v} readyState=${this.readyState}`,
-          new Error('trace')
-        )
-        origSetDuration.call(this, v)
-      },
-      get:
-        Object.getOwnPropertyDescriptor(MediaSource.prototype, 'duration')
-          ?.get ?? (() => undefined),
-      configurable: true,
-    })
-  }
+/**
+ * 浏览器端转码（playsvideo）的运行能力。
+ *
+ * 管线本身要求「能把 fMP4 分片喂给 <video>」，对应两种 API：
+ * - `MediaSource`（MSE，桌面 Chrome/Edge/Firefox/桌面 Safari、iPadOS Safari）
+ * - `ManagedMediaSource`（MMS，**iPhone Safari 17.1+ 才有**的托管版 MSE；
+ *   它继承 MediaSource，静态 isTypeSupported 通用，hls.js 1.5+ 原生支持）
+ *
+ * iPhone 在 17.1 之前两者都没有 —— 此时浏览器端转码**在原理上就不可能**：
+ * <video> 只接受完整文件（URL / Blob），没有「边转边喂」的通道。
+ * 这不是引擎的 bug，而是平台能力缺失，需要给用户准确的提示而不是
+ * 「开启浏览器转码引擎后重试」这种无效引导。
+ */
+export type PlaysVideoSupport =
+  | { ok: true; kind: 'mse' | 'managed-mse' }
+  | { ok: false; reason: 'no-worker' | 'no-mse' | 'no-codec' }
+
+/** 单例探测结果（能力在整个会话内不变，重复探测无意义） */
+let cachedSupport: PlaysVideoSupport | null = null
+
+/**
+ * 探测浏览器端转码能力（含原因，供文案与降级决策使用）。
+ */
+export function getPlaysVideoSupport(): PlaysVideoSupport {
+  if (cachedSupport) return cachedSupport
+  cachedSupport = detectPlaysVideoSupport()
+  return cachedSupport
 }
 
-/** 判断当前浏览器是否具备 playsvideo 引擎的运行条件（MSE + Worker） */
-export function isPlaysVideoSupported(): boolean {
-  if (typeof window === 'undefined') return false
-  if (typeof Worker !== 'function') return false
-  if (!('MediaSource' in window)) return false
-  return !!window.MediaSource?.isTypeSupported?.(
+function detectPlaysVideoSupport(): PlaysVideoSupport {
+  if (typeof window === 'undefined') return { ok: false, reason: 'no-mse' }
+  if (typeof Worker !== 'function') return { ok: false, reason: 'no-worker' }
+
+  const g = globalThis as unknown as {
+    MediaSource?: { isTypeSupported?: (type: string) => boolean }
+    ManagedMediaSource?: { isTypeSupported?: (type: string) => boolean }
+  }
+  const mse = g.MediaSource
+  const mms = g.ManagedMediaSource
+  const source = mse ?? mms
+  if (!source || typeof source.isTypeSupported !== 'function') {
+    return { ok: false, reason: 'no-mse' }
+  }
+  const codecOk = !!source.isTypeSupported(
     'video/mp4; codecs="avc1.640029, mp4a.40.2"'
   )
+  if (!codecOk) return { ok: false, reason: 'no-codec' }
+  return { ok: true, kind: mse ? 'mse' : 'managed-mse' }
+}
+
+/** 判断当前浏览器是否具备 playsvideo 引擎的运行条件（MSE/MMS + Worker） */
+export function isPlaysVideoSupported(): boolean {
+  return getPlaysVideoSupport().ok
+}
+
+/**
+ * 能力缺失时的用户文案（用于播放失败提示）。
+ *
+ * iOS 的两种情况必须区分：
+ * - iPhone < 17.1：平台没有 MSE/MMS，无解，只能换片源或换设备；
+ * - 其他：浏览器缺少能力，建议换浏览器。
+ */
+export function describePlaysVideoSupport(): string {
+  const support = getPlaysVideoSupport()
+  // 注意：前端 tsconfig 未开 strict，布尔字面量判别式（if (support.ok)）
+  // 不会触发布尔判别联合的收窄，必须用 === true 比较式收窄。
+  if (support.ok === true) return '当前浏览器支持浏览器端转码'
+  switch (support.reason) {
+    case 'no-worker':
+      return '当前浏览器不支持 Web Worker，无法运行浏览器端转码'
+    case 'no-codec':
+      return '当前浏览器不支持 fMP4（H.264/AAC）分片播放，无法运行浏览器端转码'
+    default:
+      return '当前浏览器不支持 MediaSource / ManagedMediaSource，无法运行浏览器端转码'
+  }
 }
 
 /**
@@ -174,9 +200,8 @@ class PlaysVideoController implements PlayerController {
 
   async attach(startTime?: number): Promise<string> {
     if (!isPlaysVideoSupported()) {
-      throw new Error('浏览器不支持 MSE/WebWorker，无法启用浏览器端转码')
+      throw new Error(describePlaysVideoSupport())
     }
-    installMediaSourceDiagnostics()
 
     // 结束旧世代（切换 / 重载场景）
     this.cleanup()

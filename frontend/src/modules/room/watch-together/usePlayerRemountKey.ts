@@ -21,8 +21,10 @@ import { useRoomStore } from '@/store/roomStore'
 
 export function usePlayerRemountKey(): string | number {
   const currentMovieId = useRoomStore((s) => s.currentMovieId)
+  const roomId = useRoomStore((s) => s.roomId)
   const [remountKey, setRemountKey] = useState<string | number>('init')
   const prevMovieIdRef = useRef<number | null>(null)
+  const prevRoomIdRef = useRef<string>('')
 
   useEffect(() => {
     if (currentMovieId == null) return
@@ -32,6 +34,21 @@ export function usePlayerRemountKey(): string | number {
     if (prev == null || prev === currentMovieId) return
     setRemountKey(currentMovieId)
   }, [currentMovieId])
+
+  /**
+   * 切换房间 → 强制重挂载整个播放器。
+   *
+   * 换房间时 socket 不重连、<video> 元素也不重建，旧房间残留的引擎实例
+   * （MSE SourceBuffer / 转码 worker / 在途 fetch）与已缓冲的旧片源会跟着
+   * 进入新房间，表现为「在新房间点播放，放的却是上一个房间的内容」。
+   * 换房间时换 key，让播放器连同全部业务 Hook 一起干净重建。
+   */
+  useEffect(() => {
+    const prev = prevRoomIdRef.current
+    prevRoomIdRef.current = roomId
+    if (!roomId || !prev || prev === roomId) return
+    setRemountKey(`room:${roomId}:${Date.now()}`)
+  }, [roomId])
 
   return remountKey
 }

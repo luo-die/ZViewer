@@ -75,6 +75,33 @@ English | **[中文](README.md)**
 - **Native subtitle system**: directly parses SRT / ASS / SSA / VTT / SMI / SUB and renders with HTML/CSS — no WebVTT conversion, higher style fidelity.
 - **Browser-side embedded subtitle extraction**: text subtitle tracks inside MKV containers are extracted directly in the browser (custom MKV demux with sparse scanning that skips audio/video payload) — subtitles appear in seconds even for multi-gigabyte files, no server-side FFmpeg required.
 - **Browser-side playback engine (playsvideo)**: containers such as MKV / AVI / TS / WMV are automatically remuxed to fMP4 in the browser; browser-incompatible audio tracks (DTS / AC3 / EAC3, etc.) are transcoded to AAC in real time in the browser. Fully automatic — **no admin-panel toggles required** — and the transcode core ships with the frontend assets, so no server-side FFmpeg is needed.
+- **One-click playlist clear**: the "Clear" button in the movie-list header removes every movie in the room at once (visible to the host/moderators, requires confirmation, synced to all members).
+
+### Platform support for browser-side remux/transcode
+
+The in-browser pipeline needs a way to feed fMP4 segments to `<video>`: either `MediaSource` (MSE) or `ManagedMediaSource` (MMS) on iPhone.
+
+| Platform | Pipeline availability | Notes |
+|---|---|---|
+| Chrome / Edge (desktop, Android) | ✅ MSE | Full experience, MKV / DTS etc. all playable |
+| **iPhone / iPad (iOS 17.1+)** | ✅ ManagedMediaSource | Supported; hls.js 1.5+ handles MMS natively |
+| iPhone (iOS < 17.1) | ❌ no MSE / MMS | Native playback only: MP4 (H.264/HEVC + AAC) works; MKV and DTS/AC3 audio do not — the UI explains this explicitly |
+| Desktop Safari / Firefox | ⚠️ partial | Cannot open MKV natively and have limited audio transcoding; Chrome / Edge recommended |
+| HLS (m3u8) sources | ✅ | Safari (including older iOS) uses native HLS, others use hls.js |
+
+> When a device cannot run the in-browser pipeline, the error message names the reason (instead of telling you to flip the "browser transcode engine" switch) and suggests an MP4 (H.264 + AAC) source.
+
+### Server-side transcode (optional, requires ffmpeg on the server)
+
+Sources the browser genuinely cannot handle (iPhone before iOS 17.1 without MSE, HEVC, DTS audio, …) can be handled by the server:
+
+- The backend uses **ffmpeg** to remux/transcode the source into **HLS**; the frontend keeps playing it with hls.js, and **iOS uses Safari's native HLS player**, so no MediaSource is required.
+- Two modes: `remux` (video passthrough, almost no CPU) and `transcode` (re-encode to H.264 when the browser cannot decode the video codec); audio is always converted to AAC.
+- Trigger: automatically when the device cannot run the in-browser pipeline and the source needs remuxing/transcoding, or manually via the **"Server transcode"** switch in the playlist (local to your browser; the current movie is re-resolved immediately).
+- Segments are written to `config/transcode/<session id>/` and reclaimed automatically after 15 minutes idle (process + directory); everything is cleaned up on shutdown.
+- **Install ffmpeg**: put it on `PATH`, or point the `FFMPEG_PATH` environment variable at the binary. Without it the switch is hidden, and the API answers 503 with an installation hint.
+
+> Note: forward seeking is limited by ffmpeg producing segments sequentially — jumping past the produced point waits for ffmpeg to catch up. Sessions are reused by "movie + mode + start (rounded to 30 s)", so everyone in a room shares one transcode. Server-side transcoding costs server CPU and bandwidth, so enable it only when needed.
 
 ### Real-Time Interaction
 

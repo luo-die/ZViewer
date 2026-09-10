@@ -61,22 +61,47 @@ export function setPlaysvideoLocalOverride(
 }
 
 /**
- * 本次会话内「管线已确认播不了」的源地址。
+ * 本次会话内「管线已确认播不了」的源地址（含标记时间）。
  *
  * 管线失败后已回退直连，但用户重载影片 / 切回同一集时再走一遍管线只会又黑屏
- * 一次（体感就是「开关一开视频就不加载」）。失败过的源在本次会话内直接跳过管线；
- * 用户重新拨动「浏览器转码引擎」开关时清空重试。
+ * 一次（体感就是「开关一开视频就不加载」）。失败过的源在短期内直接跳过管线。
+ *
+ * 标记**带有效期**（而不是整会话拉黑）：一次瞬时失败（网络抖动、token 过期、
+ * 上游短暂 5xx）不该让这个片源在本会话里永远用不上转码——这正是用户抱怨
+ * 「这引擎时灵时不灵」的来源。过期后自动重试。
  */
-const playsVideoFailedUrls = new Set<string>()
+const FAILURE_TTL_MS = 5 * 60_000
+
+/** 上限：避免长时间挂机后无限增长（超出时丢弃最旧的记录） */
+const FAILURE_MAX_ENTRIES = 200
+
+const playsVideoFailedUrls = new Map<string, number>()
 
 /** 标记某源地址的管线播放失败（回退原生直连时调用） */
 export function markPlaysVideoFailure(url: string): void {
-  if (url) playsVideoFailedUrls.add(url)
+  if (!url) return
+  const now = Date.now()
+  // 顺带清理过期项，避免 Map 只增不减
+  for (const [key, at] of playsVideoFailedUrls) {
+    if (now - at > FAILURE_TTL_MS) playsVideoFailedUrls.delete(key)
+  }
+  if (playsVideoFailedUrls.size >= FAILURE_MAX_ENTRIES) {
+    const oldest = playsVideoFailedUrls.keys().next().value
+    if (oldest !== undefined) playsVideoFailedUrls.delete(oldest)
+  }
+  playsVideoFailedUrls.set(url, now)
 }
 
-/** 该源是否已在本次会话中确认「管线播不了」 */
+/** 该源是否在有效期内被确认「管线播不了」 */
 export function hasPlaysVideoFailure(url: string | undefined): boolean {
-  return !!url && playsVideoFailedUrls.has(url)
+  if (!url) return false
+  const at = playsVideoFailedUrls.get(url)
+  if (at === undefined) return false
+  if (Date.now() - at > FAILURE_TTL_MS) {
+    playsVideoFailedUrls.delete(url)
+    return false
+  }
+  return true
 }
 
 function subscribe(callback: () => void): () => void {

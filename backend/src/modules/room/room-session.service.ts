@@ -77,6 +77,58 @@ export class RoomSessionService {
   }
 
   /**
+   * 加入新房间前，先离开该 socket 此前加入的其它房间。
+   *
+   * 背景（切换房间后播放的却是上一个房间的内容，刷新才好）：
+   * socket.io 的 `socket.join()` 只是**追加**成员身份，服务端从不让 socket
+   * 离开旧房间。同一个浏览器标签页从房间 A 切到房间 B 时 socket 并未重连，
+   * 于是客户端仍然收到 A 的 `watch-together-state` / `watch-together-control` /
+   * `sync-heartbeat` / `current-movie` 等广播，把它们应用到播放器上——表现为
+   * 「在 B 里点播放，放的却是 A 的内容」。
+   *
+   * 同时旧房间的 viewer Session 也不会结束，观众数与会话状态残留。
+   *
+   * 注意：**不结束旧房间的 sharer（房主）会话**——房主切房间的房间生命周期
+   * 由客户端 host-leave + 服务端宽限期逻辑负责，这里只停止接收广播并收尾
+   * viewer 会话，避免把「宽限期可返回」的旧房间直接判死。
+   */
+  async leaveOtherRooms(socket: Socket, keepRoomId: string): Promise<void> {
+    const stale = [...socket.rooms].filter(
+      (id) => id !== socket.id && id !== keepRoomId,
+    );
+    if (stale.length === 0) return;
+
+    const sessionRepo = AppDataSource.getRepository(Session);
+    for (const roomId of stale) {
+      try {
+        socket.leave(roomId);
+      } catch {
+        /* ignore */
+      }
+      roomPermissionService.invalidatePermissionCache(socket.id, roomId);
+      try {
+        const sessions = await sessionRepo.findBy({
+          roomId,
+          socketId: socket.id,
+          role: 'viewer',
+          endedAt: IsNull(),
+        });
+        if (sessions.length > 0) {
+          const now = new Date();
+          for (const s of sessions) s.endedAt = now;
+          await sessionRepo.save(sessions);
+        }
+      } catch (err) {
+        console.error('[room-session] leaveOtherRooms end session error:', err);
+      }
+      this.io?.to(roomId).emit('viewer-left', { viewerSocketId: socket.id });
+    }
+    console.log(
+      `[room-session] socket ${socket.id} 已离开旧房间: ${stale.join(', ')}（进入 ${keepRoomId}）`,
+    );
+  }
+
+  /**
    * 注册房主（首次或重连）。
    *
    * - 若存在同 ownerUserId 的旧 sharer session，复用并更新 socketId
@@ -137,7 +189,8 @@ export class RoomSessionService {
       await sessionRepo.save(session);
     }
 
-    // 加入 socket.io 房间
+    // 加入 socket.io 房间（先离开旧房间，避免继续收到上一个房间的广播）
+    await this.leaveOtherRooms(socket, roomId);
     await socket.join(roomId);
 
     // 更新最后访问时间
@@ -184,7 +237,8 @@ export class RoomSessionService {
     });
     await sessionRepo.save(session);
 
-    // 加入 socket.io 房间
+    // 加入 socket.io 房间（先离开旧房间，避免继续收到上一个房间的广播）
+    await this.leaveOtherRooms(socket, roomId);
     await socket.join(roomId);
 
     return session;

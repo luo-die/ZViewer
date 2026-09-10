@@ -89,3 +89,26 @@ index 29fd811..eb09187 100644
  /** Discover subtitle tracks from a demuxed input. Cheap — reads only metadata, no cue extraction. */
  export async function getSubtitleTrackInfos(input) {
      const tracks = await input.getSubtitleTracks();
+diff --git a/node_modules/playsvideo/dist/pipeline/codec-probe.js b/node_modules/playsvideo/dist/pipeline/codec-probe.js
+index a65d49f..e2b148d 100644
+--- a/node_modules/playsvideo/dist/pipeline/codec-probe.js
++++ b/node_modules/playsvideo/dist/pipeline/codec-probe.js
+@@ -32,11 +32,17 @@ const PIPELINE_UNSAFE_AUDIO = new Set(['ac3', 'eac3']);
+  */
+ export function createBrowserProber() {
+     const cache = new Map();
++    // 本地补丁（ZViewer）：iPhone Safari（iOS 17.1+）没有 MediaSource 全局，
++    // 只提供 ManagedMediaSource（MSE 的精简/托管版本）。此处直接引用
++    // MediaSource 会抛 ReferenceError，让整条转码管线在 iPhone 上直接崩掉。
++    // ManagedMediaSource 继承自 MediaSource，静态 isTypeSupported 通用，
++    // 因此二者取其一即可（都没有时按不支持处理，由调用方降级）。
++    const mse = globalThis.MediaSource ?? globalThis.ManagedMediaSource ?? null;
+     function isSupported(mime) {
+         const cached = cache.get(mime);
+         if (cached !== undefined)
+             return cached;
+-        const result = MediaSource.isTypeSupported(mime);
++        const result = mse ? mse.isTypeSupported(mime) : false;
+         cache.set(mime, result);
+         return result;
+     }

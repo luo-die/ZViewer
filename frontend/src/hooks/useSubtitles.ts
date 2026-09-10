@@ -233,7 +233,11 @@ const DEFAULT_SUBTITLE_STYLE = {
   subtitleFontFamily: '',
 } satisfies Partial<SubtitleState>
 
-function clampNumber(value: unknown, min: number, max: number): number | undefined {
+function clampNumber(
+  value: unknown,
+  min: number,
+  max: number
+): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
   return Math.min(max, Math.max(min, value))
 }
@@ -258,7 +262,8 @@ function readStoredSubtitleStyle(): Partial<SubtitleState> | null {
     if (strokeWidth !== undefined) out.subtitleStrokeWidth = strokeWidth
     const shadowBlur = clampNumber(parsed.shadowBlur, 0, 12)
     if (shadowBlur !== undefined) out.subtitleShadowBlur = shadowBlur
-    if (typeof parsed.fontFamily === 'string') out.subtitleFontFamily = parsed.fontFamily
+    if (typeof parsed.fontFamily === 'string')
+      out.subtitleFontFamily = parsed.fontFamily
     return out
   } catch {
     return null
@@ -301,7 +306,9 @@ export function useSubtitles({
 }: UseSubtitlesOptions) {
   const { socket } = useSocket()
   // 本地保存过的样式只读一次：既用于初始状态，也决定观众是否算「已自定义」
-  const storedStyleRef = useRef<Partial<SubtitleState> | null | undefined>(undefined)
+  const storedStyleRef = useRef<Partial<SubtitleState> | null | undefined>(
+    undefined
+  )
   if (storedStyleRef.current === undefined) {
     storedStyleRef.current = readStoredSubtitleStyle()
   }
@@ -673,7 +680,9 @@ export function useSubtitles({
                     },
                   ],
                   subtitleEnabled: true,
-                  activeTrackIndex: activate ? trackIndex : prev.activeTrackIndex,
+                  activeTrackIndex: activate
+                    ? trackIndex
+                    : prev.activeTrackIndex,
                 }
                 return next
               }
@@ -748,7 +757,9 @@ export function useSubtitles({
       // mkv-embedded 的 fetch 无法携带 Authorization 头，
       // 本站 /api/ URL 必须附加 token query（与播放引擎 appendAuthToken 一致），
       // 否则 401 → 探测失败显示「未检测到内嵌字幕」。直链 URL 原样返回。
-      const url = appendAuthToken(sourceUrl ?? buildServerFileProxyUrl(filePath))
+      const url = appendAuthToken(
+        sourceUrl ?? buildServerFileProxyUrl(filePath)
+      )
 
       // 防并行重入：同一 URL 加载中（首路还在探测）或已完成时，
       // StrictMode/effect 重跑的二次调用直接跳过，避免重复建轨
@@ -1017,6 +1028,9 @@ export function useSubtitles({
           return true
         }
         let data: ExtractPayload | null = null
+        // 「提取中」只打印一次：轮询间隔 700ms~2s，整集提取可能持续 1~2 分钟，
+        // 每轮都 console 会把日志量放大到几百条（生产环境还会全量上报到后端）。
+        let loggedPending = false
         for (;;) {
           if (embeddedEpochRef.current !== epoch) return 0
           const res = await apiFetch(extractUrl)
@@ -1034,7 +1048,7 @@ export function useSubtitles({
                 data.language,
                 allowPartialBroadcast()
               )
-              console.info(
+              console.debug(
                 `[useSubtitles] 字幕已部分可用（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s），后台继续补齐…`
               )
               await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
@@ -1045,9 +1059,12 @@ export function useSubtitles({
           if (Date.now() > deadline) {
             throw new Error(data.message || '字幕提取超时，请稍后重试')
           }
-          console.info(
-            `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s）`
-          )
+          if (!loggedPending) {
+            loggedPending = true
+            console.debug(
+              `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s）`
+            )
+          }
           await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
         }
         if (!data || !data.content) {
@@ -1155,17 +1172,20 @@ export function useSubtitles({
   )
 
   const setStrokeWidth = useCallback(
-    (strokeWidth: number) => applySubtitleStyle({ subtitleStrokeWidth: strokeWidth }),
+    (strokeWidth: number) =>
+      applySubtitleStyle({ subtitleStrokeWidth: strokeWidth }),
     [applySubtitleStyle]
   )
 
   const setShadowBlur = useCallback(
-    (shadowBlur: number) => applySubtitleStyle({ subtitleShadowBlur: shadowBlur }),
+    (shadowBlur: number) =>
+      applySubtitleStyle({ subtitleShadowBlur: shadowBlur }),
     [applySubtitleStyle]
   )
 
   const setFontFamily = useCallback(
-    (fontFamily: string) => applySubtitleStyle({ subtitleFontFamily: fontFamily }),
+    (fontFamily: string) =>
+      applySubtitleStyle({ subtitleFontFamily: fontFamily }),
     [applySubtitleStyle]
   )
 
@@ -1204,7 +1224,7 @@ export function useSubtitles({
       setState((prev) => ({
         subtitleEnabled: touched
           ? prev.subtitleEnabled
-          : payload.enabled ?? prev.subtitleEnabled,
+          : (payload.enabled ?? prev.subtitleEnabled),
         // 轨道数据：以房主广播为基准（数量/顺序/新增/清空均跟随房主，
         // 房主手动上传的轨道由此同步给观众）；仅当本地同索引轨道 label
         // 一致且 cues 更多（观众本地流式提取进度领先房主快照）时保留
@@ -1222,31 +1242,30 @@ export function useSubtitles({
           : prev.subtitleTracks,
         activeTrackIndex: touched
           ? prev.activeTrackIndex
-          : payload.activeIndex ?? prev.activeTrackIndex,
+          : (payload.activeIndex ?? prev.activeTrackIndex),
         subtitleMovieId: payload.movieId ?? prev.subtitleMovieId,
-        secondaryTrackIndex:
-          payload.secondaryIndex ?? prev.secondaryTrackIndex,
+        secondaryTrackIndex: payload.secondaryIndex ?? prev.secondaryTrackIndex,
         subtitleFontSize: touched
           ? prev.subtitleFontSize
-          : payload.fontSize ?? prev.subtitleFontSize,
+          : (payload.fontSize ?? prev.subtitleFontSize),
         subtitleOffset: touched
           ? prev.subtitleOffset
-          : payload.offset ?? prev.subtitleOffset,
+          : (payload.offset ?? prev.subtitleOffset),
         subtitleShiftX: touched
           ? prev.subtitleShiftX
-          : payload.shiftX ?? prev.subtitleShiftX,
+          : (payload.shiftX ?? prev.subtitleShiftX),
         subtitleShiftY: touched
           ? prev.subtitleShiftY
-          : payload.shiftY ?? prev.subtitleShiftY,
+          : (payload.shiftY ?? prev.subtitleShiftY),
         subtitleStrokeWidth: touched
           ? prev.subtitleStrokeWidth
-          : payload.strokeWidth ?? prev.subtitleStrokeWidth,
+          : (payload.strokeWidth ?? prev.subtitleStrokeWidth),
         subtitleShadowBlur: touched
           ? prev.subtitleShadowBlur
-          : payload.shadowBlur ?? prev.subtitleShadowBlur,
+          : (payload.shadowBlur ?? prev.subtitleShadowBlur),
         subtitleFontFamily: touched
           ? prev.subtitleFontFamily
-          : payload.fontFamily ?? prev.subtitleFontFamily,
+          : (payload.fontFamily ?? prev.subtitleFontFamily),
       }))
     }
     socket.on('subtitle-update', handler)

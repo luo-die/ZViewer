@@ -27,6 +27,7 @@ import {
 } from '../../middleware/auth';
 import { movieService } from './movie.service';
 import { movieBroadcasterService } from './movie-broadcaster.service';
+import { roomStateService } from '../room/room-state.service';
 import { isInternalOpenListServer } from '../../services/openlist-errors';
 import {
   MOUNT_TYPES,
@@ -296,6 +297,37 @@ export function createMovieRouter(io: SocketIOServer): Router {
       } catch (err) {
         console.error('[PUT /movies/:movieId] error:', err);
         res.status(500).json({ success: false, message: '更新影片失败' });
+      }
+    },
+  );
+
+  // DELETE /api/rooms/:roomId/movies - 清空播放列表（仅 root 或房间 owner）
+  // 注意：必须注册在 /:roomId/movies/:movieId 之前也可（路径段数不同，无冲突）
+  router.delete(
+    '/:roomId/movies',
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const roomId = req.params.roomId as string;
+        const roomRepo = AppDataSource.getRepository(Room);
+        const room = await roomRepo.findOneBy({ roomId });
+        if (!room) {
+          res.status(404).json({ success: false, message: '房间不存在' });
+          return;
+        }
+        if (!canControlRoom(req, room)) {
+          res.status(403).json({ success: false, message: '无权限：仅 root 或房间创建者可清空播放列表' });
+          return;
+        }
+
+        const removed = await movieService.clearMovies(roomId);
+        // 清空后当前影片必然失效：清内存状态并广播，避免客户端继续播放已删除的影片
+        roomStateService.setCurrentMovie(roomId, null);
+        await movieBroadcasterService.broadcastMovieList(io, roomId);
+        io.to(roomId).emit('current-movie', { roomId, movieId: null });
+        res.json({ success: true, removed });
+      } catch (err) {
+        console.error('[DELETE /movies] error:', err);
+        res.status(500).json({ success: false, message: '清空播放列表失败' });
       }
     },
   );
