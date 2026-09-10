@@ -350,6 +350,13 @@ interface RoomState {
       username?: string
       password?: string
       directLink?: boolean
+      /**
+       * 挂载来源的挂载 ID（自己的或他人共享给自己的）。
+       *
+       * 被共享者看不到挂载的 serverUrl 与凭证，只能传 mountId，
+       * 由后端按访问权限补齐连接信息；播放方式跟随挂载主设置，无需前端传 directLink。
+       */
+      mountId?: number
       /** 影片级浏览器播放引擎（playsvideo）开关：false 时强制原生直连播放 */
       playsvideoEnabled?: boolean
       sourceMeta?: AniSubsSourceMeta | null

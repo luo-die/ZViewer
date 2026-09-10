@@ -5,12 +5,16 @@
  * 分离式架构：REST 客户端在 services/jellyfin-client.ts（重导出 emby-client）。
  */
 import {
-  stripPassword,
   extractErrorMessage,
   ensureHttpsProbe,
   maybeUpgradeDirectUrl,
   probeForMountSave,
 } from '../modules/shared/mount-utils';
+import {
+  canUseDirectLink,
+  resolveAccessibleMount,
+  toOwnMountDto,
+} from '../modules/shared/mount-share';
 import { Router, Request, Response } from 'express';
 import { AppDataSource } from '../data-source';
 import { UserMount } from '../entities/UserMount';
@@ -109,7 +113,7 @@ function mapJellyfinEntry(item: {
 
 router.use(authenticateToken);
 
-// 列表 - GET /mounts
+// 列表 - GET /mounts（仅自己的挂载；他人共享的见 /api/mounts/shared）
 router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
@@ -117,7 +121,7 @@ router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<
       where: { userId, type: 'jellyfin' },
       order: { createdAt: 'DESC' },
     });
-    res.json({ success: true, mounts: mounts.map(stripPassword) });
+    res.json({ success: true, mounts: mounts.map(toOwnMountDto) });
   } catch (err) {
     console.error('[jellyfin] list mounts error:', err);
     res.status(500).json({ success: false, message: '获取 Jellyfin 挂载列表失败' });
@@ -206,7 +210,7 @@ router.post('/mounts', async (req: AuthenticatedRequest, res: Response): Promise
     const httpsWarning = await probeForMountSave(mount);
     res.status(201).json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       ...(httpsWarning ? { warning: httpsWarning } : {}),
     });
   } catch (err) {
@@ -248,7 +252,7 @@ router.put('/mounts/:id', async (req: AuthenticatedRequest, res: Response): Prom
     const httpsWarning = await probeForMountSave(mount);
     res.json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       ...(httpsWarning ? { warning: httpsWarning } : {}),
     });
   } catch (err) {
@@ -279,7 +283,7 @@ router.delete('/mounts/:id', async (req: AuthenticatedRequest, res: Response): P
   }
 });
 
-// 浏览 - GET /mounts/:id/browse?path=
+// 浏览 - GET /mounts/:id/browse?path=（自己的挂载或他人共享给自己的挂载）
 router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const mountId = Number(req.params.id);
@@ -287,8 +291,7 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
       res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
       return;
     }
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'jellyfin' });
+    const mount = (await resolveAccessibleMount(mountId, 'jellyfin', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -329,8 +332,7 @@ router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response
       ? Math.min(Math.floor(limitRaw), 200)
       : 60;
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'jellyfin' });
+    const mount = (await resolveAccessibleMount(mountId, 'jellyfin', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -379,11 +381,7 @@ router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response)
     const maxWidth = clampQueryNumber(req.query.maxWidth, 16, 1280, 320);
     const maxHeight = clampQueryNumber(req.query.maxHeight, 16, 1920, 480);
 
-    const mount = await userMountRepository().findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'jellyfin',
-    });
+    const mount = (await resolveAccessibleMount(mountId, 'jellyfin', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -443,11 +441,7 @@ router.get('/mounts/:id/episodes', async (req: AuthenticatedRequest, res: Respon
     }
     const limit = clampQueryNumber(req.query.limit, 1, 1000, 500);
 
-    const mount = await userMountRepository().findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'jellyfin',
-    });
+    const mount = (await resolveAccessibleMount(mountId, 'jellyfin', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -503,12 +497,12 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       res.status(400).json({ success: false, message: 'itemId 不能为空', code: 'INVALID_PARAMS' });
       return;
     }
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'jellyfin' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'jellyfin', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const { mount, shared } = access;
     const session = await resolveJellyfinSession(mount);
     const info = await session.client.playbackInfo(itemId, session.userId);
     const source = info.MediaSources[0];
@@ -540,11 +534,14 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       : `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/stream?static=true&api_key=${session.token}`;
     const httpsDirect = await ensureHttpsProbe(mount);
     const directUrl = maybeUpgradeDirectUrl(directUrlRaw, httpsDirect);
+    // 他人共享的挂载：默认不下发直连 URL（其中含源站地址与 api_key），
+    // 需挂载主在共享设置中显式开启「允许直链直连」
+    const allowDirect = canUseDirectLink(mount, shared);
     res.json({
       success: true,
       title,
       videoUrl: proxyUrl,
-      directUrl,
+      ...(allowDirect ? { directUrl } : {}),
       format,
       duration: 0,
       audioCodec,

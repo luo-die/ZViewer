@@ -82,6 +82,14 @@ export interface MovieDto {
   username?: string | null;
   /** WebDAV/FTP 密码（已解密） */
   password?: string | null;
+  /**
+   * 仅请求方向：新增影片时使用的挂载 ID。
+   *
+   * 被共享者看不到挂载的 serverUrl/凭证，添加影片时改传 mountId，
+   * 由后端按访问权限（自己的挂载或他人共享）补齐 serverUrl/username/password。
+   * 不落库、不出现在响应里。
+   */
+  mountId?: number;
   /** 是否为直链 */
   directLink?: boolean;
   /**

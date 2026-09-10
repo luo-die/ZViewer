@@ -28,12 +28,16 @@ import { UserMount } from '../entities/UserMount';
 import { Movie } from '../entities/Movie';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import {
-  stripPassword,
   extractErrorMessage,
   ensureHttpsProbe,
   maybeUpgradeDirectUrl,
   probeForMountSave,
 } from '../modules/shared/mount-utils';
+import {
+  canUseDirectLink,
+  resolveAccessibleMount,
+  toOwnMountDto,
+} from '../modules/shared/mount-share';
 import {
   normalizeOpenListServerUrl,
   isInternalOpenListServer,
@@ -154,7 +158,7 @@ function resolveDirectLinkWithInternalCheck(
   return directLink;
 }
 
-// GET /mounts - 列出挂载
+// GET /mounts - 列出挂载（仅自己的挂载；他人共享的见 /api/mounts/shared）
 router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
@@ -164,7 +168,7 @@ router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<
     });
     res.json({
       success: true,
-      mounts: mounts.map(stripPassword),
+      mounts: mounts.map(toOwnMountDto),
     });
   } catch (err) {
     console.error('[openlist] list mounts error:', err);
@@ -245,7 +249,7 @@ router.post('/mounts', async (req: AuthenticatedRequest, res: Response): Promise
 
     res.status(201).json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       // 告知前端：内网挂载被强制中转
       ...(effectiveDirectLink !== (directLink === true)
         ? { warning: '检测到内网地址，已强制使用服务器中转模式' }
@@ -334,7 +338,7 @@ router.put('/mounts/:id', async (req: AuthenticatedRequest, res: Response): Prom
 
     res.json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       // 告知前端：内网挂载被强制中转
       ...(effectiveDirectLink !== requestedDirectLink
         ? { warning: '检测到内网地址，已强制使用服务器中转模式' }
@@ -372,7 +376,7 @@ router.delete('/mounts/:id', async (req: AuthenticatedRequest, res: Response): P
   }
 });
 
-// GET /mounts/:id/browse - 浏览目录
+// GET /mounts/:id/browse - 浏览目录（自己的挂载或他人共享给自己的挂载）
 router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const id = Number(req.params.id);
@@ -381,12 +385,12 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id, userId: req.user!.userId, type: 'openlist' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(id, 'openlist', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;
@@ -459,12 +463,12 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'openlist' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'openlist', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;
@@ -523,10 +527,20 @@ router.get('/direct-url', async (req: AuthenticatedRequest, res: Response): Prom
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'openlist' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'openlist', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+      return;
+    }
+    const { mount, shared } = access;
+    // 他人共享的挂载：默认不允许取直链（直链会暴露源站地址与 token），
+    // 需挂载主在共享设置中显式开启「允许直链直连」
+    if (!canUseDirectLink(mount, shared)) {
+      res.status(403).json({
+        success: false,
+        message: '该挂载为他人共享且未开放直链，请使用服务器转发模式',
+        code: 'SHARED_DIRECT_FORBIDDEN',
+      });
       return;
     }
     if (!mount.serverUrl) {
@@ -646,12 +660,12 @@ router.get('/proxy', async (req: AuthenticatedRequest, res: Response): Promise<v
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'openlist' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'openlist', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;
@@ -831,12 +845,12 @@ router.get('/search', async (req: AuthenticatedRequest, res: Response): Promise<
     }
     const parent = typeof parentRaw === 'string' ? parentRaw : '/';
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({ id: mountId, userId: req.user!.userId, type: 'openlist' });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'openlist', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;

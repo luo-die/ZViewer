@@ -1,4 +1,8 @@
-import { stripPassword, extractErrorMessage } from '../modules/shared/mount-utils';
+import { extractErrorMessage } from '../modules/shared/mount-utils';
+import {
+  resolveAccessibleMount,
+  toOwnMountDto,
+} from '../modules/shared/mount-share';
 import { Router, Request, Response } from 'express';
 import { AppDataSource } from '../data-source';
 import { UserMount } from '../entities/UserMount';
@@ -34,7 +38,7 @@ function mountToParams(mount: UserMount): FTPConnectionParams {
 
 router.use(authenticateToken);
 
-// 挂载 CRUD - GET /mounts
+// 挂载 CRUD - GET /mounts（仅自己的挂载；他人共享的见 /api/mounts/shared）
 router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.userId;
@@ -45,7 +49,7 @@ router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<
 
     res.json({
       success: true,
-      mounts: mounts.map(stripPassword),
+      mounts: mounts.map(toOwnMountDto),
     });
   } catch (err) {
     console.error('[ftp] list mounts error:', err);
@@ -149,7 +153,7 @@ router.post('/mounts', async (req: AuthenticatedRequest, res: Response): Promise
 
     res.status(201).json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
     });
   } catch (err) {
     console.error('[ftp] create mount error:', err);
@@ -225,7 +229,7 @@ router.put('/mounts/:id', async (req: AuthenticatedRequest, res: Response): Prom
 
     res.json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
     });
   } catch (err) {
     console.error('[ftp] update mount error:', err);
@@ -261,7 +265,7 @@ router.delete('/mounts/:id', async (req: AuthenticatedRequest, res: Response): P
   }
 });
 
-// 浏览 - GET /mounts/:id/browse?path=
+// 浏览 - GET /mounts/:id/browse?path=（自己的挂载或他人共享给自己的挂载）
 router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const id = Number(req.params.id);
@@ -270,16 +274,12 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({
-      id,
-      userId: req.user!.userId,
-      type: 'ftp',
-    });
-    if (!mount) {
+    const access = await resolveAccessibleMount(id, 'ftp', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;
@@ -327,16 +327,12 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'ftp',
-    });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'ftp', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
     if (!mount.serverUrl) {
       res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
       return;

@@ -32,6 +32,7 @@ import kazumiRoutes from './routes/kazumi';
 import serverFilesRoutes from './routes/serverFiles';
 import { createMountRouter } from './routes/webdav';
 import openlistRoutes from './routes/openlist';
+import mountsRoutes from './routes/mounts';
 import ftpRoutes from './routes/ftp';
 import embyRoutes from './routes/emby';
 import jellyfinRoutes from './routes/jellyfin';
@@ -293,6 +294,8 @@ async function bootstrap() {
   // CLI 本地代理端点：供 zcontrol-cli 使用，使用用户自己的 Cookie 解析高画质
   app.use('/api/cli', cliRoutes);
   app.use('/api/openlist', openlistRoutes);
+  // 个人挂载共享：跨类型的共享设置与「共享给我的挂载」列表
+  app.use('/api/mounts', mountsRoutes);
   app.use('/api/webdav', createMountRouter({
     type: 'webdav',
     proxyPrefix: '/api/webdav',

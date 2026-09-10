@@ -8,12 +8,16 @@
  * - includeSize：OpenList resolve 返回文件大小
  */
 import {
-  stripPassword,
   extractErrorMessage,
   ensureHttpsProbe,
   maybeUpgradeDirectUrl,
   probeForMountSave,
 } from '../modules/shared/mount-utils';
+import {
+  canUseDirectLink,
+  resolveAccessibleMount,
+  toOwnMountDto,
+} from '../modules/shared/mount-share';
 import { Router, Request, Response } from 'express';
 import { AppDataSource } from '../data-source';
 import { UserMount } from '../entities/UserMount';
@@ -107,7 +111,7 @@ export function createMountRouter(opts: MountRouterOptions): Router {
 
   router.use(authenticateToken);
 
-  // 2.1 挂载 CRUD - GET /mounts
+  // 2.1 挂载 CRUD - GET /mounts（仅自己的挂载；他人共享的见 /api/mounts/shared）
   router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const userId = req.user!.userId;
@@ -118,7 +122,7 @@ export function createMountRouter(opts: MountRouterOptions): Router {
 
       res.json({
         success: true,
-        mounts: mounts.map(stripPassword),
+        mounts: mounts.map(toOwnMountDto),
       });
     } catch (err) {
       console.error(`[${logTag}] list mounts error:`, err);
@@ -210,7 +214,7 @@ export function createMountRouter(opts: MountRouterOptions): Router {
 
       res.status(201).json({
         success: true,
-        mount: stripPassword(mount),
+        mount: toOwnMountDto(mount),
         ...(mount.directLink !== (directLink === true)
           ? { warning: '检测到内网地址，已强制使用服务器中转模式' }
           : httpsWarning
@@ -288,7 +292,7 @@ export function createMountRouter(opts: MountRouterOptions): Router {
 
       res.json({
         success: true,
-        mount: stripPassword(mount),
+        mount: toOwnMountDto(mount),
         ...(mount.directLink !== (directLink === true)
           ? { warning: '检测到内网地址，已强制使用服务器中转模式' }
           : httpsWarning
@@ -329,7 +333,7 @@ export function createMountRouter(opts: MountRouterOptions): Router {
     }
   });
 
-  // 2.3 浏览 - GET /mounts/:id/browse?path=
+  // 2.3 浏览 - GET /mounts/:id/browse?path=（自己的挂载或他人共享给自己的挂载）
   router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     try {
       const id = Number(req.params.id);
@@ -338,16 +342,12 @@ export function createMountRouter(opts: MountRouterOptions): Router {
         return;
       }
 
-      const repo = userMountRepository();
-      const mount = await repo.findOneBy({
-        id,
-        userId: req.user!.userId,
-        type,
-      });
-      if (!mount) {
+      const access = await resolveAccessibleMount(id, type, req.user!.userId);
+      if (!access) {
         res.status(404).json({ success: false, message: '挂载不存在或无权限' });
         return;
       }
+      const mount = access.mount;
       if (!mount.serverUrl) {
         res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
         return;
@@ -393,16 +393,12 @@ export function createMountRouter(opts: MountRouterOptions): Router {
         return;
       }
 
-      const repo = userMountRepository();
-      const mount = await repo.findOneBy({
-        id: mountId,
-        userId: req.user!.userId,
-        type,
-      });
-      if (!mount) {
+      const access = await resolveAccessibleMount(mountId, type, req.user!.userId);
+      if (!access) {
         res.status(404).json({ success: false, message: '挂载不存在或无权限' });
         return;
       }
+      const mount = access.mount;
       if (!mount.serverUrl) {
         res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
         return;
@@ -529,14 +525,20 @@ export function createMountRouter(opts: MountRouterOptions): Router {
         return;
       }
 
-      const repo = userMountRepository();
-      const mount = await repo.findOneBy({
-        id: mountId,
-        userId: req.user!.userId,
-        type,
-      });
-      if (!mount) {
+      const access = await resolveAccessibleMount(mountId, type, req.user!.userId);
+      if (!access) {
         res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+        return;
+      }
+      const { mount, shared } = access;
+      // 他人共享的挂载：默认不允许取直链（直链会暴露源站地址与 token），
+      // 需挂载主在共享设置中显式开启「允许直链直连」
+      if (!canUseDirectLink(mount, shared)) {
+        res.status(403).json({
+          success: false,
+          message: '该挂载为他人共享且未开放直链，请使用服务器转发模式',
+          code: 'SHARED_DIRECT_FORBIDDEN',
+        });
         return;
       }
       if (!mount.serverUrl) {

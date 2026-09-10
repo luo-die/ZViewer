@@ -28,6 +28,12 @@ import {
 import { movieService } from './movie.service';
 import { movieBroadcasterService } from './movie-broadcaster.service';
 import { isInternalOpenListServer } from '../../services/openlist-errors';
+import {
+  MOUNT_TYPES,
+  canUseDirectLink,
+  resolveAccessibleMount,
+} from '../shared/mount-share';
+import type { MountType } from '../../entities/UserMount';
 import type { MovieDto } from '../shared';
 
 /**
@@ -94,9 +100,43 @@ export function createMovieRouter(io: SocketIOServer): Router {
           return;
         }
 
+        const sourceType = typeof data.source === 'string' ? data.source.toLowerCase() : '';
+
+        // 挂载来源：优先用前端传的 mountId 解析（自己的挂载或他人共享给自己的）。
+        // 被共享者拿不到 serverUrl/凭证，只能传 mountId —— 后端补齐凭证，
+        // 并让播放方式跟随挂载主的 directLink 设置（被共享者无权选择）。
+        const mountIdRaw = data.mountId;
+        if (typeof mountIdRaw === 'number' && Number.isFinite(mountIdRaw)) {
+          if (!(MOUNT_TYPES as string[]).includes(sourceType)) {
+            res.status(400).json({ success: false, message: 'mountId 仅适用于挂载类来源' });
+            return;
+          }
+          const access = await resolveAccessibleMount(
+            mountIdRaw,
+            sourceType as MountType,
+            req.user!.userId,
+          );
+          if (!access) {
+            res.status(404).json({ success: false, message: '挂载不存在或无权限' });
+            return;
+          }
+          const { mount, shared } = access;
+          data.serverUrl = mount.serverUrl ?? undefined;
+          if (shared) {
+            // 被共享者：连接信息与播放方式全部以挂载配置为准，不接受请求体覆盖
+            data.username = mount.username ?? undefined;
+            data.password = mount.password ?? undefined;
+            data.directLink = canUseDirectLink(mount, shared);
+          } else {
+            data.username = data.username || mount.username || undefined;
+            data.password = data.password || mount.password || undefined;
+          }
+          // mountId 只是解析入口，不落库
+          delete (data as { mountId?: number }).mountId;
+        }
+
         // WebDAV / OpenList：前端不传凭证（挂载列表 API 不返回密码），
         // 后端从 UserMount 表按 userId + serverUrl 自动补全。
-        const sourceType = typeof data.source === 'string' ? data.source.toLowerCase() : '';
         if ((sourceType === 'webdav' || sourceType === 'openlist') && data.serverUrl) {
           if (!data.username || !data.password) {
             const mount = await AppDataSource.getRepository(UserMount).findOneBy({

@@ -418,6 +418,17 @@ Parse BV/AV video links, with quality switching and premium content support. Con
 
 - **MP4 Direct Link**: Input a direct MP4 URL to play.
 - **WebDAV / FTP / OpenList**: Save connection configurations in mount management, browse directories, and play video files.
+- **Emby / Jellyfin**: Mount a media-server library, browse libraries/seasons/episodes, and play them.
+
+### Mount Sharing (share your personal mounts with other users)
+
+Every mount in your profile has a **Share** button, letting you share it with selected users or everyone:
+
+- **Owner**: pick target users (searchable, select-all) or switch to "all users" (including accounts registered later). Sharing can be turned off at any time.
+- **Recipient**: shared mounts appear in the room's "Add Movie" mount dropdown (labelled with the owner) and can be browsed and added to the playlist; a read-only "Mounts shared with me" list is shown in the profile.
+- **Information isolation**: server URL, username, password, API key and root path are never sent to recipients. When adding a movie the client only sends `mountId`; the backend fills in the credentials and strips credential fields from movie API responses and room broadcasts.
+- **Playback mode**: recipients cannot choose direct-link vs. server proxy — it always follows the owner's mount setting. If the owner's mount uses direct links, recipients receive the direct URL (which exposes the source host); configure the mount as "server proxy" to keep it hidden.
+- **Permission boundary**: shared mounts cannot be edited, deleted or connection-tested, and can only be used to add movies to rooms the recipient manages.
 
 ---
 

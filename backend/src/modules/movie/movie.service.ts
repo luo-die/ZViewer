@@ -333,6 +333,12 @@ export class MovieService {
    * - password 字段由 ValueTransformer 自动解密
    * - acceptQuality JSON 字符串解析为数组返回（前端期望数组形式）
    * - createdAt/updatedAt 转 ISO 字符串
+   *
+   * 安全：serverUrl / username / password 是挂载源的连接凭证，**不下发**。
+   * 影片列表会广播给房间内所有成员（含游客），而影片可能是用他人共享的
+   * 挂载添加的——一旦下发就等于把挂载主的服务器地址和账号密码泄露出去。
+   * 播放侧不需要这些字段：中转模式下 url 已是 /api/<source>/stream?movieId=N，
+   * 后端在 /stream 里用 movieId 从 Movie 表自行取凭证。
    */
   serializeMovie(movie: MovieEntity): MovieDto {
     return {
@@ -352,10 +358,7 @@ export class MovieService {
       acceptQuality: parseAcceptQualityArray(movie.acceptQuality),
       pages: parsePagesArray(movie.pages),
       currentPage: movie.currentPage,
-      serverUrl: movie.serverUrl,
       path: movie.path,
-      username: movie.username,
-      password: movie.password,
       directLink: movie.directLink,
       wasmEngine: movie.wasmEngine,
       playsvideoEnabled: movie.playsvideoEnabled !== false,

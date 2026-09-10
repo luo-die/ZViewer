@@ -68,6 +68,34 @@ export class UserMount {
   @Column({ type: 'boolean', nullable: true })
   httpsDirect!: boolean | null;
 
+  /**
+   * 是否允许把该挂载共享给其他用户使用。
+   *
+   * 共享后对方（被共享者）只能做两件事：
+   * - 浏览该挂载的目录树，挑选影片；
+   * - 在自己有权限管理的房间中用它添加影片。
+   *
+   * 服务器地址、账号、密码一律不下发给被共享者（见 toSharedMountDto）；
+   * 播放方式（直链/中转）由本挂载的 directLink 决定，被共享者无权更改。
+   */
+  @Column({ type: 'boolean', default: false })
+  shareEnabled!: boolean;
+
+  /**
+   * 共享范围：
+   * - selected：仅 sharedUserIds 列表中的用户可用
+   * - all：所有已登录用户（含之后新注册的用户）都可用
+   */
+  @Column({ type: 'simple-enum', enum: ['selected', 'all'], default: 'selected' })
+  shareScope!: 'selected' | 'all';
+
+  /**
+   * 共享目标用户 ID 列表（JSON 数组，shareScope === 'selected' 时生效）。
+   * 空数组表示不共享给任何人（避免误开 shareEnabled 即全员可见）。
+   */
+  @Column({ type: 'text', default: '[]' })
+  sharedUserIds!: string;
+
   @CreateDateColumn()
   createdAt!: Date;
 

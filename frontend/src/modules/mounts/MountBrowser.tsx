@@ -9,7 +9,7 @@ import OpenListBrowser from '@/modules/openlist/OpenListBrowser'
 import FTPBrowser from '@/modules/ftp/FTPBrowser'
 import EmbyBrowser from '@/modules/emby/EmbyBrowser'
 import JellyfinBrowser from '@/modules/jellyfin/JellyfinBrowser'
-import type { UnionMount } from './types'
+import type { AnyMount } from './types'
 import {
   isWebDAVMount,
   isOpenListMount,
@@ -19,7 +19,8 @@ import {
 } from './types'
 
 interface MountBrowserProps {
-  mount: UnionMount | null
+  /** 自己的挂载或他人共享给自己的挂载（共享挂载同样支持浏览） */
+  mount: AnyMount | null
   open: boolean
   onClose: () => void
   onSelectFile?: (path: string) => void

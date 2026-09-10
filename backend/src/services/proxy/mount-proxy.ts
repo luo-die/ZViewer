@@ -6,9 +6,9 @@
  */
 
 import { Response } from 'express';
-import { AppDataSource } from '../../data-source';
 import { UserMount } from '../../entities/UserMount';
 import { AuthenticatedRequest } from '../../middleware/auth';
+import { resolveAccessibleMount } from '../../modules/shared/mount-share';
 
 export type MountType = 'webdav' | 'openlist' | 'ftp' | 'emby' | 'jellyfin';
 
@@ -16,11 +16,15 @@ export interface ResolvedMount {
   mount: UserMount;
   /** 请求的目标文件路径（已 trim，非空） */
   targetPath: string;
+  /** 是否以「被共享者」身份访问他人共享给自己的挂载 */
+  shared: boolean;
 }
 
 /**
- * 解析代理请求的 mountId + path，并查询当前用户对应类型的挂载。
- * 校验失败时直接写出错误响应并返回 null；成功返回挂载与目标路径。
+ * 解析代理请求的 mountId + path，并查询当前用户可访问的挂载。
+ *
+ * 可访问 = 自己创建的挂载，或他人共享给自己（shareEnabled 且命中共享范围）
+ * 的挂载。校验失败时直接写出错误响应并返回 null。
  */
 export async function resolveUserMount(
   req: AuthenticatedRequest,
@@ -45,19 +49,20 @@ export async function resolveUserMount(
     return null;
   }
 
-  const mount = await AppDataSource.getRepository(UserMount).findOneBy({
-    id: mountId,
-    userId: req.user!.userId,
+  const resolved = await resolveAccessibleMount(
+    mountId,
     type,
-  });
-  if (!mount) {
+    req.user!.userId,
+  );
+  if (!resolved) {
     res.status(404).json({ success: false, message: '挂载不存在或无权限' });
     return null;
   }
+  const { mount, shared } = resolved;
   if (!mount.serverUrl) {
     res.status(400).json({ success: false, message: '该挂载未配置服务器地址' });
     return null;
   }
 
-  return { mount, targetPath };
+  return { mount, targetPath, shared };
 }

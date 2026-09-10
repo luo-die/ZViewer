@@ -9,12 +9,16 @@
  * - 代理播放流（复用 services/proxy/http-proxy.ts）
  */
 import {
-  stripPassword,
   extractErrorMessage,
   ensureHttpsProbe,
   maybeUpgradeDirectUrl,
   probeForMountSave,
 } from '../modules/shared/mount-utils';
+import {
+  canUseDirectLink,
+  resolveAccessibleMount,
+  toOwnMountDto,
+} from '../modules/shared/mount-share';
 import { Router, Request, Response } from 'express';
 import { AppDataSource } from '../data-source';
 import { UserMount } from '../entities/UserMount';
@@ -124,7 +128,7 @@ router.get('/mounts', async (req: AuthenticatedRequest, res: Response): Promise<
       where: { userId, type: 'emby' },
       order: { createdAt: 'DESC' },
     });
-    res.json({ success: true, mounts: mounts.map(stripPassword) });
+    res.json({ success: true, mounts: mounts.map(toOwnMountDto) });
   } catch (err) {
     console.error('[emby] list mounts error:', err);
     res.status(500).json({ success: false, message: '获取 Emby 挂载列表失败' });
@@ -247,7 +251,7 @@ router.post('/mounts', async (req: AuthenticatedRequest, res: Response): Promise
     const httpsWarning = await probeForMountSave(mount);
     res.status(201).json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       ...(httpsWarning ? { warning: httpsWarning } : {}),
     });
   } catch (err) {
@@ -299,7 +303,7 @@ router.put('/mounts/:id', async (req: AuthenticatedRequest, res: Response): Prom
     const httpsWarning = await probeForMountSave(mount);
     res.json({
       success: true,
-      mount: stripPassword(mount),
+      mount: toOwnMountDto(mount),
       ...(httpsWarning ? { warning: httpsWarning } : {}),
     });
   } catch (err) {
@@ -336,7 +340,7 @@ router.delete('/mounts/:id', async (req: AuthenticatedRequest, res: Response): P
 
 // ==================== 浏览 / 解析 / 代理 ====================
 
-// 浏览 - GET /mounts/:id/browse?path=（空 = 媒体库）
+// 浏览 - GET /mounts/:id/browse?path=（空 = 媒体库；自己的挂载或他人共享给自己的挂载）
 router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const mountId = Number(req.params.id);
@@ -344,16 +348,12 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
       res.status(400).json({ success: false, message: '挂载 ID 不正确', code: 'INVALID_PARAMS' });
       return;
     }
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'emby',
-    });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'emby', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
 
     const browsePath = typeof req.query.path === 'string' ? req.query.path : '';
     const session = await resolveEmbySession(mount);
@@ -398,16 +398,12 @@ router.get('/mounts/:id/search', async (req: AuthenticatedRequest, res: Response
       ? Math.min(Math.floor(limitRaw), 200)
       : 60;
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'emby',
-    });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'emby', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const mount = access.mount;
 
     const session = await resolveEmbySession(mount);
     if (!session.userId) {
@@ -453,11 +449,7 @@ router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response)
     const maxWidth = clampQueryNumber(req.query.maxWidth, 16, 1280, 320);
     const maxHeight = clampQueryNumber(req.query.maxHeight, 16, 1920, 480);
 
-    const mount = await userMountRepository().findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'emby',
-    });
+    const mount = (await resolveAccessibleMount(mountId, 'emby', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -520,11 +512,7 @@ router.get('/mounts/:id/episodes', async (req: AuthenticatedRequest, res: Respon
     }
     const limit = clampQueryNumber(req.query.limit, 1, 1000, 500);
 
-    const mount = await userMountRepository().findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'emby',
-    });
+    const mount = (await resolveAccessibleMount(mountId, 'emby', req.user!.userId))?.mount;
     if (!mount) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
@@ -581,16 +569,12 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
-    const repo = userMountRepository();
-    const mount = await repo.findOneBy({
-      id: mountId,
-      userId: req.user!.userId,
-      type: 'emby',
-    });
-    if (!mount) {
+    const access = await resolveAccessibleMount(mountId, 'emby', req.user!.userId);
+    if (!access) {
       res.status(404).json({ success: false, message: '挂载不存在或无权限' });
       return;
     }
+    const { mount, shared } = access;
 
     const session = await resolveEmbySession(mount);
     const info = await session.client.playbackInfo(itemId, session.userId);
@@ -635,12 +619,15 @@ router.get('/resolve', async (req: AuthenticatedRequest, res: Response): Promise
       : `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}/stream?static=true&api_key=${session.token}`;
     const httpsDirect = await ensureHttpsProbe(mount);
     const directUrl = maybeUpgradeDirectUrl(directUrlRaw, httpsDirect);
+    // 他人共享的挂载：默认不下发直连 URL（其中含源站地址与 api_key），
+    // 需挂载主在共享设置中显式开启「允许直链直连」
+    const allowDirect = canUseDirectLink(mount, shared);
 
     res.json({
       success: true,
       title,
       videoUrl: proxyUrl,
-      directUrl,
+      ...(allowDirect ? { directUrl } : {}),
       format,
       duration: 0,
       audioCodec,
