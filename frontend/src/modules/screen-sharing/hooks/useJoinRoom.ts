@@ -150,6 +150,13 @@ export function useJoinRoom(options: UseJoinRoomOptions): UseJoinRoomResult {
             if (response.data?.streamKey !== undefined) {
               setStreamKey(response.data.streamKey)
             }
+            // 转码方式是房主设置的房间级状态：观众端只读展示（自动 / 服务端），
+            // 进房时就同步，避免显示默认值而与实际播放路径不符
+            if (response.data?.transcodeMode !== undefined) {
+              useRoomStore
+                .getState()
+                .setRoomSettings({ transcodeMode: response.data.transcodeMode })
+            }
             if (mode === 'watch-together') {
               if (response.message === '已加入房间') {
                 hasJoinedRef.current = true

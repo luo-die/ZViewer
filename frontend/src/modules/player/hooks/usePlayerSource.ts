@@ -358,9 +358,7 @@ export function usePlayerSource(
             if (outcome.kind === 'unsupported') {
               // 本设备没有 MSE/MMS：管线根本不可能运行，给平台级说明而非开关引导
               onPlaybackErrorRef.current?.(
-                new Error(
-                  unsupportedPipelineMessage()
-                )
+                new Error(unsupportedPipelineMessage())
               )
             } else if (outcome.kind === 'disabled') {
               // 引擎被两级开关禁用：无回退路径，提示开启引导
@@ -646,10 +644,7 @@ export function usePlayerSource(
             )
             const outcome = await attachPlaysVideoFallback(video, source)
             if (outcome.kind === 'unsupported') {
-              throw new Error(
-                unsupportedPipelineMessage(),
-                { cause: err }
-              )
+              throw new Error(unsupportedPipelineMessage(), { cause: err })
             }
             if (outcome.kind === 'disabled') {
               // 引擎被两级开关禁用（系统级/影片级任一关闭）：尊重用户
@@ -768,9 +763,7 @@ export function usePlayerSource(
         !shouldUsePlaysVideo(source)
       ) {
         if (pipelineNeeded && !isPlaysVideoSupported()) {
-          throw new Error(
-            unsupportedPipelineMessage()
-          )
+          throw new Error(unsupportedPipelineMessage())
         }
         throw new Error(getUnsupportedFormatMessage(source.format))
       }

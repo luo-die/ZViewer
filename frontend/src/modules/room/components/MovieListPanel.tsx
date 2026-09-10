@@ -19,11 +19,6 @@ import { message } from '@/components/ui/message'
 import { useSocket } from '@/hooks/useSocket'
 import { useRoomStore, type Movie } from '@/store/roomStore'
 import { fetchTranscodeCapability } from '@/modules/player/services/server-transcode'
-import { useSystemSettingsStore } from '@/store/systemSettingsStore'
-import {
-  usePlaysvideoLocalOverride,
-  setPlaysvideoLocalOverride,
-} from '@/modules/player/playsvideo-preference'
 import {
   resolveBilibiliWithOptions,
   filterQualitiesByVip,
@@ -97,7 +92,6 @@ export function MovieListPanel({
   const triggerViewerSourceReload = useRoomStore(
     (state) => state.triggerViewerSourceReload
   )
-  const triggerEngineReload = useRoomStore((state) => state.triggerEngineReload)
   const triggerMovieReload = useRoomStore((state) => state.triggerMovieReload)
   const viewerCliResolvedSource = useRoomStore(
     (state) => state.viewerCliResolvedSource
@@ -130,25 +124,15 @@ export function MovieListPanel({
     }
   }
 
-  // ===== 转码方式（一个控件，三档）=====
-  // 合并了原来的「浏览器转码引擎」与「服务端转码」两个开关：
+  // ===== 转码方式（房间级状态，房主可切、观众只读展示）=====
   // - auto  ：浏览器端重封装/转码（零服务器开销，默认）
   // - server：服务端 ffmpeg 转 HLS（兼容性最好，iOS 也能看 MKV/DTS）
-  //           **房间级、仅房主可改**，开启后重新解析并广播，全房间生效
-  // - off   ：强制原生直连（MKV/DTS 等会黑屏/无声，本机调试用）
-  const playsvideoOverride = usePlaysvideoLocalOverride()
-  const systemPlaysvideoEnabled = useSystemSettingsStore(
-    (state) => state.playsvideoEnabled !== false
-  )
+  // 本机不再提供「自己切换」的选项：观众界面只显示当前生效的方式，
+  // 由房主的房间设置同步而来（进房 ack + room-settings-updated 广播）。
   const roomTranscodeMode = useRoomStore(
     (state) => state.roomSettings.transcodeMode
   )
-  const currentMovie = movies.find((m) => m.id === currentMovieId)
-  // 浏览器端引擎是否启用（本机偏好优先，未设置时跟随影片级开关）
-  const engineEnabled =
-    playsvideoOverride !== null
-      ? playsvideoOverride === 'on'
-      : currentMovie?.playsvideoEnabled !== false
+  const setRoomSettings = useRoomStore((state) => state.setRoomSettings)
 
   const [serverTranscodeAvailable, setServerTranscodeAvailable] =
     useState(false)
@@ -162,57 +146,38 @@ export function MovieListPanel({
     }
   }, [])
 
-  /** 当前档位：服务端（房主设置）优先，其次看本机是否关掉了浏览器端引擎 */
-  const transcodeChoice: 'auto' | 'server' | 'off' =
+  /** 当前生效的转码方式（房主设置；服务端不可用时按自动处理） */
+  const serverModeActive =
     roomTranscodeMode === 'server' && serverTranscodeAvailable
-      ? 'server'
-      : engineEnabled
-        ? 'auto'
-        : 'off'
 
+  /**
+   * 房主切换转码方式。
+   *
+   * 必须等后端 ack 并**先写入本地 store 再重新解析**：早期实现是先 emit
+   * 再立刻 triggerMovieReload，此时 store 里还是旧值（auto），
+   * resolveMovieSource 解析出来的仍是原片源，结果房主自己没切过去、
+   * 观众（尤其 iPhone）自然依旧播不了。
+   */
   const handleSelectTranscode = (value: string) => {
-    if (value === 'server') {
-      if (!isHost) {
-        message.info('服务端转码由房主开启（占用的是房主的服务器资源）')
-        return
-      }
-      socket?.emit(
-        'update-room-settings',
-        { roomId, transcodeMode: 'server' },
-        (res: { success?: boolean; message?: string }) => {
-          if (!res?.success) {
-            message.error(res?.message || '开启服务端转码失败')
-          }
+    if (!isHost) return
+    const next: 'auto' | 'server' = value === 'server' ? 'server' : 'auto'
+    socket?.emit(
+      'update-room-settings',
+      { roomId, transcodeMode: next },
+      (res: { success?: boolean; message?: string }) => {
+        if (!res?.success) {
+          message.error(res?.message || '切换转码方式失败')
+          return
         }
-      )
-      // 房间级设置由后端广播回来，这里只负责本机偏好归位 + 重新解析
-      setPlaysvideoLocalOverride(null)
-      if (currentMovieId != null) triggerMovieReload()
-      message.success(
-        '已切换为服务端转码（服务器 ffmpeg 转 HLS，全房间生效；iOS 也能看 MKV/DTS）'
-      )
-      return
-    }
-
-    if (value === 'auto') {
-      if (isHost && roomTranscodeMode === 'server') {
-        socket?.emit('update-room-settings', {
-          roomId,
-          transcodeMode: 'auto',
-        })
+        // 先落地本地状态（不等广播回来），再重新解析当前影片并广播给观众
+        setRoomSettings({ transcodeMode: next })
+        if (currentMovieId != null) triggerMovieReload()
+        message.success(
+          next === 'server'
+            ? '已切换为服务端转码：由服务器 ffmpeg 转 HLS，全房间（含 iPhone/iPad）都能播 MKV/DTS'
+            : '已切换为自动转码：MKV/DTS 等在浏览器内重封装/转码，不占服务器'
+        )
       }
-      setPlaysvideoLocalOverride(null)
-      if (currentMovieId != null) triggerMovieReload()
-      message.success('已切换为自动：优先浏览器端重封装/转码（不占服务器）')
-      return
-    }
-
-    // off：不改变房间设置（若房间正开着服务端转码，仅本机无法规避），
-    // 只关掉本机的浏览器端引擎 → 强制原生直连
-    setPlaysvideoLocalOverride('off')
-    if (currentMovieId != null) triggerEngineReload()
-    message.success(
-      '已关闭转码（本机强制原生直连，MKV/DTS 等将无法播放或无声）'
     )
   }
 
@@ -468,11 +433,10 @@ export function MovieListPanel({
         </div>
       )}
 
-      {/* 转码方式（合并了原「浏览器转码引擎」与「服务端转码」两个开关）：
-          - 自动   ：浏览器端重封装/转码，零服务器开销（默认）
-          - 服务端 ：服务器 ffmpeg 转 HLS，兼容性最好（iOS 也能看 MKV/DTS），
-                     房间级设置、仅房主可改，开启后重新解析并广播给全房间
-          - 关闭   ：本机强制原生直连（MKV/DTS 等将黑屏/无声）
+      {/* 转码方式（房间级状态）：房主可切「自动 / 服务端」，观众只读展示。
+          - 自动  ：浏览器端重封装/转码，零服务器开销（默认）
+          - 服务端：服务器 ffmpeg 转 HLS，兼容性最好（iPhone/iPad 也能看 MKV/DTS）
+          本机不再提供自行切换（观众不能悄悄占用房主服务器资源）。
           远程共享模式播放的是 WebRTC 画面流，引擎不参与，隐藏该控件。 */}
       {!isScreenShare && (
         <div
@@ -497,37 +461,45 @@ export function MovieListPanel({
                   color: 'var(--md-sys-color-primary)',
                 }}
                 title={
-                  isHost
-                    ? '「服务端」为房间级设置，全房间生效'
-                    : '「服务端」由房主决定（占用的是房主的服务器资源）'
+                  isHost ? '房间级设置，全房间生效' : '由房主设置，本机只读同步'
                 }
               >
-                {isHost ? '房主可改' : '本机'}
+                {isHost ? '房主可改' : '跟随房主'}
               </span>
             </div>
-            <SegmentedToggle
-              options={[
-                { value: 'auto', label: '自动' },
-                ...(serverTranscodeAvailable && isHost
-                  ? [{ value: 'server', label: '服务端' }]
-                  : []),
-                { value: 'off', label: '关闭' },
-              ]}
-              value={transcodeChoice}
-              onChange={handleSelectTranscode}
-              disabled={
-                !systemPlaysvideoEnabled && transcodeChoice !== 'server'
-              }
-            />
+            {isHost ? (
+              <SegmentedToggle
+                options={[
+                  { value: 'auto', label: '自动' },
+                  ...(serverTranscodeAvailable
+                    ? [{ value: 'server', label: '服务端' }]
+                    : []),
+                ]}
+                value={serverModeActive ? 'server' : 'auto'}
+                onChange={handleSelectTranscode}
+              />
+            ) : (
+              <span
+                className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium"
+                style={{
+                  backgroundColor: serverModeActive
+                    ? 'color-mix(in srgb, var(--md-sys-color-tertiary) 18%, transparent)'
+                    : 'color-mix(in srgb, var(--md-sys-color-primary) 14%, transparent)',
+                  color: serverModeActive
+                    ? 'var(--md-sys-color-tertiary)'
+                    : 'var(--md-sys-color-primary)',
+                }}
+              >
+                {serverModeActive ? '服务端转码' : '自动转码'}
+              </span>
+            )}
           </div>
           <Text type="secondary" className="block text-[10px] leading-snug">
-            {transcodeChoice === 'server'
-              ? '服务端转码：由服务器 ffmpeg 转 HLS，兼容性最好（iPhone/iPad 也能看 MKV/DTS）；消耗服务器 CPU 与带宽，全房间生效。'
-              : transcodeChoice === 'off'
-                ? '已关闭转码：本机强制原生直连，MKV/DTS 等将无法播放或无声。'
-                : serverTranscodeAvailable && isHost
-                  ? '自动：MKV/DTS 等在浏览器内重封装/转码（不占服务器）。与 iOS 设备共享时切到「服务端」。'
-                  : '自动：MKV/DTS 等在浏览器内重封装/转码（不占服务器）。设备不支持时请房主切到「服务端」。'}
+            {serverModeActive
+              ? '服务端转码：房主已开启，由服务器 ffmpeg 转 HLS —— iPhone/iPad 也能看 MKV/DTS（消耗房主的服务器 CPU 与带宽）。'
+              : isHost
+                ? '自动：MKV/DTS 等在浏览器内重封装/转码，不占服务器。要与 iOS 设备共享时切到「服务端」。'
+                : '自动：MKV/DTS 等在浏览器内重封装/转码。若本机播不了（如旧版 iPhone），可请房主切到「服务端」。'}
           </Text>
         </div>
       )}

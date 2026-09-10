@@ -217,6 +217,28 @@ function RoomPage() {
     }
   }, [roomId, socket, setDanmakuMeta])
 
+  // 房间设置广播：房主与**观众都要监听**。
+  // RoomInfoPanel 里也有一份监听，但那个组件只在房主分支渲染——
+  // 观众侧过去拿不到 room-settings-updated，导致「转码方式」显示与实际不符
+  // （房主开了服务端转码，观众界面仍显示自动）。
+  useEffect(() => {
+    if (!roomId || !socket) return
+    const handleRoomSettingsUpdated = (payload: {
+      roomId?: string
+      transcodeMode?: 'auto' | 'server'
+    }) => {
+      if (!payload) return
+      if (payload.roomId && payload.roomId !== roomId) return
+      if (payload.transcodeMode !== undefined) {
+        setRoomSettings({ transcodeMode: payload.transcodeMode })
+      }
+    }
+    socket.on('room-settings-updated', handleRoomSettingsUpdated)
+    return () => {
+      socket.off('room-settings-updated', handleRoomSettingsUpdated)
+    }
+  }, [roomId, socket, setRoomSettings])
+
   // 房主刷新或重连后，重新声明房主身份以恢复 sharer 会话
   useEffect(() => {
     if (!isHost || !roomId || !socket) return

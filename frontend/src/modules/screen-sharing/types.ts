@@ -25,6 +25,8 @@ export interface RequestJoinResponse {
     shareMethod?: 'webrtc' | 'stream-push'
     /** OBS 推流密钥（stream-push 子模式专用） */
     streamKey?: string | null
+    /** 房主设置的转码方式（auto=浏览器端 / server=服务端 ffmpeg），观众端只读 */
+    transcodeMode?: 'auto' | 'server'
     /** 后端检测到当前用户是房间 owner，自动恢复了房主身份 */
     isHost?: boolean
   }

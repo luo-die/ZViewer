@@ -220,6 +220,8 @@ export class ViewerJoinHandler implements SocketEventHandler {
                 mode: room.mode,
                 shareMethod: room.shareMethod,
                 streamKey: room.streamKey,
+                // 转码方式是房主设置的房间级状态，观众端只读展示（自动 / 服务端）
+                transcodeMode: room.transcodeMode ?? 'auto',
               },
             });
           }
@@ -240,6 +242,8 @@ export class ViewerJoinHandler implements SocketEventHandler {
                 mode: room.mode,
                 shareMethod: room.shareMethod,
                 streamKey: room.streamKey,
+                // 转码方式是房主设置的房间级状态，观众端只读展示（自动 / 服务端）
+                transcodeMode: room.transcodeMode ?? 'auto',
                 name: room.name,
               });
 
@@ -279,6 +283,8 @@ export class ViewerJoinHandler implements SocketEventHandler {
                   mode: room.mode,
                   shareMethod: room.shareMethod,
                   streamKey: room.streamKey,
+                  // 转码方式是房主设置的房间级状态，观众端只读展示（自动 / 服务端）
+                  transcodeMode: room.transcodeMode ?? 'auto',
                 },
               });
             }
@@ -295,6 +301,8 @@ export class ViewerJoinHandler implements SocketEventHandler {
               mode: room.mode,
               shareMethod: room.shareMethod,
               streamKey: room.streamKey,
+              // 转码方式是房主设置的房间级状态，观众端只读展示（自动 / 服务端）
+              transcodeMode: room.transcodeMode ?? 'auto',
             },
           });
         } catch (err) {

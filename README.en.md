@@ -91,19 +91,18 @@ The in-browser pipeline needs a way to feed fMP4 segments to `<video>`: either `
 
 > When a device cannot run the in-browser pipeline, the error message names the reason (instead of telling you to flip the "browser transcode engine" switch) and suggests an MP4 (H.264 + AAC) source.
 
-### Transcode mode (one control, host-controlled server transcoding)
+### Transcode mode (room-level: host switches, viewers read-only)
 
-The playlist header has a single **"Transcode mode"** control that merges the former "browser transcode engine" and "server transcode" switches:
+The playlist header has a single **"Transcode mode"** control (merging the former "browser transcode engine" and "server transcode" switches):
 
-| Option | Who can change it | Behaviour |
-|---|---|---|
-| **Auto** (default) | host and viewers (local preference) | MKV / DTS are remuxed/audio-transcoded **in the browser** — **zero server CPU and bandwidth** |
-| **Server** | **host only** (room-level, applies to everyone) | Server ffmpeg produces **HLS**; iPhone/iPad use Safari's native HLS player, so MKV/DTS work even without MSE. Costs server CPU and bandwidth |
-| **Off** | host and viewers (local) | Force native playback; MKV/DTS will not play or will be silent (debugging) |
+| Role | What they see |
+|---|---|
+| **Host** | A two-option switch: **Auto / Server** ("Server" is hidden when ffmpeg is not installed) |
+| **Viewers** | A **read-only status**: `Auto transcode` or `Server transcode`, synced from the host's room setting (join ack + `room-settings-updated` broadcast) |
 
-- **Why keep "Auto"**: browser-side remux/transcode costs the server nothing and is the best path on desktop Chrome/Edge, Android and iPad (MKV, AVI/TS/WMV, DTS/AC3 audio all rely on it). Dropping it would make every MKV/DTS source depend on server ffmpeg plus full relay bandwidth.
-- **Why "Server"**: iPhone before iOS 17.1 has no MSE/ManagedMediaSource, so the browser pipeline cannot run at all. **When the host needs to share with iOS devices**, switching to "Server" makes the whole room (including iPhones) play HLS immediately.
-- Server transcoding is **host-exclusive**: viewers only see "Auto / Off" — it burns the host's server resources and must not be switched on silently by a viewer. When a viewer's device cannot play, the error message tells them to ask the host to switch to "Server".
+- **Auto** (default): MKV / DTS are remuxed/audio-transcoded **in the browser** — **zero server CPU and bandwidth**. This is the cheapest path for desktop Chrome/Edge, Android and iPad.
+- **Server**: server ffmpeg produces **HLS**; iPhone/iPad use Safari's native HLS player, so MKV/DTS work without MSE. **When the host wants to share with iOS devices, switch to this mode**: the host re-resolves the current movie and broadcasts the HLS source, so every member (iPhones included) follows immediately.
+- Viewers have **no** transcoding controls of their own: server transcoding burns the host's CPU and bandwidth and must not be enabled by a viewer. When a viewer's device cannot play, the error message tells them to ask the host to switch to "Server".
 
 #### Server transcode details
 
