@@ -103,6 +103,20 @@ export function isServerTranscodeUrl(url: string | null | undefined): boolean {
 }
 
 /**
+ * 当前客户端最近一次使用的转码会话（用于不再需要时立刻停掉服务端 ffmpeg）。
+ *
+ * 不主动停的话，切影片/切回自动之后旧 ffmpeg 会继续全速转码（没有 -re，
+ * 它会尽快把整个文件跑完），多个进程并存直接把服务器 CPU 吃满。
+ */
+let activeSessionId: string | null = null
+let activeRoomId: string | null = null
+
+/** 当前是否有正在使用的转码会话 */
+export function hasActiveTranscodeSession(): boolean {
+  return activeSessionId !== null
+}
+
+/**
  * 发起（或复用）一次服务端转码会话，返回带鉴权的 HLS 播放列表地址。
  *
  * 不再由前端指定 remux/transcode：源编码（HEVC/AV1/10bit 等）前端常常拿不到，
@@ -112,6 +126,7 @@ export function isServerTranscodeUrl(url: string | null | undefined): boolean {
 export async function createTranscodeSession(opts: {
   movieId: number
   start?: number
+  roomId?: string
 }): Promise<{ sessionId: string; playlistUrl: string }> {
   const res = await apiFetch('/api/transcode/session', {
     method: 'POST',
@@ -127,7 +142,37 @@ export async function createTranscodeSession(opts: {
   if (!res.ok || !data.success || !data.playlistUrl) {
     throw new Error(data.message || '服务端转码会话创建失败')
   }
+  activeSessionId = data.sessionId ?? null
+  activeRoomId = opts.roomId ?? null
   return { sessionId: data.sessionId ?? '', playlistUrl: data.playlistUrl }
+}
+
+/**
+ * 停止指定房间（缺省为当前活跃房间）的全部转码会话。
+ *
+ * 在「切影片 / 切回自动 / 不再使用转码源」时调用，让服务端立刻 kill 旧 ffmpeg。
+ * 幂等、失败静默——服务端还有同房间回收、并发上限与 5 分钟空闲回收兜底。
+ */
+export async function stopRoomTranscodeSessions(
+  roomId?: string
+): Promise<void> {
+  const target = roomId ?? activeRoomId
+  if (!target) return
+  if (activeSessionId === null && !roomId) return
+  try {
+    await apiFetch('/api/transcode/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: target }),
+    })
+  } catch (err) {
+    console.warn(
+      '[server-transcode] 停止转码会话失败（服务端会兜底回收）:',
+      err
+    )
+  }
+  activeSessionId = null
+  activeRoomId = null
 }
 
 /**

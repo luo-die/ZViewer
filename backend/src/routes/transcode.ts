@@ -7,7 +7,9 @@
  *
  * 端点（全部需要登录态，媒体请求可带 `?token=`）：
  * - GET    /api/transcode/capability              探测本机 ffmpeg 是否可用
+ * - GET    /api/transcode/sessions                当前会话概览（诊断残留转码进程）
  * - POST   /api/transcode/session                 创建/复用转码会话，返回 playlistUrl
+ * - POST   /api/transcode/stop                    停止本房间的全部会话（切影片/切回自动时调用）
  * - GET    /api/transcode/:sessionId/index.m3u8   等待并返回播放列表（URI 已改写为绝对地址）
  * - GET    /api/transcode/:sessionId/:segment     返回 fmp4 分片 / init.mp4（支持 Range）
  * - DELETE /api/transcode/:sessionId              立即停止并清理会话
@@ -18,8 +20,9 @@
  *   既有代码处理，转码模块不需要再实现一遍源适配。
  * - 该内部请求需要鉴权，故服务端用 `generateTokens` 为当前用户现签一个短期
  *   access token 拼进内部 URL（auth 中间件接受 `?token=`）。
- * - 分片/播放列表端点由浏览器反复拉取，因此 sessionKey 相同的重复请求复用同一个
- *   ffmpeg 进程，空闲 15 分钟才回收。
+ * - 生命周期：同一「影片+起点」的重复请求复用同一个 ffmpeg 进程；**同房间
+ *   新建会话会停掉该房间的旧会话**（切影片/拖进度/切回自动都不再留残留进程），
+ *   并有并发上限与 5 分钟空闲回收兜底。
  */
 import { Router, type Response } from 'express';
 import fs from 'node:fs';
@@ -36,7 +39,9 @@ import {
 import {
   createSession,
   getSession,
+  listSessions,
   stopSession,
+  stopSessionsForRoom,
   touchSession,
   type TranscodeMode,
   type TranscodeSession,
@@ -230,11 +235,17 @@ router.get('/capability', async (_req: AuthenticatedRequest, res: Response): Pro
 });
 
 // ==================== POST /session ====================
-// body: { movieId: number, mode?: 'auto' | 'remux' | 'transcode', start?: number }
+// body: { movieId: number, mode?: 'auto' | 'remux' | 'transcode', start?: number, roomId?: string }
 // mode 缺省/auto：由服务端 ffprobe 探测源视频编码决定（HEVC/AV1/10bit → 真转码）
+// roomId：归属房间；同房间新建会话会停掉该房间的旧会话（避免残留 ffmpeg 吃满 CPU）
 router.post('/session', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const body = (req.body ?? {}) as { movieId?: unknown; mode?: unknown; start?: unknown };
+    const body = (req.body ?? {}) as {
+      movieId?: unknown;
+      mode?: unknown;
+      start?: unknown;
+      roomId?: unknown;
+    };
 
     const movieId = parsePositiveNumber(body.movieId);
     if (movieId === null) {
@@ -245,6 +256,10 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
     // 仅显式指定 remux/transcode 时透传，其余（缺省/auto/非法值）交给服务端探测
     const requestedMode: 'remux' | 'transcode' | null =
       body.mode === 'remux' || body.mode === 'transcode' ? body.mode : null;
+    const roomKey =
+      typeof body.roomId === 'string' && body.roomId.trim()
+        ? body.roomId.trim()
+        : undefined;
     const start = parsePositiveNumber(body.start) ?? 0;
 
     const movie = await AppDataSource.getRepository(Movie).findOneBy({ id: movieId });
@@ -301,6 +316,9 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
       startTime: start,
       // key 不含 mode：模式由服务端探测决定，同一影片+起点只应有一个会话
       sessionKey: `${movie.id}:${start}`,
+      // 归属房间：同房间新建会话会回收旧会话（切影片不再残留 ffmpeg）
+      ownerKey: roomKey,
+      movieId: movie.id,
     });
 
     res.json({
@@ -322,6 +340,33 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
     console.error('[transcode] create session error:', err);
     res.status(500).json({ success: false, message: '创建转码会话失败' });
   }
+});
+
+// ==================== POST /stop ====================
+// body: { roomId: string }
+// 停止某房间的全部转码会话：客户端在「切影片 / 切回自动 / 离开房间」时调用，
+// 避免旧 ffmpeg 继续全速转码把 CPU 吃满（服务端同房间回收与空闲回收是兜底）。
+router.post('/stop', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const body = (req.body ?? {}) as { roomId?: unknown };
+    const roomKey = typeof body.roomId === 'string' ? body.roomId.trim() : '';
+    if (!roomKey) {
+      res.status(400).json({ success: false, message: '缺少 roomId' });
+      return;
+    }
+    const stopped = await stopSessionsForRoom(roomKey);
+    console.log(`[transcode] 主动停止房间 ${roomKey} 的转码会话：${stopped} 个`);
+    res.json({ success: true, stopped });
+  } catch (err) {
+    console.error('[transcode] stop room sessions error:', err);
+    res.status(500).json({ success: false, message: '停止转码会话失败' });
+  }
+});
+
+// ==================== GET /sessions ====================
+// 当前会话概览：排查「后台残留转码进程」用（含是否运行中与空闲时长）
+router.get('/sessions', (_req: AuthenticatedRequest, res: Response): void => {
+  res.json({ success: true, sessions: listSessions() });
 });
 
 // ==================== GET /:sessionId/index.m3u8 ====================

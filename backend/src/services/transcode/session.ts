@@ -61,6 +61,10 @@ export interface TranscodeSession {
   stderrBuffer: string;
   /** 是否已被服务端主动停止（主动停止不算失败，避免误报错误日志）。 */
   stopped: boolean;
+  /** 归属键（房间 ID）：同房间新建会话时用于回收旧会话。 */
+  ownerKey?: string;
+  /** 影片 ID（仅用于日志与诊断）。 */
+  movieId?: number;
 }
 
 export interface CreateSessionOptions {
@@ -70,18 +74,42 @@ export interface CreateSessionOptions {
   mode?: TranscodeMode;
   /** 起点（秒），> 0 时以 `-ss` 输入定位。 */
   startTime?: number;
-  /** 去重键：调用方按「影片 + 模式 + 起点」生成。 */
+  /** 去重键：调用方按「影片 + 起点」生成。 */
   sessionKey: string;
+  /**
+   * 归属键（房间 ID）。
+   *
+   * 同一房间新建会话时会**停掉该房间的其它会话**——否则「切影片 / 拖进度 /
+   * 切回自动」后旧 ffmpeg 仍在全速转码，多个进程叠加直接把 CPU 吃满。
+   */
+  ownerKey?: string;
+  /** 影片 ID（仅用于日志与诊断）。 */
+  movieId?: number;
 }
 
 /** 转码输出根目录：与其它运行时数据一起放在 config/ 下，升级时整体保留。 */
 const TRANSCODE_ROOT = path.join(CONFIG_DIR, 'transcode');
 
-/** 空闲回收阈值：15 分钟无任何分片/播放列表请求即回收。 */
-const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+/**
+ * 空闲回收阈值：5 分钟无任何分片/播放列表请求即回收。
+ *
+ * 播放中的客户端会持续请求播放列表（hls.js / Safari 原生 HLS 都会周期性
+ * 刷新），因此 5 分钟没有任何请求 = 已经没人在看。旧值 15 分钟太长，
+ * 期间 ffmpeg 仍在全速转码（无 -re，会尽快跑完整个文件），是「后台一堆
+ * 转码进程」的主要来源。
+ */
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** 空闲扫描间隔：2 分钟一次（unref，不影响进程退出）。 */
-const CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
+/** 空闲扫描间隔：30 秒一次（unref，不影响进程退出）。 */
+const CLEANUP_INTERVAL_MS = 30 * 1000;
+
+/**
+ * 同时运行的转码会话上限（安全阀）。
+ *
+ * 正常情况下一台服务器同时只服务少量房间；超过上限时停掉「最久未被访问」
+ * 的会话，避免异常场景（多房间同播、客户端反复重建会话）把 CPU 打满。
+ */
+const MAX_CONCURRENT_SESSIONS = 4;
 
 /** 诊断信息保留的 stderr 行数。 */
 const STDERR_TAIL_LINES = 20;
@@ -410,6 +438,35 @@ export async function createSession(opts: CreateSessionOptions): Promise<Transco
     await stopSession(staleId);
   }
 
+  // 2.1 同房间的其它会话一律停掉。
+  // 关键修复：切影片 / 拖进度 / 切回自动之后，旧 ffmpeg 仍在全速转码
+  // （没有 -re，它会尽快把整个文件跑完），多个进程叠加直接把 CPU 吃满。
+  if (opts.ownerKey) {
+    for (const other of [...sessions.values()]) {
+      if (other.ownerKey !== opts.ownerKey) continue;
+      if (other.id === staleId) continue;
+      console.log(
+        `[transcode] 房间 ${opts.ownerKey} 新建会话，回收同房间旧会话 ${other.id}（影片 ${other.movieId ?? '-'}）`,
+      );
+      await stopSession(other.id);
+    }
+  }
+
+  // 2.2 并发上限安全阀：超限时停掉「最久未被访问」的会话
+  const running = [...sessions.values()].filter(
+    (s) => s.process !== null && !s.finished && !s.stopped,
+  );
+  if (running.length >= MAX_CONCURRENT_SESSIONS) {
+    running.sort((a, b) => a.lastAccessAt - b.lastAccessAt);
+    const victims = running.slice(0, running.length - MAX_CONCURRENT_SESSIONS + 1);
+    for (const victim of victims) {
+      console.warn(
+        `[transcode] 并发已达上限 ${MAX_CONCURRENT_SESSIONS}，回收最久未访问的会话 ${victim.id}`,
+      );
+      await stopSession(victim.id);
+    }
+  }
+
   // 3. ffmpeg 必须可用（路由层已提前判断并返回 503，这里只是兜底）
   const ffmpegPath = await resolveFfmpegPath();
   if (!ffmpegPath) {
@@ -437,6 +494,8 @@ export async function createSession(opts: CreateSessionOptions): Promise<Transco
     errorTail: [],
     stderrBuffer: '',
     stopped: false,
+    ownerKey: opts.ownerKey,
+    movieId: opts.movieId,
   };
 
   const args = buildArgs({ inputUrl: opts.inputUrl, mode, startTime, dir, playlistPath });
@@ -513,6 +572,45 @@ export async function stopSession(id: string): Promise<boolean> {
   await waitForExit(child, 2000);
   await removeDirWithRetry(session.dir);
   return true;
+}
+
+/**
+ * 停止某个房间的全部转码会话（含已结束但目录仍在的）。
+ *
+ * 客户端在「切影片 / 切回自动 / 离开房间」时主动调用，避免旧 ffmpeg
+ * 继续空转；服务端的同房间回收与空闲回收是兜底。
+ */
+export async function stopSessionsForRoom(roomKey: string): Promise<number> {
+  const targets = [...sessions.values()].filter((s) => s.ownerKey === roomKey);
+  for (const target of targets) {
+    console.log(`[transcode] 主动回收房间 ${roomKey} 的会话 ${target.id}`);
+    await stopSession(target.id);
+  }
+  return targets.length;
+}
+
+/** 当前会话概览（诊断用；供日志/接口查看是否有残留转码进程）。 */
+export function listSessions(): {
+  id: string;
+  movieId?: number;
+  ownerKey?: string;
+  mode: TranscodeMode;
+  running: boolean;
+  finished: boolean;
+  failed: boolean;
+  idleMs: number;
+}[] {
+  const now = Date.now();
+  return [...sessions.values()].map((s) => ({
+    id: s.id,
+    movieId: s.movieId,
+    ownerKey: s.ownerKey,
+    mode: s.mode,
+    running: s.process !== null && !s.finished && !s.stopped,
+    finished: s.finished,
+    failed: s.failed,
+    idleMs: now - s.lastAccessAt,
+  }));
 }
 
 /** 清理全部会话（进程退出时调用）。 */

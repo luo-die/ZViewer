@@ -16,13 +16,16 @@ import { extractBvid, resolveBilibiliViaCli } from '@/modules/bilibili/cliApi'
 import { useCliAgentStore } from '@/store/cliAgentStore'
 import { getBilibiliParseOptions } from '@/modules/bilibili/parseOptions'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
+import { useRoomStore } from '@/store/roomStore'
 import type { QualityOption } from './resolveSource'
 import { buildServerFileProxyUrl } from '@/modules/server-files/serverFilesApi'
 import { appendAuthToken } from '@/modules/player/services/url-proxy'
 import {
   createTranscodeSession,
   fetchTranscodeCapability,
+  hasActiveTranscodeSession,
   shouldUseServerTranscode,
+  stopRoomTranscodeSessions,
 } from '@/modules/player/services/server-transcode'
 import {
   resolveAniSubsEpisode,
@@ -420,6 +423,7 @@ export async function resolveMovieSource({
   // 产出后端 ffmpeg 的 HLS 播放列表——桌面走 hls.js，iPhone 走 Safari
   // 原生 HLS，因此不需要 MediaSource 也能播 MKV / DTS 这类源。
   // 房主开启后本函数解析出 HLS 源并随状态广播给全房间。
+  const roomId = useRoomStore.getState().roomId
   await fetchTranscodeCapability()
   if (shouldUseServerTranscode()) {
     try {
@@ -427,10 +431,12 @@ export async function resolveMovieSource({
       const rawStart = recovery?.currentTime ?? 0
       const start = rawStart > 60 ? Math.floor(rawStart / 30) * 30 : undefined
       // 模式（remux / transcode）交由服务端 ffprobe 探测决定：
-      // 源是 HEVC/AV1/10bit 时必须真转码，否则安卓等设备依旧只有声音没画面
+      // 源是 HEVC/AV1/10bit 时必须真转码，否则安卓等设备依旧只有声音没画面。
+      // roomId 让服务端新建会话时回收本房间旧会话，避免残留 ffmpeg 空转。
       const { playlistUrl } = await createTranscodeSession({
         movieId: movie.id,
         start,
+        roomId,
       })
       console.info(
         `[movie-source-resolver] 使用服务端转码${start ? `（起点 ${start}s）` : ''}`
@@ -453,6 +459,11 @@ export async function resolveMovieSource({
         err
       )
     }
+  } else if (hasActiveTranscodeSession()) {
+    // 本次不再需要服务端转码（切回自动 / 换成原生可播的片源）：
+    // 立刻让服务端 kill 旧 ffmpeg，否则它会继续全速转码直到把整个文件跑完
+    console.info('[movie-source-resolver] 不再使用服务端转码，停止房间转码会话')
+    void stopRoomTranscodeSessions(roomId)
   }
 
   // 非 B站 源：直接使用影片记录字段（Movie 类型不含 headers，见 roomStore）
