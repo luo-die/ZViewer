@@ -47,6 +47,12 @@ export interface RoomSettings {
   password: string | null
   maxViewers: number
   requireApproval: boolean
+  /**
+   * 转码方式（房主设置，全房间生效）：
+   * - 'auto'（默认）：浏览器端重封装/转码，不占服务器 CPU/带宽；
+   * - 'server'：服务器 ffmpeg 转 HLS，兼容性最好（iOS 也能看 MKV/DTS）。
+   */
+  transcodeMode: 'auto' | 'server'
 }
 
 export type MovieSourceType =
@@ -418,6 +424,7 @@ const defaultState = {
     password: null as string | null,
     maxViewers: 10,
     requireApproval: true,
+    transcodeMode: 'auto' as 'auto' | 'server',
   } as RoomSettings,
   isSharing: false,
   isPaused: false,

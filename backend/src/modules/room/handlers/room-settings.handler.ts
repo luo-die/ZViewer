@@ -39,6 +39,8 @@ interface UpdateRoomSettingsPayload {
   password?: string | null;
   maxViewers?: number;
   requireApproval?: boolean;
+  /** 转码方式（房主设置，全房间生效） */
+  transcodeMode?: 'auto' | 'server';
 }
 
 /** p2p-mode-change 事件 payload */
@@ -178,6 +180,19 @@ export class RoomSettingsHandler implements SocketEventHandler {
           if (typeof payload.requireApproval === 'boolean') {
             room.requireApproval = payload.requireApproval;
           }
+          // 转码方式：房主决定本房间是否启用服务端转码（观众无权修改）
+          if (payload.transcodeMode !== undefined) {
+            if (
+              payload.transcodeMode !== 'auto' &&
+              payload.transcodeMode !== 'server'
+            ) {
+              return safeAck(callback, {
+                success: false,
+                message: '转码方式必须是 auto / server',
+              });
+            }
+            room.transcodeMode = payload.transcodeMode;
+          }
           await roomRepo.save(room);
 
           // 广播给房间内所有成员，前端 roomStore 同步
@@ -185,6 +200,7 @@ export class RoomSettingsHandler implements SocketEventHandler {
             password: room.password,
             maxViewers: room.maxViewers,
             requireApproval: room.requireApproval,
+            transcodeMode: room.transcodeMode,
           });
 
           return safeAck(callback, { success: true });

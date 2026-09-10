@@ -50,6 +50,7 @@ import {
   isPlaysVideoSupported,
 } from '@/modules/player/engines/playsvideo-engine'
 import { isIOSDevice } from '@/lib/fullscreen-utils'
+import { buildDeviceUnsupportedMessage } from '@/modules/player/services/server-transcode'
 
 import {
   isBrowserPlayableFormat,
@@ -91,18 +92,11 @@ const FIRST_FRAME_TIMEOUT_MS = 12_000
 /**
  * 设备不具备浏览器端转码能力时的说明文案。
  *
- * iPhone 17.1 以下是原理性缺失（没有 MSE / ManagedMediaSource），
- * 必须让用户知道「换片源」或「换设备/浏览器」才是出路，
- * 而不是反复去拨「浏览器转码引擎」开关。
+ * 服务端转码现在是「房主控制的房间级设置」，因此指引是
+ * 「请房主把转码方式切到服务端」，而不是让观众自己去找开关。
  */
-function unsupportedPipelineMessage(reason: string): string {
-  const iosHint = isIOSDevice()
-    ? 'iPhone/iPad 需 iOS 17.1 及以上才支持浏览器端转码'
-    : '请改用 Chrome / Edge 等支持 MediaSource 的浏览器'
-  return (
-    `${reason}。该片源需要浏览器端重封装/转码才能播放（如 MKV 容器、DTS/AC3 音轨）。` +
-    `${iosHint}；若无法升级，请改用 MP4（H.264 + AAC）片源。`
-  )
+function unsupportedPipelineMessage(): string {
+  return buildDeviceUnsupportedMessage()
 }
 
 /**
@@ -365,7 +359,7 @@ export function usePlayerSource(
               // 本设备没有 MSE/MMS：管线根本不可能运行，给平台级说明而非开关引导
               onPlaybackErrorRef.current?.(
                 new Error(
-                  unsupportedPipelineMessage(describePlaysVideoSupport())
+                  unsupportedPipelineMessage()
                 )
               )
             } else if (outcome.kind === 'disabled') {
@@ -653,7 +647,7 @@ export function usePlayerSource(
             const outcome = await attachPlaysVideoFallback(video, source)
             if (outcome.kind === 'unsupported') {
               throw new Error(
-                unsupportedPipelineMessage(describePlaysVideoSupport()),
+                unsupportedPipelineMessage(),
                 { cause: err }
               )
             }
@@ -775,13 +769,13 @@ export function usePlayerSource(
       ) {
         if (pipelineNeeded && !isPlaysVideoSupported()) {
           throw new Error(
-            unsupportedPipelineMessage(describePlaysVideoSupport())
+            unsupportedPipelineMessage()
           )
         }
         throw new Error(getUnsupportedFormatMessage(source.format))
       }
       if (pipelineNeeded && !isPlaysVideoSupported()) {
-        throw new Error(unsupportedPipelineMessage(describePlaysVideoSupport()))
+        throw new Error(unsupportedPipelineMessage())
       }
       if (source.format === 'flv' && !isPlaysVideoSupported()) {
         // FLV 拉流（OBS 推流模式）同样依赖 MSE，iPhone 上必然失败：

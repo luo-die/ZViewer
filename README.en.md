@@ -91,17 +91,26 @@ The in-browser pipeline needs a way to feed fMP4 segments to `<video>`: either `
 
 > When a device cannot run the in-browser pipeline, the error message names the reason (instead of telling you to flip the "browser transcode engine" switch) and suggests an MP4 (H.264 + AAC) source.
 
-### Server-side transcode (optional, requires ffmpeg on the server)
+### Transcode mode (one control, host-controlled server transcoding)
 
-Sources the browser genuinely cannot handle (iPhone before iOS 17.1 without MSE, HEVC, DTS audio, …) can be handled by the server:
+The playlist header has a single **"Transcode mode"** control that merges the former "browser transcode engine" and "server transcode" switches:
 
-- The backend uses **ffmpeg** to remux/transcode the source into **HLS**; the frontend keeps playing it with hls.js, and **iOS uses Safari's native HLS player**, so no MediaSource is required.
-- Two modes: `remux` (video passthrough, almost no CPU) and `transcode` (re-encode to H.264 when the browser cannot decode the video codec); audio is always converted to AAC.
-- Trigger: automatically when the device cannot run the in-browser pipeline and the source needs remuxing/transcoding, or manually via the **"Server transcode"** switch in the playlist (local to your browser; the current movie is re-resolved immediately).
-- Segments are written to `config/transcode/<session id>/` and reclaimed automatically after 15 minutes idle (process + directory); everything is cleaned up on shutdown.
-- **Install ffmpeg**: put it on `PATH`, or point the `FFMPEG_PATH` environment variable at the binary. Without it the switch is hidden, and the API answers 503 with an installation hint.
+| Option | Who can change it | Behaviour |
+|---|---|---|
+| **Auto** (default) | host and viewers (local preference) | MKV / DTS are remuxed/audio-transcoded **in the browser** — **zero server CPU and bandwidth** |
+| **Server** | **host only** (room-level, applies to everyone) | Server ffmpeg produces **HLS**; iPhone/iPad use Safari's native HLS player, so MKV/DTS work even without MSE. Costs server CPU and bandwidth |
+| **Off** | host and viewers (local) | Force native playback; MKV/DTS will not play or will be silent (debugging) |
 
-> Note: forward seeking is limited by ffmpeg producing segments sequentially — jumping past the produced point waits for ffmpeg to catch up. Sessions are reused by "movie + mode + start (rounded to 30 s)", so everyone in a room shares one transcode. Server-side transcoding costs server CPU and bandwidth, so enable it only when needed.
+- **Why keep "Auto"**: browser-side remux/transcode costs the server nothing and is the best path on desktop Chrome/Edge, Android and iPad (MKV, AVI/TS/WMV, DTS/AC3 audio all rely on it). Dropping it would make every MKV/DTS source depend on server ffmpeg plus full relay bandwidth.
+- **Why "Server"**: iPhone before iOS 17.1 has no MSE/ManagedMediaSource, so the browser pipeline cannot run at all. **When the host needs to share with iOS devices**, switching to "Server" makes the whole room (including iPhones) play HLS immediately.
+- Server transcoding is **host-exclusive**: viewers only see "Auto / Off" — it burns the host's server resources and must not be switched on silently by a viewer. When a viewer's device cannot play, the error message tells them to ask the host to switch to "Server".
+
+#### Server transcode details
+
+- Two modes are chosen automatically: `remux` (video passthrough, almost no CPU) and `transcode` (re-encode to H.264 when the browser cannot decode the video codec); audio is always converted to AAC.
+- Segments go to `config/transcode/<session id>/`, reclaimed after 15 minutes idle (process + directory) and cleaned up on shutdown; sessions are reused by "movie + mode + start (rounded to 30 s)".
+- **Install ffmpeg**: put it on `PATH`, or point `FFMPEG_PATH` at the binary. Without it the "Server" option is hidden and the API answers 503 with an installation hint.
+- Forward seeking is limited by ffmpeg producing segments sequentially.
 
 ### Real-Time Interaction
 

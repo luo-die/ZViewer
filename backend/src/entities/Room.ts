@@ -60,6 +60,18 @@ export class Room {
   @Column({ type: 'boolean', default: false })
   requireApproval!: boolean;
 
+  /**
+   * 转码方式（房主设置，全房间生效）：
+   * - auto（默认）：走浏览器端重封装/转码（不占服务器 CPU/带宽）；
+   *   设备不支持时该片源直接失败，并提示房主开启服务端转码；
+   * - server：由服务器 ffmpeg 转为 HLS 播放，兼容性最好
+   *   （iPhone 等没有 MSE 的设备也能看 MKV/DTS），代价是服务器 CPU 与带宽。
+   *
+   * 仅房主可通过 update-room-settings 修改；观众端只读。
+   */
+  @Column({ type: 'simple-enum', enum: ['auto', 'server'], default: 'auto' })
+  transcodeMode!: 'auto' | 'server';
+
   @Column({ type: 'integer', nullable: true })
   ownerUserId!: number | null;
 

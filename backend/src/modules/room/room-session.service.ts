@@ -147,6 +147,8 @@ export class RoomSessionService {
     name: string | null;
     streamKey: string | null;
     requireApproval: boolean;
+    /** 房主设置的转码方式（auto=浏览器端 / server=服务端 ffmpeg） */
+    transcodeMode: 'auto' | 'server';
     playback?: ReturnType<typeof roomStateService.getPlayback>;
   } | null> {
     const roomRepo = AppDataSource.getRepository(Room);
@@ -208,6 +210,7 @@ export class RoomSessionService {
       name: room.name,
       streamKey: room.streamKey,
       requireApproval: room.requireApproval,
+      transcodeMode: room.transcodeMode ?? 'auto',
       playback: advancedPlayback ?? roomStateService.getPlayback(roomId),
     };
   }

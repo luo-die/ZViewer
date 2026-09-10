@@ -1,7 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import {
   Play,
-  Server,
   Trash2,
   Film,
   Monitor,
@@ -14,15 +13,12 @@ import { Input } from '@/components/ui/Input'
 import { Text, Paragraph } from '@/components/ui/Typography'
 import { Tag } from '@/components/ui/Tag'
 import { Select } from '@/components/ui/Select'
+import { SegmentedToggle } from '@/components/ui/SegmentedToggle'
 import { Modal } from '@/components/ui/Modal'
 import { message } from '@/components/ui/message'
 import { useSocket } from '@/hooks/useSocket'
 import { useRoomStore, type Movie } from '@/store/roomStore'
-import {
-  fetchTranscodeCapability,
-  setServerTranscodeOverride,
-  useServerTranscodeOverride,
-} from '@/modules/player/services/server-transcode'
+import { fetchTranscodeCapability } from '@/modules/player/services/server-transcode'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
 import {
   usePlaysvideoLocalOverride,
@@ -134,36 +130,26 @@ export function MovieListPanel({
     }
   }
 
-  // 浏览器转码引擎（playsvideo）：本机偏好，只存 localStorage，
-  // 面向所有观看者开放（不区分房主/房管/观众），切换后不影响其他人。
+  // ===== 转码方式（一个控件，三档）=====
+  // 合并了原来的「浏览器转码引擎」与「服务端转码」两个开关：
+  // - auto  ：浏览器端重封装/转码（零服务器开销，默认）
+  // - server：服务端 ffmpeg 转 HLS（兼容性最好，iOS 也能看 MKV/DTS）
+  //           **房间级、仅房主可改**，开启后重新解析并广播，全房间生效
+  // - off   ：强制原生直连（MKV/DTS 等会黑屏/无声，本机调试用）
   const playsvideoOverride = usePlaysvideoLocalOverride()
   const systemPlaysvideoEnabled = useSystemSettingsStore(
     (state) => state.playsvideoEnabled !== false
   )
+  const roomTranscodeMode = useRoomStore(
+    (state) => state.roomSettings.transcodeMode
+  )
   const currentMovie = movies.find((m) => m.id === currentMovieId)
-  // 开关展示「当前生效状态」：本机偏好优先，未设置时跟随当前影片的影片级开关
+  // 浏览器端引擎是否启用（本机偏好优先，未设置时跟随影片级开关）
   const engineEnabled =
     playsvideoOverride !== null
       ? playsvideoOverride === 'on'
       : currentMovie?.playsvideoEnabled !== false
 
-  const handleToggleEngine = () => {
-    const next: 'on' | 'off' = engineEnabled ? 'off' : 'on'
-    setPlaysvideoLocalOverride(next)
-    // 正在播放的影片立即按新选择重新 attach（仅本机，不同步）
-    if (currentMovieId != null) triggerEngineReload()
-    message.success(
-      next === 'on'
-        ? '已启用浏览器转码引擎（仅本机生效）'
-        : '已关闭浏览器转码引擎（仅本机，强制原生直连）'
-    )
-  }
-
-  // 服务端转码（ffmpeg → HLS）：本机偏好，只在后端具备 ffmpeg 时展示。
-  // 与浏览器转码引擎不同，它会改变源地址（本地文件 → 后端 HLS 播放列表），
-  // 因此切换后要触发「重新解析当前影片」而不是单纯重新 attach。
-  const serverTranscodeOverride = useServerTranscodeOverride()
-  const serverTranscodeEnabled = serverTranscodeOverride === 'on'
   const [serverTranscodeAvailable, setServerTranscodeAvailable] =
     useState(false)
   useEffect(() => {
@@ -176,15 +162,57 @@ export function MovieListPanel({
     }
   }, [])
 
-  const handleToggleServerTranscode = () => {
-    const next: 'on' | 'off' = serverTranscodeEnabled ? 'off' : 'on'
-    setServerTranscodeOverride(next)
-    // 重新解析当前影片：源地址会随之在本地直链与后端 HLS 之间切换
-    if (currentMovieId != null) triggerMovieReload()
+  /** 当前档位：服务端（房主设置）优先，其次看本机是否关掉了浏览器端引擎 */
+  const transcodeChoice: 'auto' | 'server' | 'off' =
+    roomTranscodeMode === 'server' && serverTranscodeAvailable
+      ? 'server'
+      : engineEnabled
+        ? 'auto'
+        : 'off'
+
+  const handleSelectTranscode = (value: string) => {
+    if (value === 'server') {
+      if (!isHost) {
+        message.info('服务端转码由房主开启（占用的是房主的服务器资源）')
+        return
+      }
+      socket?.emit(
+        'update-room-settings',
+        { roomId, transcodeMode: 'server' },
+        (res: { success?: boolean; message?: string }) => {
+          if (!res?.success) {
+            message.error(res?.message || '开启服务端转码失败')
+          }
+        }
+      )
+      // 房间级设置由后端广播回来，这里只负责本机偏好归位 + 重新解析
+      setPlaysvideoLocalOverride(null)
+      if (currentMovieId != null) triggerMovieReload()
+      message.success(
+        '已切换为服务端转码（服务器 ffmpeg 转 HLS，全房间生效；iOS 也能看 MKV/DTS）'
+      )
+      return
+    }
+
+    if (value === 'auto') {
+      if (isHost && roomTranscodeMode === 'server') {
+        socket?.emit('update-room-settings', {
+          roomId,
+          transcodeMode: 'auto',
+        })
+      }
+      setPlaysvideoLocalOverride(null)
+      if (currentMovieId != null) triggerMovieReload()
+      message.success('已切换为自动：优先浏览器端重封装/转码（不占服务器）')
+      return
+    }
+
+    // off：不改变房间设置（若房间正开着服务端转码，仅本机无法规避），
+    // 只关掉本机的浏览器端引擎 → 强制原生直连
+    setPlaysvideoLocalOverride('off')
+    if (currentMovieId != null) triggerEngineReload()
     message.success(
-      next === 'on'
-        ? '已启用服务端转码（由服务器 ffmpeg 转换，消耗服务器 CPU/带宽）'
-        : '已关闭服务端转码（优先浏览器端/原生播放）'
+      '已关闭转码（本机强制原生直连，MKV/DTS 等将无法播放或无声）'
     )
   }
 
@@ -440,23 +468,27 @@ export function MovieListPanel({
         </div>
       )}
 
-      {/* 浏览器转码引擎开关：面向所有观看者，本机生效、不同步。
-          远程共享模式下播放的是 WebRTC 画面流，引擎不参与，隐藏。 */}
+      {/* 转码方式（合并了原「浏览器转码引擎」与「服务端转码」两个开关）：
+          - 自动   ：浏览器端重封装/转码，零服务器开销（默认）
+          - 服务端 ：服务器 ffmpeg 转 HLS，兼容性最好（iOS 也能看 MKV/DTS），
+                     房间级设置、仅房主可改，开启后重新解析并广播给全房间
+          - 关闭   ：本机强制原生直连（MKV/DTS 等将黑屏/无声）
+          远程共享模式播放的是 WebRTC 画面流，引擎不参与，隐藏该控件。 */}
       {!isScreenShare && (
         <div
-          className="flex items-center justify-between gap-2 rounded-[var(--md-sys-shape-corner)] px-2.5 py-2"
+          className="flex flex-col gap-1.5 rounded-[var(--md-sys-shape-corner)] px-2.5 py-2"
           style={{
             backgroundColor:
               'color-mix(in srgb, var(--md-sys-color-surface-container-high) calc(var(--glass-strength) * 100%), transparent)',
           }}
         >
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-1.5">
               <Cpu
                 className="h-3.5 w-3.5 shrink-0"
                 style={{ color: 'var(--md-sys-color-primary)' }}
               />
-              <Text className="text-xs font-medium">浏览器转码引擎</Text>
+              <Text className="text-xs font-medium">转码方式</Text>
               <span
                 className="shrink-0 rounded px-1 py-px text-[10px] font-medium"
                 style={{
@@ -464,119 +496,41 @@ export function MovieListPanel({
                     'color-mix(in srgb, var(--md-sys-color-primary) 16%, transparent)',
                   color: 'var(--md-sys-color-primary)',
                 }}
-                title="只影响本机，不会同步给房间内其他人"
+                title={
+                  isHost
+                    ? '「服务端」为房间级设置，全房间生效'
+                    : '「服务端」由房主决定（占用的是房主的服务器资源）'
+                }
               >
-                仅本机
+                {isHost ? '房主可改' : '本机'}
               </span>
             </div>
-            <Text
-              type="secondary"
-              className="mt-0.5 block text-[10px] leading-snug"
-            >
-              {systemPlaysvideoEnabled
-                ? '开启：MKV/DTS 等非常规格式由浏览器端重封装/转码播放。关闭：强制原生直连，不兼容编码将无声。'
-                : '管理后台已全局关闭该引擎，此处开关无效。'}
-            </Text>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={engineEnabled}
-            aria-label="浏览器转码引擎"
-            disabled={!systemPlaysvideoEnabled}
-            onClick={handleToggleEngine}
-            title={
-              '浏览器转码引擎：' +
-              (engineEnabled ? '已开启' : '已关闭') +
-              '（仅本机生效，不同步给其他人）'
-            }
-            className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            style={{
-              backgroundColor: engineEnabled
-                ? 'var(--md-sys-color-primary)'
-                : 'var(--md-sys-color-outline)',
-            }}
-          >
-            <span
-              className="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
-              style={{
-                transform: engineEnabled
-                  ? 'translateX(18px)'
-                  : 'translateX(2px)',
-              }}
+            <SegmentedToggle
+              options={[
+                { value: 'auto', label: '自动' },
+                ...(serverTranscodeAvailable && isHost
+                  ? [{ value: 'server', label: '服务端' }]
+                  : []),
+                { value: 'off', label: '关闭' },
+              ]}
+              value={transcodeChoice}
+              onChange={handleSelectTranscode}
+              disabled={
+                !systemPlaysvideoEnabled && transcodeChoice !== 'server'
+              }
             />
-          </button>
+          </div>
+          <Text type="secondary" className="block text-[10px] leading-snug">
+            {transcodeChoice === 'server'
+              ? '服务端转码：由服务器 ffmpeg 转 HLS，兼容性最好（iPhone/iPad 也能看 MKV/DTS）；消耗服务器 CPU 与带宽，全房间生效。'
+              : transcodeChoice === 'off'
+                ? '已关闭转码：本机强制原生直连，MKV/DTS 等将无法播放或无声。'
+                : serverTranscodeAvailable && isHost
+                  ? '自动：MKV/DTS 等在浏览器内重封装/转码（不占服务器）。与 iOS 设备共享时切到「服务端」。'
+                  : '自动：MKV/DTS 等在浏览器内重封装/转码（不占服务器）。设备不支持时请房主切到「服务端」。'}
+          </Text>
         </div>
       )}
-
-      {/* 服务端转码开关：设备解不了（iPhone < 17.1、MKV/DTS 等）时的兜底，
-          由后端 ffmpeg 输出 HLS（iOS 可走 Safari 原生 HLS）。仅后端装了
-          ffmpeg 时展示；本机生效，切换后重新解析当前影片。 */}
-      {!isScreenShare && serverTranscodeAvailable && (
-        <div
-          className="flex items-center justify-between gap-2 rounded-[var(--md-sys-shape-corner)] px-2.5 py-2"
-          style={{
-            backgroundColor:
-              'color-mix(in srgb, var(--md-sys-color-surface-container-high) calc(var(--glass-strength) * 100%), transparent)',
-          }}
-        >
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <Server
-                className="h-3.5 w-3.5 shrink-0"
-                style={{ color: 'var(--md-sys-color-tertiary)' }}
-              />
-              <Text className="text-xs font-medium">服务端转码</Text>
-              <span
-                className="shrink-0 rounded px-1 py-px text-[10px] font-medium"
-                style={{
-                  backgroundColor:
-                    'color-mix(in srgb, var(--md-sys-color-tertiary) 16%, transparent)',
-                  color: 'var(--md-sys-color-tertiary)',
-                }}
-                title="只影响本机，不会同步给房间内其他人"
-              >
-                仅本机
-              </span>
-            </div>
-            <Text
-              type="secondary"
-              className="mt-0.5 block text-[10px] leading-snug"
-            >
-              开启：由服务器 ffmpeg 转换为 HLS 播放（兼容性最好，iPhone 也能看
-              MKV/DTS）。关闭：优先浏览器端/原生播放，仅在必要时自动兜底。
-            </Text>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={serverTranscodeEnabled}
-            aria-label="服务端转码"
-            onClick={handleToggleServerTranscode}
-            title={
-              '服务端转码：' +
-              (serverTranscodeEnabled ? '已开启' : '已关闭') +
-              '（仅本机生效，不同步给其他人）'
-            }
-            className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors"
-            style={{
-              backgroundColor: serverTranscodeEnabled
-                ? 'var(--md-sys-color-tertiary)'
-                : 'var(--md-sys-color-outline)',
-            }}
-          >
-            <span
-              className="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
-              style={{
-                transform: serverTranscodeEnabled
-                  ? 'translateX(18px)'
-                  : 'translateX(2px)',
-              }}
-            />
-          </button>
-        </div>
-      )}
-
       {/* 搜索 + 一键清除：清空按钮仅房主/房管可见，需二次确认 */}
       <div className="flex items-center gap-2">
         <Input

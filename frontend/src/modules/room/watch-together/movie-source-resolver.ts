@@ -418,11 +418,10 @@ export async function resolveMovieSource({
     return resolveAnimeOnline(movie)
   }
 
-  // 服务端转码兜底 / 强制：
-  // - 设备没有 MSE/MMS（iPhone < iOS 17.1 等）且本源必须重封装/转码时自动启用；
-  // - 播放列表「服务端转码」开关为 on 时强制启用。
-  // 产出的是后端 ffmpeg 给的 HLS 播放列表：桌面走 hls.js，iPhone 走 Safari
+  // 服务端转码（房主控制的房间级设置，server 档时启用）：
+  // 产出后端 ffmpeg 的 HLS 播放列表——桌面走 hls.js，iPhone 走 Safari
   // 原生 HLS，因此不需要 MediaSource 也能播 MKV / DTS 这类源。
+  // 房主开启后本函数解析出 HLS 源并随状态广播给全房间。
   const transcodeDecisionSource: PlayerSource = {
     url: movie.url,
     format: (movie.format as MediaFormat | undefined) ?? undefined,
@@ -430,7 +429,7 @@ export async function resolveMovieSource({
     audioCodec: movie.audioCodec ?? undefined,
   }
   await fetchTranscodeCapability()
-  if (shouldUseServerTranscode(transcodeDecisionSource)) {
+  if (shouldUseServerTranscode()) {
     try {
       const mode = pickTranscodeMode(transcodeDecisionSource)
       // 起点按 30s 取整：会话键含 start，粗粒度取整让同房间成员复用同一会话

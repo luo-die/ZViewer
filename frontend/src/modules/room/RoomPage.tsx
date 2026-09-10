@@ -235,6 +235,8 @@ function RoomPage() {
             name?: string | null
             streamKey?: string | null
             requireApproval?: boolean
+            /** 房主设置的转码方式（auto=浏览器端 / server=服务端 ffmpeg） */
+            transcodeMode?: 'auto' | 'server'
             playback?: {
               currentTime: number
               isPlaying: boolean
@@ -298,6 +300,11 @@ function RoomPage() {
           // 观众加入时后端按真实值判定，房主却以为开关已开/关，导致"开关无效"假象。
           if (data?.requireApproval !== undefined) {
             setRoomSettings({ requireApproval: data.requireApproval })
+          }
+          // 同步转码方式：房主刷新/重连后播放列表的「转码方式」控件必须与
+          // 后端一致，否则显示与实际播放路径不符（服务端转码状态丢失）
+          if (data?.transcodeMode !== undefined) {
+            setRoomSettings({ transcodeMode: data.transcodeMode })
           }
           // 房主刷新恢复：保存 playback 传给 WatchTogetherPanel 应用
           if (data?.playback) {

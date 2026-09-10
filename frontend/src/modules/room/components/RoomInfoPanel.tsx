@@ -186,12 +186,18 @@ export function RoomInfoPanel({
       password: string | null
       maxViewers: number
       requireApproval: boolean
+      transcodeMode?: 'auto' | 'server'
     }) => {
       if (!payload) return
       setRoomSettings({
         password: payload.password,
         maxViewers: payload.maxViewers,
         requireApproval: payload.requireApproval,
+        // 转码方式是房间级设置（房主决定），必须同步到 store：
+        // 播放列表的「转码方式」控件与实际播放路径都依赖它
+        ...(payload.transcodeMode !== undefined
+          ? { transcodeMode: payload.transcodeMode }
+          : {}),
       })
     }
 
