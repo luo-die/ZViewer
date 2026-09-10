@@ -14,6 +14,7 @@ import {
   streamMkvSubtitleTrack,
 } from '@/modules/subtitles/mkv-embedded'
 import { appendAuthToken } from '@/modules/player/services/url-proxy'
+import { message } from '@/components/ui/message'
 
 export interface SubtitleTrack {
   cues: ParsedCue[]
@@ -956,6 +957,8 @@ export function useSubtitles({
           label?: string
           language?: string | null
           message?: string
+          /** 服务端返回的提取进度（已解析字节数 / 批次数），没有时为 null */
+          progress?: { bytes: number; batches: number } | null
         }
         // 捕获提取世代：切影片（clearTracks）会递增，回来时若已切片就丢弃结果，
         // 否则会出现「播的是第二部、字幕却是第一部」的串台
@@ -1028,12 +1031,32 @@ export function useSubtitles({
           return true
         }
         let data: ExtractPayload | null = null
-        // 「提取中」只打印一次：轮询间隔 700ms~2s，整集提取可能持续 1~2 分钟，
-        // 每轮都 console 会把日志量放大到几百条（生产环境还会全量上报到后端）。
-        let loggedPending = false
+        // 「提取中」进度日志：轮询间隔 700ms~2s，整集提取可能持续 1~2 分钟，
+        // 每轮都打印会把日志量放大到几百条；但完全不打又会出现「控制台毫无动静、
+        // 不知道是在提取还是已经卡死」——因此按 5s 节流打一条带进度的 info。
+        const PENDING_LOG_INTERVAL_MS = 5000
+        let lastPendingLogAt = 0
+        /** 提取开始提示只弹一次（轮询期间不重复打扰） */
+        let notifiedExtracting = false
         for (;;) {
           if (embeddedEpochRef.current !== epoch) return 0
-          const res = await apiFetch(extractUrl)
+          // 单次请求也加超时：接口本身要么秒回 pending、要么 1.5s 内返回首批结果，
+          // 30s 没有任何响应说明连接已经卡死（反代/网络），必须报错而不是无限等
+          const controller = new AbortController()
+          const reqTimer = setTimeout(() => controller.abort(), 30_000)
+          let res: Response | null = null
+          try {
+            res = await apiFetch(extractUrl, { signal: controller.signal })
+          } catch (err) {
+            if (!controller.signal.aborted) throw err
+          } finally {
+            clearTimeout(reqTimer)
+          }
+          if (!res) {
+            throw new Error(
+              `字幕提取请求超时（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s 无响应），请稍后重试`
+            )
+          }
           data = (await res.json()) as ExtractPayload
           if (!data.pending) {
             if (!res.ok || !data.success || !data.content) {
@@ -1048,7 +1071,7 @@ export function useSubtitles({
                 data.language,
                 allowPartialBroadcast()
               )
-              console.debug(
+              console.info(
                 `[useSubtitles] 字幕已部分可用（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s），后台继续补齐…`
               )
               await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
@@ -1059,11 +1082,22 @@ export function useSubtitles({
           if (Date.now() > deadline) {
             throw new Error(data.message || '字幕提取超时，请稍后重试')
           }
-          if (!loggedPending) {
-            loggedPending = true
-            console.debug(
-              `[useSubtitles] ${data.message || '字幕提取中…'}（已等待 ${Math.round((Date.now() - startedAt) / 1000)}s）`
+          if (Date.now() - lastPendingLogAt >= PENDING_LOG_INTERVAL_MS) {
+            lastPendingLogAt = Date.now()
+            const progressText = data.progress
+              ? `已解析 ${(data.progress.bytes / 1024).toFixed(0)}KB / 第 ${data.progress.batches} 批`
+              : '尚未读到字幕数据'
+            console.info(
+              `[useSubtitles] 服务端${data.message || '正在提取内嵌字幕…'}｜${progressText}｜已等待 ${Math.round((Date.now() - startedAt) / 1000)}s`
             )
+            // UI 上也要能看见：整集解容器要 1~2 分钟，只靠控制台用户会以为卡死了
+            if (!notifiedExtracting) {
+              notifiedExtracting = true
+              message.info(
+                '正在提取内嵌字幕（首次约 1~2 分钟，之后走缓存秒开）',
+                { duration: 5000 }
+              )
+            }
           }
           await new Promise((resolve) => setTimeout(resolve, pollDelayMs()))
         }

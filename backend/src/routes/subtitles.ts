@@ -1011,6 +1011,24 @@ const mkvInflight = new Set<string>();
  * 返回给前端，字幕秒级可用（后面继续补齐），而不是让用户干等完整提取。
  */
 const mkvPartial = new Map<string, MkvCachedSubtitle & { partial: true }>();
+/**
+ * 「部分结果」的有效期。
+ *
+ * 取 10 分钟（≈ 提取超时 900s）：部分结果是「边读边给」的进度快照，
+ * 只要提取还在跑就应该继续交付。早期取 120s，慢源上会出现在
+ * 「提取其实还在进行、但接口已不再返回部分结果」的窗口里前端只能干等 pending，
+ * 表现就是「一直卡在提取中、没有任何进度」。
+ */
+const MKV_PARTIAL_TTL_MS = 10 * 60 * 1000;
+/** 部分结果进度日志的最小间隔（提取可跑 1~3 分钟，不能被日志刷屏）。 */
+const MKV_PROGRESS_LOG_INTERVAL_MS = 15 * 1000;
+
+/**
+ * 提取进度（cacheKey → 已解析字节数/批次数）。
+ * 用于把「仍在提取」的真实进度写进 202 pending 的 message 里，
+ * 前端由此能显示「已等待 Ns / 已解析 X KB」而不是一句干等。
+ */
+const mkvProgress = new Map<string, { bytes: number; chunks: number; lastLogAt: number }>();
 /** 最近一次提取失败原因：轮询方立即拿到真实原因，而不是一直等到超时 */
 /**
  * 字幕提取的读取限速（字节/秒，0 = 不限速）。
@@ -1041,6 +1059,14 @@ function startMkvExtractionInBackground(
   if (mkvInflight.size >= 2) return false;
   mkvInflight.add(cacheKey);
   mkvFailures.delete(cacheKey);
+  const startedAt = Date.now();
+  /** 提取进度（供 pending 响应与日志使用） */
+  const progress = { bytes: 0, chunks: 0, lastLogAt: 0 };
+  mkvProgress.set(cacheKey, progress);
+  console.info(
+    `[subtitles] 开始服务端解容器提取 movie=${movie.id} track=${track}` +
+      `${fileSizeHint ? ` size=${Math.round(fileSizeHint / 1024 / 1024)}MB` : ''}`,
+  );
   void (async () => {
     try {
       const ctx = await resolveEmbyContext(movie);
@@ -1065,6 +1091,17 @@ function startMkvExtractionInBackground(
         },
         track,
         (partial) => {
+          progress.bytes = partial.length;
+          progress.chunks += 1;
+          const now = Date.now();
+          if (now - progress.lastLogAt >= MKV_PROGRESS_LOG_INTERVAL_MS) {
+            progress.lastLogAt = now;
+            console.info(
+              `[subtitles] 提取进度 movie=${movie.id} track=${track} ` +
+                `${(partial.length / 1024).toFixed(0)}KB / 第 ${progress.chunks} 批 / ` +
+                `已等待 ${Math.round((now - startedAt) / 1000)}s`,
+            );
+          }
           mkvPartial.set(cacheKey, {
             content: partial,
             format: 'ass',
@@ -1114,11 +1151,11 @@ function startMkvExtractionInBackground(
       mkvFailures.set(cacheKey, { message, at: Date.now() });
     } finally {
       mkvInflight.delete(cacheKey);
+      mkvProgress.delete(cacheKey);
     }
   })();
   return true;
 }
-
 /** Emby 字幕 codec → 提取后缀与前端解析格式。
  *  注意：Emby 的 Subtitles Stream 端点按扩展名路由转封装输出，
  *  裸 `/Stream`（无扩展名）会 404——srt 也必须显式带 `.srt` 后缀。 */
@@ -1579,6 +1616,9 @@ router.get(
       if (source === 'emby' || source === 'jellyfin') {
         // 服务端解容器路径：index 为 MKV TrackNumber（embedded-tracks 返回 mkv=true）
         if (req.query.mkv === '1') {
+          console.info(
+            `[subtitles] 提取请求 movie=${movie.id} track=${streamIndex} mode=mkv（服务端解容器）`,
+          );
           const cacheKey = `${movie.id}:${streamIndex}`;
           const cached = mkvExtractCache.get(cacheKey);
           if (cached && Date.now() - cached.at < MKV_CACHE_TTL_MS) {
@@ -1609,7 +1649,7 @@ router.get(
           // 提取中：把「已读到的部分字幕」先返回（partial=true），字幕秒级可用，
           // 前端继续轮询直到拿到完整结果
           const partial = mkvPartial.get(cacheKey);
-          if (partial && Date.now() - partial.at < 120_000) {
+          if (partial && Date.now() - partial.at < MKV_PARTIAL_TTL_MS) {
             res.json({
               success: true,
               partial: true,
@@ -1680,18 +1720,29 @@ router.get(
             if (Date.now() >= waitUntil) break;
             await new Promise((resolve) => setTimeout(resolve, 150));
           }
+          const pendingProgress = mkvProgress.get(cacheKey);
           res.status(202).json({
             success: false,
             pending: true,
+            // 把真实进度带回去：前端据此显示「已等待 Ns / 已解析 X KB」，
+            // 出现「卡住不动」时也能一眼看出是上游没数据还是在慢慢读
+            progress: pendingProgress
+              ? { bytes: pendingProgress.bytes, batches: pendingProgress.chunks }
+              : null,
             message: started
               ? '首次提取内嵌字幕（需读完整集，约 1~2 分钟），完成后自动加载'
-              : '字幕提取正在进行中，稍后自动加载',
+              : pendingProgress && pendingProgress.chunks > 0
+                ? `字幕提取中：已解析 ${(pendingProgress.bytes / 1024).toFixed(0)}KB（第 ${pendingProgress.chunks} 批）`
+                : '字幕提取正在进行中，稍后自动加载',
           });
           return;
         }
 
         // 原生 API 路径：index 为原生字幕数组下标（embedded-tracks 返回 native=true）
         if (req.query.native === '1') {
+          console.info(
+            `[subtitles] 提取请求 movie=${movie.id} index=${streamIndex} mode=native（第三方原生 API）`,
+          );
           const mount = await findMountForMovie(movie);
           const nativeClient = mount ? createNativeApiFromMount(mount) : null;
           if (!nativeClient || !movie.path) {
@@ -1731,6 +1782,9 @@ router.get(
         }
 
         const ctx = await resolveEmbyContext(movie);
+        console.info(
+          `[subtitles] 提取请求 movie=${movie.id} index=${streamIndex} mode=emby（媒体服务器字幕端点）`,
+        );
         // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
         const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
           subtitleProfile: true,
