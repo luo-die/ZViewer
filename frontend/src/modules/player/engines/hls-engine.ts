@@ -75,6 +75,65 @@ function createProxyLoader() {
   }
 }
 
+/** hls.js 抛出的错误事件数据结构（只声明用到的字段） */
+interface HlsErrorData {
+  type: string
+  details: string
+  fatal: boolean
+  url?: string
+  /** 非 2xx 时的响应元信息（XhrLoader：data 为 undefined，正文在 networkDetails） */
+  response?: { code?: number; text?: string; data?: unknown }
+  /** XhrLoader 的 XMLHttpRequest 实例 / FetchLoader 的 Response */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  networkDetails?: any
+}
+
+/**
+ * 从 hls.js 错误事件里尽量取出 HTTP 状态与响应正文片段。
+ *
+ * hls.js 的 XhrLoader 在非 2xx 时只回传 { code, text: statusText }，正文
+ * 在 networkDetails（XMLHttpRequest）里；FetchLoader 则把正文放在
+ * response.data。两边都取一次，失败原因为空时返回空串。
+ */
+function extractHlsResponse(data: HlsErrorData): {
+  status?: number
+  statusText?: string
+  body?: string
+} {
+  const status = data.response?.code
+  const statusText = data.response?.text
+  let body = ''
+  const fromResponse = data.response?.data
+  if (typeof fromResponse === 'string') {
+    body = fromResponse
+  } else if (typeof data.networkDetails?.responseText === 'string') {
+    body = data.networkDetails.responseText
+  }
+  return {
+    status,
+    statusText: statusText || undefined,
+    body: body.replace(/\s+/g, ' ').trim().slice(0, 300) || undefined,
+  }
+}
+
+/**
+ * 组装可读的 HLS 失败原因。
+ *
+ * 只写 type/details 时，前端只能看到「manifestLoadError」——既不知道
+ * 后端返回了什么状态码，也看不到后端透传的上游（Emby/Jellyfin）错误说明，
+ * 用户与排查者都无从下手。这里把状态码与响应正文一并带上。
+ */
+function describeHlsFailure(data: HlsErrorData): string {
+  const { status, statusText, body } = extractHlsResponse(data)
+  const parts = [`HLS加载失败: type=${data.type} details=${data.details}`]
+  if (status) {
+    parts.push(`HTTP ${status}${statusText ? ` ${statusText}` : ''}`)
+  }
+  if (body) parts.push(`响应: ${body}`)
+  parts.push(`url=${data.url?.slice(0, 80)}`)
+  return parts.join(' | ')
+}
+
 /** 等待 hls.js 加载 m3u8 清单完成或失败，带超时 */
 function waitForHlsReady(hls: Hls, timeoutMs = 15000): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -87,20 +146,13 @@ function waitForHlsReady(hls: Hls, timeoutMs = 15000): Promise<void> {
       resolve()
     }
 
-    const onError = (
-      _event: string,
-      data: { type: string; details: string; fatal: boolean; url?: string }
-    ) => {
+    const onError = (_event: string, data: HlsErrorData) => {
       if (settled) return
       // 非致命错误不reject，让hls.js自行恢复
       if (!data.fatal) return
       settled = true
       cleanup()
-      reject(
-        new Error(
-          `HLS加载失败: type=${data.type} details=${data.details} url=${data.url?.slice(0, 80)}`
-        )
-      )
+      reject(new Error(describeHlsFailure(data)))
     }
 
     const onTimeout = () => {
@@ -182,17 +234,17 @@ export const hlsEngine: PlayerEngine = {
         console.log('[hls-engine] MANIFEST_PARSED')
       })
       hls.on(Hls.Events.ERROR, (_event, data) => {
+        const { status, statusText, body } = extractHlsResponse(
+          data as HlsErrorData
+        )
         console.error('[hls-engine] hls.js error', {
           type: data.type,
           details: data.details,
           fatal: data.fatal,
-          url: data.url?.slice(0, 80),
-          response: data.response
-            ? {
-                code: data.response.code,
-                text: data.response.text?.slice(0, 100),
-              }
-            : null,
+          url: data.url?.slice(0, 120),
+          response: data.response ? { code: status, text: statusText } : null,
+          // 后端/上游的失败说明（后端已透传上游错误正文）
+          responseBody: body,
         })
       })
 

@@ -32,6 +32,32 @@ export const DEFAULT_PROXY_UA =
 /** 上游请求默认超时（毫秒） */
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
 
+/** 上游错误响应体的读取上限（字符）：只用于诊断，不需要完整正文 */
+const UPSTREAM_ERROR_BODY_LIMIT = 500;
+
+/**
+ * 读取上游错误响应体（截断 + 压成单行），失败或过大时返回空串。
+ *
+ * 上游的失败原因通常只写在响应体里（Emby 转码报错、鉴权失败说明、
+ * Nginx 的错误页等），而调用方默认只拿到状态码——留下一段空响应，
+ * 排查时完全看不出上游说了什么。
+ */
+async function readUpstreamErrorBody(
+  // 注意：本文件里的 Response 是 Express 的（已 import），fetch 的响应需显式取类型
+  upstream: Awaited<ReturnType<typeof fetch>>,
+): Promise<string> {
+  // 明显过大的响应（例如错误页里塞了整段 HTML）直接放弃，避免无谓的下载
+  const declared = Number(upstream.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > 64 * 1024) return '';
+  if (!upstream.body) return '';
+  try {
+    const text = await upstream.text();
+    return text.replace(/\s+/g, ' ').trim().slice(0, UPSTREAM_ERROR_BODY_LIMIT);
+  } catch {
+    return '';
+  }
+}
+
 /**
  * 通配 CORS 头。video.src 跨源加载媒体时需要 ACAO:*，否则会被 ORB 阻止。
  * 注意：携带凭证（credentials: include）的请求不能使用通配 CORS，
@@ -75,6 +101,15 @@ export interface ProxyHttpOptions {
   cacheControl?: string;
   /** 上游请求超时（毫秒），默认 30000 */
   timeoutMs?: number;
+  /**
+   * 上游返回非 2xx 时，是否把上游错误响应体（截断后）以 text/plain 下发。
+   *
+   * 默认 false：只透传状态码，响应体为空。这在播放链路里是「信息黑洞」——
+   * 前端 hls.js 只能拿到「manifestLoadError」这类无信息量的结论，看不出
+   * 上游到底说了什么（Emby 的转码失败原因、鉴权失败原因等）。
+   * HLS 播放列表 / 字幕这类「失败原因写在响应体里」的端点应开启。
+   */
+  forwardErrorBody?: boolean;
   /** 日志前缀，如 'stream'、'anisubs' */
   logTag: string;
   /** 502 错误响应的 message 文案 */
@@ -152,6 +187,7 @@ export async function proxyHttpUpstream(
     defaultContentType = 'application/octet-stream',
     cacheControl,
     timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS,
+    forwardErrorBody = false,
     logTag,
     errorMessage,
   } = opts;
@@ -226,17 +262,33 @@ export async function proxyHttpUpstream(
     }
 
     if (!upstream.ok) {
+      // 上游失败原因只写在响应体里是常态（Emby 转码报错、鉴权失败说明…）。
+      // 旧实现直接 res.end() 丢掉正文，前端 hls.js 只能报一个
+      // 「manifestLoadError」，服务端日志也只有状态码——排查时两头无线索。
+      // 现在：始终把错误正文写进服务端日志；调用方开启 forwardErrorBody 时
+      // 一并下发给前端展示。
+      const errorBody = await readUpstreamErrorBody(upstream);
       console.log(
-        `[${logTag}] proxy ${upstream.status} ${formatBytes(bytesSent)} ${Date.now() - startTime}ms range=${rangeHeader || '-'} ${requestUrl.slice(0, 100)}`,
+        `[${logTag}] proxy ${upstream.status} ${formatBytes(bytesSent)} ${Date.now() - startTime}ms range=${rangeHeader || '-'} ${requestUrl.slice(0, 100)}` +
+          (errorBody ? ` upstreamBody="${errorBody}"` : ''),
       );
       res.status(upstream.status);
       // 透传语义头：如 416 的 Content-Range: bytes */size（RFC 9110 要求），
       // 让客户端能感知分片边界；若一个头都不透传，Range 语义完全丢失。
+      // content-length 除外：下发的错误文本与上游长度无关。
+      const forwardBody = forwardErrorBody && !!errorBody;
       for (const name of PASSTHROUGH_HEADERS) {
+        if (forwardBody && name === 'content-length') continue;
         const value = upstream.headers.get(name);
         if (value) res.setHeader(name, value);
       }
-      res.end();
+      if (forwardBody) {
+        res.removeHeader('content-length');
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.end(errorBody);
+      } else {
+        res.end();
+      }
       return;
     }
 

@@ -21,7 +21,12 @@ import { UserMount } from '../entities/UserMount';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { JellyfinClient, JellyfinError } from '../services/jellyfin-client';
 import { detectMediaFormat } from '../services/mediaFormat';
-import { resolveUserMount, resolveMovieStream, proxyHttpUpstream } from '../services/proxy';
+import {
+  resolveUserMount,
+  resolveMovieStream,
+  proxyHttpUpstream,
+  StreamMovieError,
+} from '../services/proxy';
 import { normalizeServerUrlWithScheme } from '../services/network-utils';
 
 const router = Router();
@@ -573,6 +578,8 @@ router.get('/proxy', async (req: AuthenticatedRequest, res: Response): Promise<v
       defaultContentType: audioTranscode ? 'application/x-mpegURL' : 'video/mp4',
       // 转码冷启动：Jellyfin 需先启动 ffmpeg 转码才吐出首个分片，30s 默认超时会误杀
       timeoutMs: audioTranscode ? 90_000 : undefined,
+      // 上游失败原因只写在响应体里，不下发的话前端只能看到「manifestLoadError」
+      forwardErrorBody: true,
       logTag: audioTranscode ? 'jellyfin-proxy-transcode' : 'jellyfin-proxy',
       errorMessage: 'Jellyfin 视频流代理失败',
     });
@@ -625,13 +632,21 @@ router.get('/stream', async (req: AuthenticatedRequest, res: Response): Promise<
       defaultContentType: audioTranscode ? 'application/x-mpegURL' : 'video/mp4',
       // 转码冷启动：Jellyfin 需先启动 ffmpeg 转码才吐出首个分片，30s 默认超时会误杀
       timeoutMs: audioTranscode ? 90_000 : undefined,
+      // 同上：把上游错误正文透给前端，避免无信息量的播放失败
+      forwardErrorBody: true,
       logTag: audioTranscode ? 'jellyfin-stream-transcode' : 'jellyfin-stream',
       errorMessage: 'Jellyfin 视频流代理失败',
     });
   } catch (err) {
     console.error('[jellyfin] stream error:', err);
     if (!res.headersSent) {
-      const status = extractErrorCode(err) === 'AUTH_FAILED' ? 401 : 502;
+      // StreamMovieError 自带语义状态码（404 影片不存在 / 400 未挂载服务器信息）
+      const status =
+        err instanceof StreamMovieError
+          ? err.status
+          : extractErrorCode(err) === 'AUTH_FAILED'
+            ? 401
+            : 502;
       res.status(status).json({ success: false, message: extractErrorMessage(err, 'Jellyfin 视频流代理失败'), code: extractErrorCode(err) });
     } else {
       res.destroy();

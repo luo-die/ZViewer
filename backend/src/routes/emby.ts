@@ -29,7 +29,12 @@ import {
   type EmbyItem,
 } from '../services/emby-client';
 import { detectMediaFormat, getContentType } from '../services/mediaFormat';
-import { resolveUserMount, resolveMovieStream, proxyHttpUpstream } from '../services/proxy';
+import {
+  resolveUserMount,
+  resolveMovieStream,
+  proxyHttpUpstream,
+  StreamMovieError,
+} from '../services/proxy';
 import { normalizeServerUrlWithScheme } from '../services/network-utils';
 
 const router = Router();
@@ -674,6 +679,9 @@ router.get('/proxy', async (req: AuthenticatedRequest, res: Response): Promise<v
       defaultContentType: audioTranscode ? 'application/x-mpegURL' : 'video/mp4',
       // 转码冷启动：Emby 需先启动 ffmpeg 转码才吐出首个分片，30s 默认超时会误杀
       timeoutMs: audioTranscode ? 90_000 : undefined,
+      // 上游失败原因（转码报错/条目不存在/鉴权失效）只写在响应体里，
+      // 不下发的话前端只能看到 hls.js 的「manifestLoadError」
+      forwardErrorBody: true,
       logTag: audioTranscode ? 'emby-proxy-transcode' : 'emby-proxy',
       errorMessage: 'Emby 视频流代理失败',
     });
@@ -741,13 +749,22 @@ router.get('/stream', async (req: AuthenticatedRequest, res: Response): Promise<
       defaultContentType: audioTranscode ? 'application/x-mpegURL' : 'video/mp4',
       // 转码冷启动：Emby 需先启动 ffmpeg 转码才吐出首个分片，30s 默认超时会误杀
       timeoutMs: audioTranscode ? 90_000 : undefined,
+      // 同上：把上游错误正文透给前端，避免「manifestLoadError」这种无信息量报错
+      forwardErrorBody: true,
       logTag: audioTranscode ? 'emby-stream-transcode' : 'emby-stream',
       errorMessage: 'Emby 视频流代理失败',
     });
   } catch (err) {
     console.error('[emby] stream error:', err);
     if (!res.headersSent) {
-      const status = extractErrorCode(err) === 'AUTH_FAILED' ? 401 : 502;
+      // StreamMovieError 自带语义状态码（影片不存在 404 / 未挂载服务器信息 400），
+      // 一律压成 502 会让前端与日志都误判成「上游挂了」
+      const status =
+        err instanceof StreamMovieError
+          ? err.status
+          : extractErrorCode(err) === 'AUTH_FAILED'
+            ? 401
+            : 502;
       res.status(status).json({
         success: false,
         message: extractErrorMessage(err, 'Emby 视频流代理失败'),

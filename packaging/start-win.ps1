@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 #Requires -Version 5.1
 
 # ZViewer 一键启动脚本（单文件 exe 版，Windows）
@@ -83,6 +83,20 @@ function Read-PortValue {
         }
     }
     return $null
+}
+
+# 读取布尔型配置（环境变量 > .env），如 HTTPS=true
+function Read-EnvFlag([string]$Key) {
+    $envVal = [Environment]::GetEnvironmentVariable($Key)
+    if ($envVal) { return ($envVal.Trim().ToLower() -eq 'true') }
+    if (Test-Path $envFile) {
+        $line = Get-Content $envFile | Where-Object { $_ -match "^\s*$([regex]::Escape($Key))\s*=" } | Select-Object -First 1
+        if ($line) {
+            $val = ($line -split '=', 2)[1].Trim().Trim('"').Trim()
+            return ($val.ToLower() -eq 'true')
+        }
+    }
+    return $false
 }
 
 function Set-Ports {
@@ -204,10 +218,19 @@ function Start-ExeWithEnv([string]$FilePath, [hashtable]$EnvVars, [string]$OutFi
 function Invoke-Start([switch]$BackendOnly) {
     Set-Ports
 
+    # HTTPS 模式来源（二者取或）：
+    # - 显式 -Https（start/https 命令、菜单选 HTTPS）：使用 HTTPS 并签发/续签证书
+    # - .env 或环境变量 HTTPS=true：只使用 HTTPS，**不**重新签发证书
+    #   自动更新后的重启走的就是后一条：更新脚本由运行中的后端派生，带着
+    #   HTTPS=true。少了这条，HTTPS 部署更新后会以 HTTP 起来，页面直接打不开
+    #   （表现为「更新后服务没自启动」）；而每次重启都重新签发证书又会撞上
+    #   Let's Encrypt 的签发频率限制。
+    $useHttps = $Https -or (Read-EnvFlag 'HTTPS')
+
     Write-Host "========================================"
     Write-Host "  ZViewer 启动"
     Write-Host "  端口: $Port"
-    if ($Https) {
+    if ($useHttps) {
       Write-Host "  模式: HTTPS（可信/自签证书）"
     } elseif ($BackendOnly) {
       Write-Host "  模式: 仅后端（不校验前端产物）"
@@ -232,15 +255,22 @@ function Invoke-Start([switch]$BackendOnly) {
       }
     }
 
-    # HTTPS 模式：先签发证书
-    if ($Https) {
-        if (-not (Test-Exe $certExe "证书工具 zviewer-cert.exe")) { return 1 }
-        $certHost = if ($HostArg) { $HostArg } else { Select-CertHost }
-        Invoke-CertIssue -CertHost $certHost -IsForce:$Force
-        $code = $script:CertExitCode
-        if ($code -ne 0) {
-            Write-Host "  [证书] 签发失败，HTTPS 启动中止" -ForegroundColor Red
-            return 1
+    # HTTPS 模式：显式 -Https 时按用户选择签发/续签；仅由 .env 开启 HTTPS 时
+    # 只在证书缺失时补一张自签证书——更新后的自动重启没有输入通道，
+    # 不能弹交互选择（Read-Host 会直接失败或永远等待）
+    if ($useHttps) {
+        $certFile = Join-Path $rootDir 'config\ssl\cert.pem'
+        $keyFile = Join-Path $rootDir 'config\ssl\key.pem'
+        $certMissing = -not ((Test-Path $certFile) -and (Test-Path $keyFile))
+        if ($Https -or $Force -or $certMissing) {
+            if (-not (Test-Exe $certExe "证书工具 zviewer-cert.exe")) { return 1 }
+            $certHost = if ($HostArg) { $HostArg } elseif ($Https) { Select-CertHost } else { 'localhost' }
+            Invoke-CertIssue -CertHost $certHost -IsForce:$Force
+            $code = $script:CertExitCode
+            if ($code -ne 0) {
+                Write-Host "  [证书] 签发失败，HTTPS 启动中止" -ForegroundColor Red
+                return 1
+            }
         }
     }
 
@@ -258,7 +288,7 @@ function Invoke-Start([switch]$BackendOnly) {
         RTMP_PORT = if ($rtmpEnv) { "$rtmpEnv" } else { "3334" }
         HTTP_FLV_PORT = if ($flvEnv) { "$flvEnv" } else { "3335" }
     }
-    if ($Https) { $backendEnv.HTTPS = "true" }
+    if ($useHttps) { $backendEnv.HTTPS = "true" }
     $backend = Start-ExeWithEnv -FilePath $backendExe -EnvVars $backendEnv  `
         -OutFile "$logDir/backend.log" -ErrFile "$logDir/backend.err.log"
 
@@ -272,7 +302,7 @@ function Invoke-Start([switch]$BackendOnly) {
 
     Write-PidsFile -backendPid $backend.Id
     Write-Host "  后端 PID: $($backend.Id)"
-    $protocol = if ($Https) { 'https' } else { 'http' }
+    $protocol = if ($useHttps) { 'https' } else { 'http' }
     Write-Host "  访问  : ${protocol}://localhost:$Port"
     Write-Host "  日志  : $logDir/"
     return 0

@@ -496,6 +496,9 @@ set "EXTRACTED_DIR=${extractedDir}"
 set "PIDS_FILE=%ROOT%\\.prod.pids.json"
 set "CONFIG_DIR=%ROOT%\\config"
 set "CONFIG_BACKUP="
+set "ENV_FILE=%ROOT%\\.env"
+set "ENV_BACKUP="
+set "COPY_FAILED=0"
 set "LOG_FILE=%ROOT%\\update.log"
 
 :: 将主逻辑输出重定向到日志文件，方便诊断更新失败原因
@@ -523,21 +526,17 @@ taskkill /F /IM zviewer-cert.exe >nul 2>&1
 
 :: 停止 Node.js 开发模式进程
 if exist "%PIDS_FILE%" (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "\
-    $pids = Get-Content '%PIDS_FILE%' -Raw | ConvertFrom-Json; \
-    foreach ($key in $pids.PSObject.Properties.Name) { \
-      $info = $pids.$key; \
-      if ($info.pid) { \
-        Stop-Process -Id $info.pid -Force -ErrorAction SilentlyContinue; \
-      } \
-    }"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$pids = Get-Content '%PIDS_FILE%' -Raw | ConvertFrom-Json; foreach ($k in $pids.PSObject.Properties.Name) { if ($pids.$k.pid) { Stop-Process -Id $pids.$k.pid -Force -ErrorAction SilentlyContinue } }"
   del "%PIDS_FILE%"
 )
 taskkill /F /IM node.exe >nul 2>&1
 
-:: 等待端口释放（taskkill 后端口可能处于 TIME_WAIT 状态）
+:: 等待端口释放 + 占用兜底：
+:: 按进程名没杀干净时（进程被改名 / 残留进程 / 手动启动的实例），
+:: 启动脚本会因为「端口已被占用」直接拒绝启动，表现就是「更新脚本跑完了，
+:: 但服务始终没起来」。这里把占用业务端口的进程一并清掉再继续。
 echo [更新脚本] 等待端口释放...
-ping 127.0.0.1 -n 4 >nul
+call :wait_port_free
 
 :: 备份 config 目录（包含数据库、用户上传文件、头像等全部用户数据）
 echo [更新脚本] 备份 config 目录...
@@ -553,31 +552,37 @@ if exist "%CONFIG_DIR%" (
   rmdir /S /Q "%CONFIG_DIR%"
 )
 
+:: 备份 .env（用户配置：端口 / HTTPS / JWT 密钥等）。
+:: 更新包里带的是模板 .env，直接覆盖会重置端口与密钥：改了端口的部署会
+:: 「起在别的端口上」，HTTPS 部署会退回 HTTP，看起来都像「更新后服务没起来」。
+echo [更新脚本] 备份 .env...
+if exist "%ENV_FILE%" (
+  set "ENV_BACKUP=%ROOT%\\.env-backup-!RANDOM!"
+  copy /Y "%ENV_FILE%" "!ENV_BACKUP!" >nul
+  if errorlevel 1 (
+    echo [警告] .env 备份失败，将沿用更新包内的 .env
+    set "ENV_BACKUP="
+  ) else (
+    echo [更新脚本] 已备份 .env 到 !ENV_BACKUP!
+  )
+)
+
 echo [更新脚本] 应用新文件...
+:: 复制失败不再直接退出：更新包里的 .env 会覆盖用户配置、可执行文件可能被占用。
+:: 无论复制是否成功，最后都必须尝试把服务拉起来（服务停着才是最坏结果）。
 if not exist "%EXTRACTED_DIR%" (
   echo [错误] 未找到解压目录：%EXTRACTED_DIR%
-  if exist "!CONFIG_BACKUP!" (
-    xcopy /E /Y /I "!CONFIG_BACKUP!" "%CONFIG_DIR%" >nul
+  set "COPY_FAILED=1"
+) else (
+  xcopy /E /Y /I "%EXTRACTED_DIR%\\*" "%ROOT%\\" >nul
+  if errorlevel 1 (
+    echo [错误] 文件复制失败（可能有文件被占用）
+    set "COPY_FAILED=1"
   )
-  exit /b 1
-)
-
-xcopy /E /Y /I "%EXTRACTED_DIR%\\*" "%ROOT%\\" >nul
-if errorlevel 1 (
-  echo [错误] 文件复制失败
-  if exist "!CONFIG_BACKUP!" (
-    xcopy /E /Y /I "!CONFIG_BACKUP!" "%CONFIG_DIR%" >nul
+  if not exist "%ROOT%\\zviewer-backend.exe" (
+    echo [错误] 更新后未找到 zviewer-backend.exe，更新包可能损坏
+    set "COPY_FAILED=1"
   )
-  exit /b 1
-)
-
-:: 验证关键文件是否复制成功
-if not exist "%ROOT%\\zviewer-backend.exe" (
-  echo [错误] 更新后未找到 zviewer-backend.exe，更新包可能损坏
-  if exist "!CONFIG_BACKUP!" (
-    xcopy /E /Y /I "!CONFIG_BACKUP!" "%CONFIG_DIR%" >nul
-  )
-  exit /b 1
 )
 
 :: 恢复 config 目录（保留用户数据）
@@ -593,9 +598,65 @@ if exist "!CONFIG_BACKUP!" (
   echo [更新脚本] 未检测到 config 备份（可能是首次部署），跳过恢复
 )
 
+:: 恢复 .env（保留用户配置：端口 / HTTPS / 密钥）
+:: 更新包内的 .env 是模板（PORT=3333、占位密钥、无 HTTPS）：直接沿用会让
+:: 改了端口的部署换端口、HTTPS 部署退回 HTTP——用户看到的就是「更新后打不开」。
+if exist "!ENV_BACKUP!" (
+  copy /Y "!ENV_BACKUP!" "%ENV_FILE%" >nul
+  del "!ENV_BACKUP!" >nul 2>&1
+  echo [更新脚本] 已恢复 .env（用户配置已保留）
+) else (
+  echo [更新脚本] 未检测到 .env 备份，使用更新包内的 .env
+)
+
 echo [更新脚本] 清理临时文件...
 rmdir /S /Q "%TEMP_DIR%"
 
+if "!COPY_FAILED!"=="1" (
+  echo [警告] 本次更新存在文件复制错误，将尝试用现有文件启动服务
+)
+
+:: 重新启动服务（先清端口 → 启动 → 校验端口是否真的监听）
+call :restart_service
+
+echo [更新脚本] 更新完成。%date% %time%
+exit /b 0
+
+:: ==================== 子过程 ====================
+
+:read_env_value
+:: 读取 .env 中指定键的值，结果写入 ENV_VALUE（未找到时清空）
+set "ENV_VALUE="
+if exist "%ENV_FILE%" (
+  for /f "usebackq tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
+    if /i "%%a"=="%~1" set "ENV_VALUE=%%b"
+  )
+)
+exit /b 0
+
+:resolve_port
+:: 端口优先级：.env > 进程环境变量 > 3333
+call :read_env_value PORT
+set "APP_PORT=!ENV_VALUE!"
+if not defined APP_PORT set "APP_PORT=%PORT%"
+if not defined APP_PORT set "APP_PORT=3333"
+exit /b 0
+
+:wait_port_free
+call :resolve_port
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=%APP_PORT%; for ($i=0; $i -lt 20; $i++) { $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue; if (-not $c) { exit 0 }; $c | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 1000 }; exit 1"
+if errorlevel 1 echo [警告] 端口 %APP_PORT% 仍被占用，启动可能失败
+exit /b 0
+
+:restart_service
+:: 更新脚本由运行中的后端派生，继承其环境变量（含 HTTPS=true）。
+:: 再显式读一次 .env 的 HTTPS：即使更新包覆盖了 .env，也能保持 HTTPS 模式，
+:: 否则 HTTPS 部署更新后会以 HTTP 启动，表现为「更新后服务打不开」。
+call :resolve_port
+if not defined HTTPS (
+  call :read_env_value HTTPS
+  if /i "!ENV_VALUE!"=="true" set "HTTPS=true"
+)
 echo [更新脚本] 重新启动服务...
 :: 直接调用 powershell 执行 start.ps1，绕过 start.bat
 :: start.bat 中如果 PowerShell 检查失败会执行 pause，在隐藏窗口下会无限等待
@@ -604,30 +665,22 @@ set "PS1=%ROOT%\\start.ps1"
 if not exist "%PS1%" set "PS1=%ROOT%\\start-win.ps1"
 if exist "%PS1%" (
   :: 使用 start /b 在后台启动 powershell，不创建可见窗口
-  :: powershell 会异步启动后端和前端（Start-Process -WindowStyle Hidden），然后退出
+  :: powershell 会异步启动后端（Start-Process -WindowStyle Hidden），然后退出
   start "" /b powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" start
 ) else if exist "%ROOT%\\start.bat" (
   :: 回退到 start.bat start（传递 start 参数避免进入交互菜单）
   start "" /b "%ROOT%\\start.bat" start
 ) else (
   :: 最终回退：直接启动后端 exe，手动设置环境变量
-  :: 统一端口：前后端共用同一端口（默认 3333），由后端托管前端静态文件
   echo [更新脚本] 未找到 start.ps1/start.bat，直接启动 exe
-  if exist "%ROOT%\\.env" (
-    for /f "usebackq tokens=1,* delims==" %%a in ("%ROOT%\\.env") do (
-      if /i "%%a"=="PORT" set "PORT=%%b"
-    )
-  )
-  if not defined PORT set "PORT=3333"
   set "NODE_ENV=production"
   set "HOST=::"
   start "" /D "%ROOT%" "%ROOT%\\zviewer-backend.exe"
 )
 
-echo [更新脚本] 更新完成，服务正在启动... %date% %time%
-:: 先 exit 再 del：del 自身后脚本立即退出，exit 不会执行
-:: 改为：先退出，由 cmd 在退出后自动释放文件句柄（无法自我删除）
-:: 实际上 del "%~f0" 在 bat 中是可行的，因为脚本已被读入内存
+:: 启动校验：更新后最常见的问题是「脚本跑完了但服务没起来」，
+:: 这里等端口监听，把结论写进 update.log，避免用户只看到「页面打不开」。
+powershell -NoProfile -ExecutionPolicy Bypass -Command "for ($i=0; $i -lt 60; $i++) { if (Get-NetTCPConnection -LocalPort %APP_PORT% -State Listen -ErrorAction SilentlyContinue) { Write-Host ('[更新脚本] 服务已就绪，监听端口 ' + %APP_PORT%); exit 0 }; Start-Sleep -Milliseconds 1000 }; Write-Host ('[更新脚本] 警告：60 秒内未检测到端口 ' + %APP_PORT% + ' 监听，服务可能未启动，请手动运行 start.bat'); exit 1"
 exit /b 0
 `;
   // 关键：Windows bat 文件必须使用 CRLF 换行符！
@@ -807,11 +860,85 @@ TEMP_DIR="${tempDir}"
 EXTRACTED_DIR="${extractedDir}"
 CONFIG_DIR="$ROOT/config"
 CONFIG_BACKUP="$ROOT/.config-backup-$$"
+ENV_FILE="$ROOT/.env"
+ENV_BACKUP=""
 SELF_PID=$$
 LOG_FILE="$ROOT/update.log"
+COPY_FAILED=0
 
 # 将输出重定向到日志文件，方便诊断更新失败原因
 exec >> "$LOG_FILE" 2>&1
+
+# ==================== 工具函数 ====================
+
+port_in_use() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN
+  else
+    return 1
+  fi
+}
+
+kill_port_holder() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser -k "$port/tcp" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# 端口优先级：环境变量 > .env > 3333（与 start.sh 保持一致）
+resolve_port() {
+  APP_PORT="\${PORT:-}"
+  if [ -z "$APP_PORT" ] && [ -f "$ENV_FILE" ]; then
+    APP_PORT=$(grep -E '^PORT=' "$ENV_FILE" | head -n 1 | cut -d= -f2- | tr -d '"' | xargs)
+  fi
+  if [ -z "$APP_PORT" ]; then
+    APP_PORT=3333
+  fi
+}
+
+# 等待端口释放并按端口清理残留占用者：
+# 按进程名没杀干净时（进程被改名 / 手动启动的实例），start.sh 会因为
+# 「端口已被占用」直接拒绝启动 —— 表现就是「更新脚本跑完了，服务没起来」。
+wait_port_free() {
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if ! port_in_use "$APP_PORT"; then
+      return 0
+    fi
+    kill_port_holder "$APP_PORT"
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "[警告] 端口 $APP_PORT 仍被占用，启动可能失败"
+  return 0
+}
+
+# HTTPS 模式：更新脚本由运行中的后端派生，继承其环境变量（含 HTTPS=true）；
+# 同时读一次 .env 的 HTTPS。若不带这个信息，HTTPS 部署更新后会以 HTTP 启动，
+# 用户看到的就是「更新后服务打不开」。
+resolve_https() {
+  if [ "\${HTTPS:-}" = "true" ]; then
+    export HTTPS=true
+    return 0
+  fi
+  if [ -f "$ENV_FILE" ]; then
+    local v
+    v=$(grep -E '^HTTPS=' "$ENV_FILE" | head -n 1 | cut -d= -f2- | tr -d '"' | xargs)
+    case "$v" in
+      true|TRUE|True|1) export HTTPS=true ;;
+    esac
+  fi
+  return 0
+}
+
+# ==================== 主流程 ====================
 
 echo ""
 echo "========================================"
@@ -834,6 +961,10 @@ for pid in $(pgrep -f "zviewer-cert" 2>/dev/null); do
   [ "$pid" != "$SELF_PID" ] && kill -9 "$pid" 2>/dev/null || true
 done
 
+echo "[更新脚本] 等待端口释放..."
+resolve_port
+wait_port_free
+
 # 备份 config 目录
 echo "[更新脚本] 备份 config 目录..."
 if [ -d "$CONFIG_DIR" ]; then
@@ -842,25 +973,37 @@ if [ -d "$CONFIG_DIR" ]; then
   echo "[更新脚本] 已备份 config 到 $CONFIG_BACKUP"
 fi
 
-echo "[更新脚本] 应用新文件..."
-if [ ! -d "$EXTRACTED_DIR" ]; then
-  echo "[错误] 未找到解压目录：$EXTRACTED_DIR"
-  if [ -d "$CONFIG_BACKUP" ]; then
-    cp -rf "$CONFIG_BACKUP" "$CONFIG_DIR"
+# 备份 .env（用户配置：端口 / HTTPS / JWT 密钥等）。
+# 更新包里带的是模板 .env：直接覆盖会重置端口与密钥，改了端口的部署会
+# 「起在别的端口上」，HTTPS 部署会退回 HTTP，看起来都像「更新后没起来」。
+echo "[更新脚本] 备份 .env..."
+if [ -f "$ENV_FILE" ]; then
+  ENV_BACKUP="$ROOT/.env-backup-$$"
+  if cp -f "$ENV_FILE" "$ENV_BACKUP" 2>/dev/null; then
+    echo "[更新脚本] 已备份 .env 到 $ENV_BACKUP"
+  else
+    echo "[警告] .env 备份失败，将沿用更新包内的 .env"
+    ENV_BACKUP=""
   fi
-  exit 1
 fi
 
-cp -rf "$EXTRACTED_DIR/"* "$ROOT/" 2>/dev/null || true
-chmod +x "$ROOT/zviewer-frontend" "$ROOT/zviewer-backend" "$ROOT/zviewer-cert" 2>/dev/null || true
-
-# 验证关键文件是否存在
-if [ ! -f "$ROOT/zviewer-backend" ]; then
-  echo "[错误] 更新后未找到 zviewer-backend，更新包可能损坏"
-  if [ -d "$CONFIG_BACKUP" ]; then
-    cp -rf "$CONFIG_BACKUP" "$CONFIG_DIR"
+echo "[更新脚本] 应用新文件..."
+# 复制失败不再直接退出：无论复制结果如何，最后都必须尝试把服务拉起来
+# （服务停着才是最坏结果，用户至少要能进后台重试）。
+if [ ! -d "$EXTRACTED_DIR" ]; then
+  echo "[错误] 未找到解压目录：$EXTRACTED_DIR"
+  COPY_FAILED=1
+else
+  # 注意：通配符不会匹配隐藏文件（.env），用户 .env 不会被更新包覆盖
+  cp -rf "$EXTRACTED_DIR/"* "$ROOT/" 2>/dev/null || COPY_FAILED=1
+  chmod +x "$ROOT/zviewer-backend" "$ROOT/zviewer-cert" 2>/dev/null || true
+  if [ -f "$EXTRACTED_DIR/start.sh" ]; then
+    chmod +x "$ROOT/start.sh" 2>/dev/null || true
   fi
-  exit 1
+  if [ ! -f "$ROOT/zviewer-backend" ]; then
+    echo "[错误] 更新后未找到 zviewer-backend，更新包可能损坏"
+    COPY_FAILED=1
+  fi
 fi
 
 # 恢复 config 目录
@@ -872,14 +1015,26 @@ if [ -d "$CONFIG_BACKUP" ]; then
   echo "[更新脚本] 已恢复 config 目录（用户数据已保留）"
 fi
 
+# 恢复 .env
+if [ -n "$ENV_BACKUP" ] && [ -f "$ENV_BACKUP" ]; then
+  cp -f "$ENV_BACKUP" "$ENV_FILE" 2>/dev/null || true
+  rm -f "$ENV_BACKUP"
+  echo "[更新脚本] 已恢复 .env（用户配置已保留）"
+fi
+
 echo "[更新脚本] 清理临时文件..."
 rm -rf "$TEMP_DIR"
+
+if [ "$COPY_FAILED" -ne 0 ]; then
+  echo "[警告] 本次更新存在文件复制错误，将尝试用现有文件启动服务"
+fi
 
 echo "[更新脚本] 重新启动服务..."
 # 关键：必须传递 start 参数！
 # start.sh 无参数时默认进入交互菜单（read 等待输入），
 # 而更新脚本在后台运行，用户无法看到菜单也无法输入，
 # 导致服务永远无法启动，看起来像"文件没有替换"。
+resolve_https
 cd "$ROOT"
 if [ -f "$ROOT/start.sh" ]; then
   nohup ./start.sh start > /dev/null 2>&1 &
@@ -892,12 +1047,29 @@ else
   if [ -f "$ROOT/.env" ]; then
     ENV_PORT=$(grep -E '^PORT=' "$ROOT/.env" | head -n 1 | cut -d= -f2- | tr -d '"' | xargs)
   fi
-  PORT="\${ENV_PORT:-3333}"
-  PORT="$PORT" NODE_ENV=production HOST=:: \
-    nohup "$ROOT/zviewer-backend" > /dev/null 2>&1 &
+  PORT="\${ENV_PORT:-3333}" NODE_ENV=production HOST=::     nohup "$ROOT/zviewer-backend" > /dev/null 2>&1 &
 fi
 
-echo "[更新脚本] 更新完成，服务正在启动... $(date)"
+# 启动校验：更新后最常见的问题就是「脚本跑完了但服务没起来」，
+# 这里等端口监听，把结论写进 update.log，避免用户只看到「页面打不开」。
+echo "[更新脚本] 校验服务是否已启动..."
+STARTED=0
+i=0
+while [ "$i" -lt 60 ]; do
+  if port_in_use "$APP_PORT"; then
+    STARTED=1
+    break
+  fi
+  sleep 1
+  i=$((i + 1))
+done
+if [ "$STARTED" -eq 1 ]; then
+  echo "[更新脚本] 服务已就绪，监听端口 $APP_PORT"
+else
+  echo "[更新脚本] 警告：60 秒内未检测到端口 $APP_PORT 监听，服务可能未启动，请手动执行 ./start.sh start"
+fi
+
+echo "[更新脚本] 更新完成 $(date)"
 rm -f "$0"
 exit 0
 `;

@@ -133,6 +133,30 @@ function hasPicture(video: HTMLVideoElement): boolean {
 }
 
 /**
+ * 是否为「按 movieId 的挂载源流代理」地址（/api/emby/stream?movieId=N、
+ * /api/jellyfin/stream?movieId=N）。
+ *
+ * 这类地址同时是两种东西：默认是 Emby/Jellyfin 服务端转码的 HLS 播放列表
+ * （movie.format='hls' 时），加上 static=1 则是原始文件直推（浏览器端自己
+ * 处理容器与音轨）。因此服务端转码不可用时可原地降级，不需要重新解析。
+ */
+function isMountStreamUrl(url: string): boolean {
+  try {
+    const u = new URL(url, window.location.origin)
+    return /^\/api\/(emby|jellyfin)\/stream$/.test(u.pathname)
+  } catch {
+    return false
+  }
+}
+
+/** 在挂载源流代理地址上追加 static=1（强制原始文件直推） */
+function toStaticStreamUrl(url: string): string {
+  const u = new URL(url, window.location.origin)
+  u.searchParams.set('static', '1')
+  return u.pathname + u.search
+}
+
+/**
  * 「有声音没画面」的用户文案。
  *
  * 已开启服务端转码却仍不出画 → 说明重编码也没救回来（片源本身有问题）；
@@ -714,6 +738,74 @@ export function usePlayerSource(
     [enqueue, attachDirectFallback]
   )
   /**
+   * Emby/Jellyfin 服务端转码（HLS）不可用时的降级：改推原始文件（static=1）。
+   *
+   * 背景：片源音轨浏览器不支持（DTS/EAC3/TrueHD）时，后端把影片解析成
+   * Emby 服务端转码的 HLS 播放列表（movie.format='hls'），前端固定用
+   * hls-engine 播放。但服务端转码依赖 Emby 自身的转码能力，失败形态
+   * （转码器报错、条目不可转码、地址失效）表现为播放列表请求直接非 2xx——
+   * hls.js 只会抛「manifestLoadError」，用户看到的是一句无从下手的报错，
+   * 影片则完全不播。
+   *
+   * 这里原地降级为原始文件直推：容器与音轨交给浏览器端处理
+   * （forcePlaysVideo 让 playsvideo 管线接管不兼容音轨），至少让影片能播，
+   * 与「宁可能看但可能缺音轨，也不留永久黑屏」的既有降级策略一致。
+   *
+   * @returns 是否已成功挂载直推流
+   */
+  const attachMountStaticFallback = useCallback(
+    async (
+      video: HTMLVideoElement,
+      source: PlayerSource,
+      reason: string
+    ): Promise<boolean> => {
+      if (!isMountStreamUrl(source.url)) return false
+      const staticUrl = toStaticStreamUrl(source.url)
+      // 容器未知（Emby 条目多为 mkv/mp4）：声明为浏览器可开的 mp4 通过格式预检，
+      // 真实容器由浏览器/管线自行嗅探；forcePlaysVideo 交给浏览器端管线处理音轨。
+      const fallbackSource: PlayerSource = {
+        ...source,
+        url: staticUrl,
+        format: 'mp4',
+        forcePlaysVideo: true,
+        mkvFastPath: false,
+      }
+      try {
+        const engine = selectEngine(fallbackSource)
+        // 仍选中 hls 说明降级前提不成立（例如服务端转码地址未变），放弃
+        if (engine.type === 'hls') return false
+        cleanup()
+        resetVideoElement(video)
+        // appliedSourceUrlRef 保持业务层原始 URL：attachSource 的「同源不重复加载」
+        // 去重、播放期 error 监听与看门狗的「是否仍是当前源」判定都依赖它。
+        appliedSourceUrlRef.current = source.url
+        const result = await engine.attach(video, fallbackSource)
+        if (!applyAttachResult(result)) return false
+        console.warn(
+          `[usePlayerSource] ${reason}，已降级为原始文件直推（static=1）播放`
+        )
+        registerPlaybackErrorWatch(video, source, engine.type)
+        if (engine.type === 'playsvideo') {
+          armFirstFrameWatch(video, source)
+        } else {
+          armNoPictureWatch(video, source)
+        }
+        return true
+      } catch (err) {
+        console.warn('[usePlayerSource] 原始文件直推同样失败:', err)
+        return false
+      }
+    },
+    [
+      cleanup,
+      applyAttachResult,
+      registerPlaybackErrorWatch,
+      armFirstFrameWatch,
+      armNoPictureWatch,
+    ]
+  )
+
+  /**
    * attach 的内部实现（不入队）。调用方必须已处于串行上下文中。
    * 切换顺序：先 cleanup 旧引擎（中断其下载），再 reset video，最后 attach 新引擎。
    */
@@ -799,6 +891,17 @@ export function usePlayerSource(
             // attached / unmounted：结束本次 attach
             return
           }
+          // Emby/Jellyfin 服务端转码（HLS）播放列表加载失败：降级为原始文件
+          // 直推（static=1），由浏览器端处理容器与音轨。失败原因与状态码已由
+          // hls-engine 写进错误消息（后端会透传上游错误正文）。
+          if (engine.type === 'hls' && isMountStreamUrl(source.url)) {
+            const fellBack = await attachMountStaticFallback(
+              video,
+              source,
+              'Emby/Jellyfin 服务端转码流不可用'
+            )
+            if (fellBack) return
+          }
           if (engine.type === 'playsvideo') {
             // 兜底：转码管线失败但容器本身浏览器原生可开（mkv/mp4/webm/mov）
             // → 尝试原生直连。宁可「能看但可能缺音轨」也不留永久黑屏；
@@ -843,6 +946,7 @@ export function usePlayerSource(
       applyAttachResult,
       attachPlaysVideoFallback,
       attachDirectFallback,
+      attachMountStaticFallback,
       registerPlaybackErrorWatch,
       armFirstFrameWatch,
       armNoPictureWatch,

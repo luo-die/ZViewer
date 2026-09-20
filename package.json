@@ -1,6 +1,6 @@
 {
   "name": "zviewer",
-  "version": "1.0.0",
+  "version": "1.4.1",
   "private": true,
   "description": "ZViewer —— 基于浏览器的在线观影与屏幕共享平台。",
   "workspaces": [

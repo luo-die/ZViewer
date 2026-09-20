@@ -21,6 +21,11 @@ DEFAULT_FLV_PORT=3335
 BACKEND_PORT="${BACKEND_PORT:-}"
 BACKEND_ONLY=0
 HTTPS_MODE=0
+# 是否需要在启动前签发/续签证书：
+# 只有显式要求 HTTPS（--https / https 命令 / 菜单选项）才签发；
+# 由 .env / 环境变量 HTTPS=true 打开的 HTTPS 只「使用」HTTPS，不重新签发
+# （自动更新后的重启走这条，既没有交互输入通道，也不该反复申请证书）。
+CERT_ISSUE=0
 CERT_HOST=""
 CERT_FORCE=""
 
@@ -47,6 +52,26 @@ resolve_ports() {
   fi
   RTMP_PORT="$(env_port_value RTMP_PORT "$DEFAULT_RTMP_PORT")"
   HTTP_FLV_PORT="$(env_port_value HTTP_FLV_PORT "$DEFAULT_FLV_PORT")"
+}
+
+# HTTPS 模式来源（二者取或）：
+# - 显式 --https（start/restart/https 命令、菜单选项）：使用 HTTPS 并签发/续签证书
+# - .env 或环境变量 HTTPS=true：只使用 HTTPS，不重新签发证书
+#   自动更新后的重启走的是后一条：更新脚本由运行中的后端派生，带着 HTTPS=true。
+#   少了这条，HTTPS 部署更新后会以 HTTP 起来，页面直接打不开
+#   （表现为「更新后服务没自启动」）。
+resolve_https_mode() {
+  if [ "$HTTPS_MODE" -eq 1 ]; then
+    return 0
+  fi
+  local val="${HTTPS:-}"
+  if [ -z "$val" ] && [ -f "$ENV_FILE" ]; then
+    val=$(grep -E '^HTTPS=' "$ENV_FILE" | head -n 1 | cut -d= -f2- | tr -d '"' | xargs)
+  fi
+  case "$val" in
+    true|TRUE|True|1) HTTPS_MODE=1 ;;
+  esac
+  return 0
 }
 
 write_pids() {
@@ -181,6 +206,7 @@ do_cert() {
 
 do_start() {
   resolve_ports
+  resolve_https_mode
   echo "========================================"
   echo "  ZViewer 启动"
   echo "  端口: $BACKEND_PORT"
@@ -208,16 +234,27 @@ do_start() {
     fi
   fi
 
-  # HTTPS 模式：先签发证书
+  # HTTPS 模式：显式 --https 时按用户选择签发/续签；仅由 .env 开启 HTTPS 时
+  # 只在证书缺失时补一张自签证书（更新后的自动重启没有输入通道，
+  # select_cert_host 的 read 会立刻拿到 EOF）
   if [ "$HTTPS_MODE" -eq 1 ]; then
-    if ! has_exe "$CERT_BIN" "证书工具 zviewer-cert"; then return 1; fi
-    if [ -z "$CERT_HOST" ]; then
-      select_cert_host
+    CERT_MISSING=0
+    if [ ! -f "$ROOT_DIR/config/ssl/cert.pem" ] || [ ! -f "$ROOT_DIR/config/ssl/key.pem" ]; then
+      CERT_MISSING=1
     fi
-    issue_cert
-    if [ "$CERT_RC" -ne 0 ]; then
-      echo "  [证书] 签发失败，HTTPS 启动中止"
-      return 1
+    if [ "$CERT_ISSUE" -eq 1 ] || [ "$CERT_MISSING" -eq 1 ]; then
+      if ! has_exe "$CERT_BIN" "证书工具 zviewer-cert"; then return 1; fi
+      if [ "$CERT_ISSUE" -eq 1 ] && [ -z "$CERT_HOST" ]; then
+        select_cert_host
+      fi
+      if [ -z "$CERT_HOST" ]; then
+        CERT_HOST="localhost"
+      fi
+      issue_cert
+      if [ "$CERT_RC" -ne 0 ]; then
+        echo "  [证书] 签发失败，HTTPS 启动中止"
+        return 1
+      fi
     fi
   fi
 
@@ -365,14 +402,14 @@ do_menu() {
       2) BACKEND_ONLY=1
         printf "  请选择类型 (1=HTTP 2=HTTPS，直接回车默认 HTTP): "
         read BO_CHOICE
-        if [ "$BO_CHOICE" = "2" ]; then HTTPS_MODE=1; else HTTPS_MODE=0; fi
+        if [ "$BO_CHOICE" = "2" ]; then HTTPS_MODE=1; CERT_ISSUE=1; else HTTPS_MODE=0; CERT_ISSUE=0; fi
         do_start; wait_key ;;
       3) do_stop; wait_key ;;
       4) do_restart; wait_key ;;
       5) do_status; wait_key ;;
       6) do_logs; wait_key ;;
       7) do_cert; wait_key ;;
-      8) BACKEND_ONLY=0; HTTPS_MODE=1; do_start; wait_key ;;
+      8) BACKEND_ONLY=0; HTTPS_MODE=1; CERT_ISSUE=1; do_start; wait_key ;;
       0) return 0 ;;
       *) echo "  无效输入，请重新选择"; sleep 1 ;;
     esac
@@ -391,7 +428,7 @@ wait_key() {
 parse_start_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --https) HTTPS_MODE=1; shift ;;
+      --https) HTTPS_MODE=1; CERT_ISSUE=1; shift ;;
       --force) CERT_FORCE="--force"; shift ;;
       *)
         if [ -z "$CERT_HOST" ]; then
@@ -452,6 +489,7 @@ case "$CMD" in
   https)
     shift
     HTTPS_MODE=1
+    CERT_ISSUE=1
     parse_start_args "$@"
     do_start
     ;;
