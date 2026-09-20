@@ -299,7 +299,15 @@ router.post('/session', async (req: AuthenticatedRequest, res: Response): Promis
     const source = (movie.source || '').trim();
     let inputPath: string;
     if (MOUNT_SOURCES.includes(source)) {
-      inputPath = `/api/${source}/stream?movieId=${movie.id}`;
+      // static=1：强制媒体服务器**直推原始文件**。
+      //
+      // 不带这个参数时，Emby/Jellyfin 的 /stream 会按影片记录里的 format 决定取哪条流：
+      // movie.format='hls'（片源音轨浏览器不支持时后端自动标记）会去拉媒体的
+      // main.m3u8 —— 那是一条转码播放列表，而 ffmpeg 拿到的是「没有扩展名的 URL」，
+      // 既无法按 m3u8 解析，又会被媒体服务器直接拒绝：
+      //   服务端转码失败：Error opening input: Server returned 400 Bad Request
+      // ffmpeg 自己会解容器/解码，只需要原始码流，因此这里必须显式要求直推。
+      inputPath = `/api/${source}/stream?movieId=${movie.id}&static=1`;
     } else if (source === 'server-files') {
       if (!movie.path) {
         res.status(400).json({ success: false, message: '影片缺少文件路径，无法服务端转码' });

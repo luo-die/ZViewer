@@ -957,8 +957,21 @@ export function useSubtitles({
           label?: string
           language?: string | null
           message?: string
-          /** 服务端返回的提取进度（已解析字节数 / 批次数），没有时为 null */
-          progress?: { bytes: number; batches: number } | null
+          /**
+           * 服务端返回的提取进度，没有时为 null。
+           *
+           * bytes/batches 是「已解出的字幕字节数与批次数」——解容器前几十秒经常
+           * 一条 cue 都没有，光看它无法区分「在慢慢读」和「已经卡死」；
+           * readBytes/totalBytes/mode 是上游读取进度与当前策略，才是有效信号。
+           */
+          progress?: {
+            bytes: number
+            batches: number
+            readBytes?: number
+            totalBytes?: number
+            mode?: 'range' | 'stream'
+            requests?: number
+          } | null
         }
         // 捕获提取世代：切影片（clearTracks）会递增，回来时若已切片就丢弃结果，
         // 否则会出现「播的是第二部、字幕却是第一部」的串台
@@ -1084,9 +1097,26 @@ export function useSubtitles({
           }
           if (Date.now() - lastPendingLogAt >= PENDING_LOG_INTERVAL_MS) {
             lastPendingLogAt = Date.now()
-            const progressText = data.progress
-              ? `已解析 ${(data.progress.bytes / 1024).toFixed(0)}KB / 第 ${data.progress.batches} 批`
-              : '尚未读到字幕数据'
+            const progressText = (() => {
+              const p = data.progress
+              if (!p) return '尚未读到字幕数据'
+              const parts: string[] = []
+              // 上游读取进度放前面：它才是「有没有在动」的判断依据
+              if (p.readBytes) {
+                const total = p.totalBytes
+                  ? `/${(p.totalBytes / 1048576).toFixed(0)}MB`
+                  : ''
+                const mode = p.mode === 'range' ? '跳读' : '顺序流'
+                const reqs = p.requests ? `，请求 ${p.requests}` : ''
+                parts.push(
+                  `已读取 ${(p.readBytes / 1048576).toFixed(1)}MB${total}（${mode}${reqs}）`
+                )
+              }
+              parts.push(
+                `已解析 ${(p.bytes / 1024).toFixed(0)}KB / 第 ${p.batches} 批`
+              )
+              return parts.join(' · ')
+            })()
             console.info(
               `[useSubtitles] 服务端${data.message || '正在提取内嵌字幕…'}｜${progressText}｜已等待 ${Math.round((Date.now() - startedAt) / 1000)}s`
             )

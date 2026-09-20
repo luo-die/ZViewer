@@ -41,14 +41,19 @@ const CHUNK_SIZE = 4 * 1024 * 1024;
 
 /**
  * 「跳读」模式（Range 跳过视频负载）的窗口大小。
- * 顺序流要下载整个文件（940MB 的单集约 2 分钟），而字幕只占其中极小一段；
- * 跳读模式下解析器只按需取小块：解析到视频块就只推进指针（不下载），
- * 到下一个元素再抓一个小窗口。窗口越小省得越多，但请求数越多。
- * 64KB 是折中：每个视频块浪费 ≤64KB，25 分钟剧集约 300~600 个请求、~20MB。
+ *
+ * 关键事实：MKV 的字幕块散落在**每个 Cluster 内部**，而块头（含负载长度）只有
+ * 十几字节 —— 想找齐字幕就必须把整条文件「按块头走一遍」。也就是说跳读省下的是
+ * 「不在窗口里的视频负载」，而窗口本身仍会被下载。因此窗口过小有两个代价：
+ *   1. 请求数 ≈ 文件大小 / 窗口大小（1GB 文件 64KB 窗口 = 1.6 万次请求）；
+ *   2. 上游请求是**串行 + 最小间隔**的（防 429），请求数直接乘以等待时间 ——
+ *      1.6 万次 × 30ms 光是间隔就 8 分钟，比顺序流还慢。
+ * 512KB 窗口把请求数压到 1/8，同一份文件的提取时间从「分钟级」降到「十几秒级」；
+ * 解析器在窗口内读到的块头是顺带下载的，浪费比例很小（视频负载本来就要跳过）。
  */
 const SKIP_WINDOW_BYTES = (() => {
-  const raw = Number(process.env.MKV_SKIP_WINDOW_KB ?? 64);
-  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1024) : 64 * 1024;
+  const raw = Number(process.env.MKV_SKIP_WINDOW_KB ?? 512);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1024) : 512 * 1024;
 })();
 
 /**
@@ -57,14 +62,14 @@ const SKIP_WINDOW_BYTES = (() => {
  * 遇到 429 会自适应翻倍（见 HttpByteReader.onRateLimit）。
  */
 const SKIP_MIN_INTERVAL_MS = (() => {
-  const raw = Number(process.env.MKV_SKIP_MIN_INTERVAL_MS ?? 30);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 30;
+  const raw = Number(process.env.MKV_SKIP_MIN_INTERVAL_MS ?? 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 10;
 })();
 
 /** 跳读模式的请求预算：超过后自动降级为顺序流（从当前位置继续），避免请求风暴 */
 const SKIP_MAX_REQUESTS = (() => {
-  const raw = Number(process.env.MKV_SKIP_MAX_REQUESTS ?? 1500);
-  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 1500;
+  const raw = Number(process.env.MKV_SKIP_MAX_REQUESTS ?? 6000);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 6000;
 })();
 
 /** 小于该体积的文件直接用顺序流（1 个请求就够，跳读没有收益） */
@@ -204,6 +209,24 @@ export interface MkvProbeResult {
   timestampScale: number;
   /** 文件总大小（0 = 未知）；提取阶段据此选择跳读 / 顺序流 */
   fileSize: number;
+}
+
+/**
+ * 提取进度（供接口把「到底有没有在动」暴露给前端）。
+ *
+ * 只报字幕字节数是没有意义的：客户端解容器时前几十秒往往一条 cue 都没有，
+ * 界面就一直是「已解析 0KB」，看起来像卡死。真正能说明问题的是「上游已读了多少
+ * 字节 / 总共多少字节」以及当前用的是跳读还是顺序流。
+ */
+export interface MkvExtractProgress {
+  /** 已从上游读取（或跳读越过）的字节位置 */
+  bytesRead: number;
+  /** 文件总大小（0 = 未知） */
+  totalBytes: number;
+  /** range=跳读（窗口式 Range）；stream=顺序流（单请求整读） */
+  mode: 'range' | 'stream';
+  /** 已发出的上游请求数（跳读模式下的主要耗时因素） */
+  requests: number;
 }
 
 export interface MkvExtractResult {
@@ -816,6 +839,8 @@ export async function extractMkvSubtitleTrack(
   trackNumber: number,
   /** 提取过程中回调「已读到的部分字幕」（约每 5 秒一次，供前端渐进显示） */
   onPartial?: (content: string) => void,
+  /** 提取过程中回调「读取进度」（每个 Cluster 一次，供前端展示真实进展） */
+  onProgress?: (info: MkvExtractProgress) => void,
 ): Promise<MkvExtractResult> {
   // 提取整轨必须遍历全部 Cluster，两种读取策略：
   // - 顺序流（1 个请求，下载整个文件）：请求数最少、最稳，但 940MB 的单集要读 1~2 分钟，
@@ -1024,6 +1049,22 @@ export async function extractMkvSubtitleTrack(
           }
         }
         emitPartial();
+        // 真实读取进度：前端据此显示「已读取 X MB / 共 Y GB（跳读/顺序流）」，
+        // 而不是只看到「已解析 0KB」这种看不出死活的数字
+        const emitProgress = (): void => {
+          if (!onProgress) return;
+          try {
+            onProgress({
+              bytesRead: reader.position,
+              totalBytes: reader.fileSize || opts.fileSizeHint || 0,
+              mode: reader.rangeSupported ? 'range' : 'stream',
+              requests: reader.requestCount,
+            });
+          } catch {
+            /* 进度上报失败不影响提取 */
+          }
+        };
+        emitProgress();
         // 自适应决策：顺序流跑了一小段后，按实测吞吐推算「整集读完要多久」，
         // 太慢就切跳读（从当前 Cluster 边界续读，不重头来）。
         if (!strategyDecided && reader.position > 0) {
@@ -1060,6 +1101,8 @@ export async function extractMkvSubtitleTrack(
               );
             }
             strategyDecided = true;
+            // 模式刚变化：立刻把新模式的进度报出去，界面马上能看到「已切跳读」
+            emitProgress();
           }
         }
         // 请求预算保护：跳读模式请求数超限时降级为「从当前位置继续的顺序流」
@@ -1114,6 +1157,7 @@ export async function extractMkvSubtitleTrack(
         { ...opts, mode: 'stream' },
         trackNumber,
         onPartial,
+        onProgress,
       );
     }
     if (parseError && cues.length === 0) {
