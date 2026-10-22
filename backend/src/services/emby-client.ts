@@ -474,6 +474,10 @@ const playbackInfoCache = new Map<
 >();
 const PLAYBACK_INFO_TTL_MS = 60_000;
 
+/** 条目详情缓存（60s）：字幕链路会多次问同一条目的 MediaStreams */
+const itemDetailCache = new Map<string, { at: number; value: EmbyItem }>();
+const ITEM_DETAIL_TTL_MS = 60_000;
+
 function gateKeyOf(baseUrl: string, token?: string): string {
   // token 只取前 8 位参与 key：不同账号分开限流，又不把凭据留在内存 map 的 key 里
   return `${baseUrl}|${(token ?? '').slice(0, 8)}`;
@@ -950,10 +954,23 @@ export class EmbyClient {
    * 列出容器里的全部流。emby-direct-web / jellyfin-web 取字幕 Index 用的就是它。
    */
   async itemDetail(userId: string, itemId: string): Promise<EmbyItem> {
-    return this.request<EmbyItem>({
+    // 60s 缓存：字幕链路一次播放里可能被「PlaybackInfo 兜底」和「找外挂轨」
+    // 各调一次；不缓存会把同一条目详情重复打到上游（也是 429 的来源之一）。
+    const cacheKey = `${this.baseUrl}|${userId}|${itemId}`;
+    const cached = itemDetailCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < ITEM_DETAIL_TTL_MS) {
+      return cached.value;
+    }
+    const value = await this.request<EmbyItem>({
       path: `/emby/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}`,
       query: { Fields: 'MediaStreams,MediaSources' },
     });
+    itemDetailCache.set(cacheKey, { at: Date.now(), value });
+    if (itemDetailCache.size > 300) {
+      const oldest = itemDetailCache.keys().next().value;
+      if (oldest) itemDetailCache.delete(oldest);
+    }
+    return value;
   }
 
   /** 停止转码 POST /emby/Videos/ActiveEncodings/Delete */

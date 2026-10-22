@@ -839,7 +839,13 @@ async function getEmbyStreams(ctx: {
     source ? [source] : [],
   );
 
-  if (!streams.some((s) => s.Type === 'Subtitle')) {
+  // PlaybackInfo 不可靠：转码时可能既没有字幕流，也可能只给内嵌、把外挂轨藏掉。
+  // 只要它没给出「外挂字幕」，就补问一次条目详情，并把详情里多出来的流合并进来
+  // （按 媒体源+Index 去重，避免同一条轨出现两次）。
+  const hasExternalSubtitle = streams.some(
+    (s) => s.Type === 'Subtitle' && s.IsExternal === true,
+  );
+  if (!hasExternalSubtitle) {
     const detail = await ctx.client
       .itemDetail(ctx.userId, ctx.itemId)
       .catch(() => null);
@@ -852,11 +858,24 @@ async function getEmbyStreams(ctx: {
       })),
     ];
     if (detailStreams.length > 0) {
-      console.info(
-        `[subtitles] PlaybackInfo 无字幕流，改用条目详情（${detailStreams.length} 条流，${detail?.MediaSources?.length ?? 0} 个媒体源）`,
-      );
-      streams = detailStreams;
-      mediaSourceId = detail?.MediaSources?.[0]?.Id ?? mediaSourceId;
+      const seen = new Set(streams.map((s) => `${s.MediaSourceId ?? ''}|${s.Index}`));
+      const added: EmbyStreamWithSource[] = [];
+      for (const stream of detailStreams) {
+        const key = `${stream.MediaSourceId ?? ''}|${stream.Index}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        added.push(stream);
+      }
+      if (added.length > 0) {
+        console.info(
+          `[subtitles] 条目详情补充 ${added.length} 条流` +
+            `（PlaybackInfo 字幕 ${streams.filter((s) => s.Type === 'Subtitle').length} 条，` +
+            `详情 ${detailStreams.filter((s) => s.Type === 'Subtitle').length} 条，` +
+            `${detail?.MediaSources?.length ?? 0} 个媒体源）`,
+        );
+        streams = [...streams, ...added];
+        mediaSourceId = detail?.MediaSources?.[0]?.Id ?? mediaSourceId;
+      }
     }
   }
 

@@ -53,6 +53,125 @@ const IMAGE_MAX_CONCURRENT = 4;
 let imageActive = 0;
 const imageWaiters: Array<() => void> = [];
 
+/**
+ * 封面图内存 LRU 缓存。
+ *
+ * 同一张封面会被反复请求：同一用户来回翻页、多个观看者看同一个库、刷新页面。
+ * 每次回源既慢又吃上游限流额度（429 的主要来源之一）。这里按
+ * mount + item + 类型 + tag + 尺寸做 key（tag 变化自动失效），命中直接回内存。
+ * 上限 64MB，超过就按插入顺序淘汰最老的（Map 的迭代顺序即插入顺序）。
+ */
+interface CachedImage {
+  buf: Buffer;
+  contentType: string;
+  at: number;
+}
+const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const IMAGE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+/** 单张封面上限：超过基本是错误页或原图，不值得进缓存 */
+const IMAGE_MAX_ITEM_BYTES = 8 * 1024 * 1024;
+const imageCache = new Map<string, CachedImage>();
+let imageCacheBytes = 0;
+const imageInflight = new Map<string, Promise<CachedImage | null>>();
+
+function imageCacheKey(
+  mountId: number,
+  itemId: string,
+  type: string,
+  tag: string | undefined,
+  maxWidth: number,
+  maxHeight: number,
+): string {
+  return `${mountId}|${itemId}|${type}|${tag ?? ''}|${maxWidth}x${maxHeight}`;
+}
+
+function readImageCache(key: string): CachedImage | null {
+  const hit = imageCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > IMAGE_CACHE_TTL_MS) {
+    imageCache.delete(key);
+    imageCacheBytes -= hit.buf.length;
+    return null;
+  }
+  // LRU：命中后挪到队尾
+  imageCache.delete(key);
+  imageCache.set(key, hit);
+  return hit;
+}
+
+function writeImageCache(key: string, entry: CachedImage): void {
+  if (entry.buf.length > IMAGE_MAX_ITEM_BYTES) return;
+  const old = imageCache.get(key);
+  if (old) {
+    imageCache.delete(key);
+    imageCacheBytes -= old.buf.length;
+  }
+  imageCache.set(key, entry);
+  imageCacheBytes += entry.buf.length;
+  while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+    const oldestKey = imageCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = imageCache.get(oldestKey);
+    if (oldest) imageCacheBytes -= oldest.buf.length;
+    imageCache.delete(oldestKey);
+  }
+}
+
+/** 直接回源取一张封面（受 image slot 与全局闸门约束） */
+async function fetchImageUpstream(
+  url: string,
+  token: string,
+  baseUrl: string,
+): Promise<CachedImage | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'X-Emby-Token': token,
+        Referer: baseUrl,
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') ?? 'image/jpeg';
+    if (!contentType.startsWith('image/')) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length === 0 || buf.length > IMAGE_MAX_ITEM_BYTES) return null;
+    return { buf, contentType, at: Date.now() };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 目录列表短缓存（30s）。
+ * 来回翻页、多个观看者看同一个媒体库、刷新页面都会重复请求同一层目录；
+ * 30 秒内的重复请求直接回缓存，既不增加上游请求也不影响"刚入库想看新片"。
+ */
+const browseCache = new Map<string, { at: number; payload: unknown }>();
+const BROWSE_CACHE_TTL_MS = 30_000;
+
+function sendCachedImage(
+  res: Response,
+  entry: CachedImage,
+  etag: string,
+  ifNoneMatch?: string,
+): void {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('ETag', etag);
+  if (ifNoneMatch === etag) {
+    res.status(304).end();
+    return;
+  }
+  res.setHeader('Content-Type', entry.contentType);
+  res.setHeader('Content-Length', String(entry.buf.length));
+  res.end(entry.buf);
+}
+
 async function acquireImageSlot(): Promise<void> {
   if (imageActive < IMAGE_MAX_CONCURRENT) {
     imageActive += 1;
@@ -388,6 +507,14 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
     const mount = access.mount;
 
     const browsePath = typeof req.query.path === 'string' ? req.query.path : '';
+    const cacheKey = `${mountId}|${browsePath || 'views'}`;
+
+    const cachedBrowse = browseCache.get(cacheKey);
+    if (cachedBrowse && Date.now() - cachedBrowse.at < BROWSE_CACHE_TTL_MS) {
+      res.json(cachedBrowse.payload);
+      return;
+    }
+
     const session = await resolveEmbySession(mount);
 
     let items: EmbyItem[] = [];
@@ -397,7 +524,13 @@ router.get('/mounts/:id/browse', async (req: AuthenticatedRequest, res: Response
       items = await session.client.items(session.userId, browsePath);
     }
 
-    res.json({ success: true, entries: items.map(mapEmbyEntry) });
+    const payload = { success: true, entries: items.map(mapEmbyEntry) };
+    browseCache.set(cacheKey, { at: Date.now(), payload });
+    if (browseCache.size > 200) {
+      const oldestKey = browseCache.keys().next().value;
+      if (oldestKey) browseCache.delete(oldestKey);
+    }
+    res.json(payload);
   } catch (err) {
     console.error('[emby] browse mount error:', err);
     const code = extractErrorCode(err);
@@ -487,36 +620,59 @@ router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response)
       return;
     }
 
-    const session = await resolveEmbySession(mount);
-    const upstreamUrl = session.client.buildItemImageUrl(itemId, {
-      type,
-      tag,
-      maxWidth,
-      maxHeight,
-      quality: 90,
-    });
+    const cacheKey = imageCacheKey(mountId, itemId, type, tag, maxWidth, maxHeight);
+    const etag = `"${tag ?? 'notag'}-${maxWidth}x${maxHeight}"`;
+    const ifNoneMatch =
+      typeof req.headers['if-none-match'] === 'string'
+        ? req.headers['if-none-match']
+        : undefined;
 
-    await acquireImageSlot();
-    try {
-      await proxyHttpUpstream(req, res, {
-        url: upstreamUrl,
-        headers: {
-          extra: {
-            'X-Emby-Token': session.token,
-            Referer: session.client.baseUrl,
-          },
-        },
-        cors: 'wildcard',
-        defaultContentType: 'image/jpeg',
-        // 图片内容按 tag 变化（tag 拼在上游 URL 里），可长时间缓存
-        cacheControl: 'public, max-age=86400',
-        timeoutMs: 15_000,
-        logTag: 'emby-image',
-        errorMessage: '获取 Emby 图片失败',
-      });
-    } finally {
-      releaseImageSlot();
+    // 1) 内存命中：不解析会话、不回源，直接回
+    const cached = readImageCache(cacheKey);
+    if (cached) {
+      sendCachedImage(res, cached, etag, ifNoneMatch);
+      return;
     }
+
+    // 2) 同 key 并发请求合并成一次回源（首屏同图重复请求很常见）
+    let pending = imageInflight.get(cacheKey);
+    if (!pending) {
+      pending = (async (): Promise<CachedImage | null> => {
+        await acquireImageSlot();
+        try {
+          const session = await resolveEmbySession(mount);
+          const upstreamUrl = session.client.buildItemImageUrl(itemId, {
+            type,
+            tag,
+            maxWidth,
+            maxHeight,
+            quality: 90,
+          });
+          const img = await fetchImageUpstream(
+            upstreamUrl,
+            session.token,
+            session.client.baseUrl,
+          );
+          if (img) writeImageCache(cacheKey, img);
+          return img;
+        } finally {
+          releaseImageSlot();
+        }
+      })();
+      imageInflight.set(cacheKey, pending);
+      void pending.finally(() => imageInflight.delete(cacheKey)).catch(() => {});
+    }
+
+    const img = await pending;
+    if (!img) {
+      res.status(502).json({
+        success: false,
+        message: '获取 Emby 封面失败（上游未返回图片，可能被限流）',
+        code: 'IMAGE_FETCH_FAILED',
+      });
+      return;
+    }
+    sendCachedImage(res, img, etag, ifNoneMatch);
   } catch (err) {
     console.error('[emby] image proxy error:', err);
     if (!res.headersSent) {

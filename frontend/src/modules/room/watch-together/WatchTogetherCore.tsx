@@ -306,50 +306,13 @@ export function WatchTogetherCore({
     // （HTTP/1.1 每源 6 条），实测表现为「视频流在下载但迟迟不播 / 黑屏」，
     // 还会把媒体服务器的限流额度打满（429）。服务端路径只发 1~2 个请求、
     // 结果落盘缓存，并由 socket 广播给全体观众，无需观众本地再取一次。
-    if (
-      (currentMovieSourceType === 'emby' ||
-        currentMovieSourceType === 'jellyfin') &&
-      currentMovieId != null &&
-      isHost
-    ) {
-      const kind = currentMovieSourceType as 'emby' | 'jellyfin'
-      const movieId = currentMovieId
-      // 延迟 300ms：让起播请求先发出（探测本身只读文件头，代价很小）
-      embeddedTimer = setTimeout(() => {
-        const video = videoRef.current
-        const startExtract = (): void => {
-          void subtitles.autoLoadEmbeddedTracks({ kind, movieId })
-        }
-        // 先并行做一次「字幕轨探测」（只读文件头，几百 KB 量级）：
-        // 探测结果在后端进程内缓存，等起播后真正提取时直接命中，
-        // 省掉提取前那 0.5~1s 的探测等待。失败不影响后续流程。
-        if (embeddedSource) {
-          void subtitles.listEmbeddedTracks(embeddedSource).catch(() => {})
-        }
-        // 起播后再提取最稳（避免与首帧抢带宽），但**最多只等 3s**：
-        // 用户按下播放后 3s 内字幕就该出现，而不是等到视频真的 playing
-        // （慢源可能要十几秒）。服务端解容器已加读取限速（默认 8MB/s），
-        // 即使提前开跑也不会把起播带宽吃满；顺序读取保证开头的 cue 先到。
-        if (!video || (!video.paused && video.readyState >= 2)) {
-          startExtract()
-          return
-        }
-        let started = false
-        const onPlaying = (): void => {
-          if (started) return
-          started = true
-          video.removeEventListener('playing', onPlaying)
-          startExtract()
-        }
-        video.addEventListener('playing', onPlaying)
-        embeddedTimer = setTimeout(() => {
-          if (started) return
-          started = true
-          video.removeEventListener('playing', onPlaying)
-          startExtract()
-        }, 2_000)
-      }, 300)
-    }
+    // Emby / Jellyfin：**不再在开片时自动探测字幕**（懒加载）。
+    //
+    // 以前每次切影片都会打 PlaybackInfo + itemDetail + 内嵌候选，是 429 的
+    // 主要来源之一；而多数播放并不需要切字幕。现在改为用户主动打开
+    // 「设置 → 字幕 → 检测内嵌字幕」时才探测/提取（SettingsPanel 的
+    // onListEmbeddedTracks / onExtractEmbeddedTrack）。
+    // 观众端本来就不探测，仍跟随房主广播。
     return () => clearTimeout(embeddedTimer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
