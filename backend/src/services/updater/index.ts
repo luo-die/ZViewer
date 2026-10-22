@@ -875,11 +875,19 @@ port_in_use() {
   local port="$1"
   if command -v lsof >/dev/null 2>&1; then
     lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-  elif command -v ss >/dev/null 2>&1; then
-    ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN
-  else
-    return 1
+    return $?
   fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | grep -Eq "[:.]$port[[:space:]]"
+    return $?
+  fi
+  # 兜底：bash 内建 /dev/tcp（精简系统没有 lsof/ss/netstat 时）
+  # 少了这个兜底，port_in_use 恒为 false，重启校验会误判「没起来」。
+  (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
 }
 
 kill_port_holder() {
@@ -1037,7 +1045,9 @@ echo "[更新脚本] 重新启动服务..."
 resolve_https
 cd "$ROOT"
 if [ -f "$ROOT/start.sh" ]; then
-  nohup ./start.sh start > /dev/null 2>&1 &
+  # 用 restart 而不是 start：restart 会先按 pid 文件 + 端口清理残留进程，
+  # 避免「端口仍被旧进程占着 → start 直接拒绝启动 → 更新后服务没起来」。
+  nohup ./start.sh restart > /dev/null 2>&1 &
 else
   # 回退方案：start.sh 不存在时直接启动后端 exe，手动设置环境变量
   # 统一端口：前后端共用同一端口（默认 3333），由后端托管前端静态文件
@@ -1055,7 +1065,7 @@ fi
 echo "[更新脚本] 校验服务是否已启动..."
 STARTED=0
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt 120 ]; do
   if port_in_use "$APP_PORT"; then
     STARTED=1
     break
@@ -1066,7 +1076,8 @@ done
 if [ "$STARTED" -eq 1 ]; then
   echo "[更新脚本] 服务已就绪，监听端口 $APP_PORT"
 else
-  echo "[更新脚本] 警告：60 秒内未检测到端口 $APP_PORT 监听，服务可能未启动，请手动执行 ./start.sh start"
+  echo "[更新脚本] 警告：120 秒内未检测到端口 $APP_PORT 监听，服务可能未启动，请手动执行 ./start.sh restart"
+  echo "[更新脚本] 排查建议：看 $ROOT/log/backend.err.log 末尾 30 行；若端口被占用，先 ./start.sh stop 再 start"
 fi
 
 echo "[更新脚本] 更新完成 $(date)"

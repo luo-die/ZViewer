@@ -88,11 +88,20 @@ port_in_use() {
   local port="$1"
   if command -v lsof >/dev/null 2>&1; then
     lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-  elif command -v ss >/dev/null 2>&1; then
-    ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN
-  else
-    return 1
+    return $?
   fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt "sport = :$port" 2>/dev/null | grep -q LISTEN
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | grep -Eq "[:.]$port[[:space:]]"
+    return $?
+  fi
+  # 兜底：bash 内建 /dev/tcp（精简系统上没有 lsof/ss/netstat 时）
+  # 没有这个兜底，port_in_use 永远返回 false：start.sh 会认为「端口没起来」，
+  # 等满超时后把刚启动的后端 kill 掉——表现就是「更新脚本跑完了但服务没起来」。
+  (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null
 }
 
 # 等待端口开始监听（后端初始化需要数秒）
@@ -274,9 +283,17 @@ do_start() {
 
   # 等待后端就绪（TypeORM 初始化 + NMS 启动需要数秒）
   echo "  等待后端就绪..."
-  if ! wait_port_ready "$BACKEND_PORT"; then
-    echo "  错误：后端在 30 秒内未就绪，请检查日志: $LOG_DIR/backend.err.log" >&2
-    kill "$local_backend_pid" 2>/dev/null || true
+  # 60s（120×0.5s）：更新后首次启动要加载数据库、跑 schema 同步，比平时慢；
+  # 旧版只等 15s，超时还会把刚起来的后端 kill 掉——这正是「更新后服务起不来」的
+  # 直接原因之一。超时不再杀进程：它可能只是慢，杀掉就真的再也起不来了。
+  if ! wait_port_ready "$BACKEND_PORT" 120; then
+    echo "  错误：后端在 60 秒内未就绪，请检查日志: $LOG_DIR/backend.err.log" >&2
+    if [ -f "$LOG_DIR/backend.err.log" ]; then
+      echo "  ---- backend.err.log（末尾 20 行）----" >&2
+      tail -n 20 "$LOG_DIR/backend.err.log" >&2 || true
+    fi
+    echo "  后端进程仍在运行（PID $local_backend_pid），可能只是启动较慢；"
+    echo "  稍后可用 ./start.sh status 查看端口是否已监听。" >&2
     return 1
   fi
 
