@@ -455,6 +455,13 @@ const MAX_429_ATTEMPTS = 2;
 const MAX_COOLDOWN_MS = 10_000;
 
 /**
+ * 服务器能力记忆：确认「内嵌字幕端点不可用」的服务器（key = 地址|token 前 8 位）。
+ * 值 = 记忆到期时间。避免每次播放内嵌字幕都把 10 个候选地址重试一遍。
+ */
+const embeddedSubtitleUnsupported = new Map<string, number>();
+const EMBEDDED_UNSUPPORTED_TTL_MS = 15 * 60 * 1000;
+
+/**
  * PlaybackInfo（仅 subtitleProfile=true 的那类）短期缓存。
  *
  * 字幕链路一次播放会问 2~3 遍 PlaybackInfo（列轨道、提取、端点映射），
@@ -1002,6 +1009,20 @@ export class EmbyClient {
     // 上限压到 10：部分第三方服务（UHD Media Server）对密集请求会 429，
     // 试完十几种形态仍未命中说明该服务根本没有字幕端点，继续试只会把
     // 限流额度打满，连播放本身都被拖累。
+    // 服务器能力记忆：某台服务器一旦确认「内嵌字幕端点不可用」（UHD 这类），
+    // 之后 15 分钟内同服务器的内嵌轨直接走解容器，不再把 10 个候选地址试一遍。
+    // 外挂轨（IsExternal=true）不受影响——实测它们是能正常取到的。
+    const isEmbeddedStream = stream?.isExternal === false;
+    const capabilityKey = `${this.baseUrl}|${(this.opts.token ?? '').slice(0, 8)}`;
+    const unsupportedUntil = embeddedSubtitleUnsupported.get(capabilityKey);
+    if (isEmbeddedStream && unsupportedUntil && Date.now() < unsupportedUntil) {
+      throw new EmbyError(
+        '该服务器的内嵌字幕端点不可用（已记忆，直接走解容器）',
+        undefined,
+        'SUBTITLE_UNAVAILABLE',
+      );
+    }
+
     const candidates = buildSubtitleCandidates(ctx).slice(0, 10);
 
     const failures: string[] = [];
@@ -1041,6 +1062,13 @@ export class EmbyClient {
     // HLS 字幕兜底（DeliveryMethod=Hls 时只有 subtitles.m3u8 可用）
     const hls = await this.subtitleFromHls(itemId, mediaSourceId, index).catch(() => null);
     if (hls) return hls;
+
+    if (isEmbeddedStream) {
+      embeddedSubtitleUnsupported.set(
+        capabilityKey,
+        Date.now() + EMBEDDED_UNSUPPORTED_TTL_MS,
+      );
+    }
 
     throw new EmbyError(
       `Emby 未返回字幕内容（${describeSubtitleStream(stream)} ms=${mediaSourceId || '-'} ordinal=${
