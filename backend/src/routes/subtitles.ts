@@ -61,8 +61,20 @@ import {
 import {
   EmbyClient,
   createEmbyClientFromMount,
+  type EmbyMediaSource,
   type EmbyMediaStream,
 } from '../services/emby-client';
+
+/** 流 + 它所属的媒体源：多版本影片里 Index 会重复，必须带上源 ID 才能定位 */
+type EmbyStreamWithSource = EmbyMediaStream & { MediaSourceId?: string };
+
+function flattenSourceStreams(
+  sources: EmbyMediaSource[] | undefined,
+): EmbyStreamWithSource[] {
+  return (sources ?? []).flatMap((s) =>
+    (s.MediaStreams ?? []).map((st) => ({ ...st, MediaSourceId: s.Id })),
+  );
+}
 // 第三方 Emby 兼容服务的原生 API 字幕兜底（其兼容层常常没有字幕端点）
 import { createNativeApiFromMount } from '../services/emby-native';
 // 服务端 MKV 解容器取字幕（不依赖 ffmpeg / 浏览器 / Range）
@@ -815,7 +827,7 @@ async function getEmbyStreams(ctx: {
   userId: string;
 }): Promise<{
   mediaSourceId: string;
-  streams: EmbyMediaStream[];
+  streams: EmbyStreamWithSource[];
   playSessionId?: string;
 }> {
   const playback = await ctx.client
@@ -823,19 +835,25 @@ async function getEmbyStreams(ctx: {
     .catch(() => null);
   const source = playback?.MediaSources?.[0];
   let mediaSourceId = source?.Id ?? '';
-  let streams: EmbyMediaStream[] = source?.MediaStreams ?? [];
+  let streams: EmbyStreamWithSource[] = flattenSourceStreams(
+    source ? [source] : [],
+  );
 
   if (!streams.some((s) => s.Type === 'Subtitle')) {
     const detail = await ctx.client
       .itemDetail(ctx.userId, ctx.itemId)
       .catch(() => null);
-    const detailStreams = [
-      ...((detail?.MediaSources ?? []).flatMap((s) => s.MediaStreams ?? [])),
-      ...(detail?.MediaStreams ?? []),
+    const detailStreams: EmbyStreamWithSource[] = [
+      ...flattenSourceStreams(detail?.MediaSources),
+      // 条目级 MediaStreams 不带源信息，归到第一个源
+      ...(detail?.MediaStreams ?? []).map((st) => ({
+        ...st,
+        MediaSourceId: detail?.MediaSources?.[0]?.Id,
+      })),
     ];
     if (detailStreams.length > 0) {
       console.info(
-        `[subtitles] PlaybackInfo 无字幕流，改用条目详情（${detailStreams.length} 条流）`,
+        `[subtitles] PlaybackInfo 无字幕流，改用条目详情（${detailStreams.length} 条流，${detail?.MediaSources?.length ?? 0} 个媒体源）`,
       );
       streams = detailStreams;
       mediaSourceId = detail?.MediaSources?.[0]?.Id ?? mediaSourceId;
@@ -2217,7 +2235,8 @@ router.get(
             content = await Promise.race([
               ctx.client.subtitleContent(
                 ctx.itemId,
-                mediaSourceId,
+                // 多版本影片：Index 会重复，必须用这条流所属的媒体源
+                subStream.MediaSourceId ?? mediaSourceId,
                 streamIndex,
                 ext,
                 {

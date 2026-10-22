@@ -135,12 +135,26 @@ function pickPreferredEmbeddedTrack(
     (t) => t.isText !== false && !isImageSubtitleCodec(t.codecName)
   )
   if (textTracks.length === 0) return undefined
-  return (
-    textTracks.find(isChineseTrack) ??
-    textTracks.find((t) => t.isDefault && !t.isForced) ??
-    textTracks.find((t) => !t.isForced) ??
-    textTracks[0]
-  )
+
+  /**
+   * 同语言里优先外挂轨（IsExternal）：
+   * 外挂字幕由服务端直接回文件，一次请求拿全；
+   * 内嵌字幕在多数第三方 Emby（UHD 一类）上端点返回 404，只能解容器等 1~2 分钟。
+   * 语言优先级不变（中文仍排第一），只在同语言内把外挂排前面。
+   */
+  const preferExternal = (list: EmbeddedTrackInfo[]) =>
+    list.find((t) => t.isExternal) ?? list[0]
+
+  const chinese = textTracks.filter(isChineseTrack)
+  if (chinese.length > 0) return preferExternal(chinese)
+
+  const defaultTracks = textTracks.filter((t) => t.isDefault && !t.isForced)
+  if (defaultTracks.length > 0) return preferExternal(defaultTracks)
+
+  const nonForced = textTracks.filter((t) => !t.isForced)
+  if (nonForced.length > 0) return preferExternal(nonForced)
+
+  return preferExternal(textTracks)
 }
 
 /** 生成内封字幕轨道的展示标签。 */
