@@ -41,6 +41,33 @@ const router = Router();
 
 const userMountRepository = () => AppDataSource.getRepository(UserMount);
 
+/**
+ * 封面图代理的并发闸门。
+ *
+ * 浏览一页媒体库会同时加载几十张封面，每张都是一次上游请求。第三方/中转
+ * Emby（UHD 一类）按账号限流，直接并发拉图必回 429，而且会把搜索、播放
+ * 解析也一起拖下水。这里限制到 4 路并发：首屏最多慢几百毫秒，但不再触发
+ * 上游限流；浏览器侧还有 tag + max-age 缓存兜底。
+ */
+const IMAGE_MAX_CONCURRENT = 4;
+let imageActive = 0;
+const imageWaiters: Array<() => void> = [];
+
+async function acquireImageSlot(): Promise<void> {
+  if (imageActive < IMAGE_MAX_CONCURRENT) {
+    imageActive += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => imageWaiters.push(resolve));
+  imageActive += 1;
+}
+
+function releaseImageSlot(): void {
+  imageActive = Math.max(0, imageActive - 1);
+  const next = imageWaiters.shift();
+  if (next) next();
+}
+
 function extractErrorCode(err: unknown): string {
   return err instanceof EmbyError ? err.code ?? 'EMBY_ERROR' : 'UNREACHABLE';
 }
@@ -469,22 +496,27 @@ router.get('/mounts/:id/image', async (req: AuthenticatedRequest, res: Response)
       quality: 90,
     });
 
-    await proxyHttpUpstream(req, res, {
-      url: upstreamUrl,
-      headers: {
-        extra: {
-          'X-Emby-Token': session.token,
-          Referer: session.client.baseUrl,
+    await acquireImageSlot();
+    try {
+      await proxyHttpUpstream(req, res, {
+        url: upstreamUrl,
+        headers: {
+          extra: {
+            'X-Emby-Token': session.token,
+            Referer: session.client.baseUrl,
+          },
         },
-      },
-      cors: 'wildcard',
-      defaultContentType: 'image/jpeg',
-      // 图片内容按 tag 变化（tag 拼在上游 URL 里），可长时间缓存
-      cacheControl: 'public, max-age=86400',
-      timeoutMs: 15_000,
-      logTag: 'emby-image',
-      errorMessage: '获取 Emby 图片失败',
-    });
+        cors: 'wildcard',
+        defaultContentType: 'image/jpeg',
+        // 图片内容按 tag 变化（tag 拼在上游 URL 里），可长时间缓存
+        cacheControl: 'public, max-age=86400',
+        timeoutMs: 15_000,
+        logTag: 'emby-image',
+        errorMessage: '获取 Emby 图片失败',
+      });
+    } finally {
+      releaseImageSlot();
+    }
   } catch (err) {
     console.error('[emby] image proxy error:', err);
     if (!res.headersSent) {

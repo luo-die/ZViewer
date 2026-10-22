@@ -423,6 +423,91 @@ function normalizeServerUrl(url: string): string {
   return normalized.length > 0 ? normalized : 'http://localhost:8096';
 }
 
+// ============================================================
+// 出站限流闸门
+//
+// 第三方/中转 Emby（UHD 一类）按账号做「操作过于频繁」限流，返回 429。
+// 我们的问题不是某一个接口打得太狠，而是**没有全局节流**：
+//   - 每个路由都 new EmbyClient，实例之间互不知情；
+//   - 浏览一页会并发拉几十张封面（每张一次上游请求）；
+//   - 字幕链路一次会打 PlaybackInfo + 容器探测 + 十来个候选地址。
+// 因此闸门必须按「服务器地址 + token」在模块级共享，而不是挂在实例上。
+// ============================================================
+
+interface UpstreamGate {
+  active: number;
+  /** 429 后的冷却截止时间（ms）：冷却期内所有请求排队，避免继续撞限流 */
+  cooldownUntil: number;
+}
+
+/** 同一台媒体服务器（同地址 + 同 token）共享一个闸门 */
+const upstreamGates = new Map<string, UpstreamGate>();
+
+/** 单台服务器最大并发上游请求数（浏览封面时不至于把对端打爆） */
+const MAX_UPSTREAM_CONCURRENCY = 4;
+/** 429 默认冷却时间（无 Retry-After 时） */
+const DEFAULT_429_COOLDOWN_MS = 2_000;
+/** 429 重试次数（含首次） */
+const MAX_429_ATTEMPTS = 2;
+/** 单次冷却上限：再长就让用户看到失败，而不是把请求挂住 */
+const MAX_COOLDOWN_MS = 10_000;
+
+/**
+ * PlaybackInfo（仅 subtitleProfile=true 的那类）短期缓存。
+ *
+ * 字幕链路一次播放会问 2~3 遍 PlaybackInfo（列轨道、提取、端点映射），
+ * 每次都算一次上游请求。媒体源在几十秒内不会变，缓存 60s 能直接砍掉一半请求。
+ * 播放解析用的 PlaybackInfo 不缓存：转码地址/PlaySessionId 需要实时。
+ */
+const playbackInfoCache = new Map<
+  string,
+  { at: number; value: EmbyPlaybackInfo }
+>();
+const PLAYBACK_INFO_TTL_MS = 60_000;
+
+function gateKeyOf(baseUrl: string, token?: string): string {
+  // token 只取前 8 位参与 key：不同账号分开限流，又不把凭据留在内存 map 的 key 里
+  return `${baseUrl}|${(token ?? '').slice(0, 8)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireUpstreamGate(key: string): Promise<UpstreamGate> {
+  let gate = upstreamGates.get(key);
+  if (!gate) {
+    gate = { active: 0, cooldownUntil: 0 };
+    upstreamGates.set(key, gate);
+  }
+  for (;;) {
+    const cooldown = gate.cooldownUntil - Date.now();
+    if (cooldown > 0) {
+      await sleep(Math.min(cooldown, 250));
+      continue;
+    }
+    if (gate.active < MAX_UPSTREAM_CONCURRENCY) {
+      gate.active += 1;
+      return gate;
+    }
+    await sleep(20);
+  }
+}
+
+/** 解析 Retry-After（秒数或 HTTP 日期），返回毫秒 */
+function parseRetryAfter(value: string | null): number {
+  if (!value) return DEFAULT_429_COOLDOWN_MS;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Math.max(seconds * 1000, 500), MAX_COOLDOWN_MS);
+  }
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) {
+    return Math.min(Math.max(date - Date.now(), 500), MAX_COOLDOWN_MS);
+  }
+  return DEFAULT_429_COOLDOWN_MS;
+}
+
 export class EmbyClient {
   /** 归一化后的服务器基础地址（供路由构造直连 URL） */
   readonly baseUrl: string;
@@ -462,53 +547,81 @@ export class EmbyClient {
       headers['Content-Type'] = 'application/json';
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const res = await fetch(url.toString(), {
-        method,
-        headers,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        // 尽量取响应体片段：Emby 的 404 常带说明（路由不存在 / 找不到字幕流），
-        // 这是定位「字幕 404」最直接的线索
-        let detail = '';
-        try {
-          const text = await res.text();
-          detail = text.replace(/\s+/g, ' ').trim().slice(0, 200);
-        } catch {
-          /* ignore */
+    const gateKey = gateKeyOf(this.baseUrl, this.opts.token);
+    // 429 最多重试一次；等待时间取 Retry-After。冷却期内同服务器的其它请求
+    // 也会在 acquireUpstreamGate 里一起排队，避免「越限越打」。
+    for (let attempt = 0; ; attempt += 1) {
+      const gate = await acquireUpstreamGate(gateKey);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const res = await fetch(url.toString(), {
+          method,
+          headers,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
+        if (res.status === 429 && attempt < MAX_429_ATTEMPTS - 1) {
+          const cooldown = parseRetryAfter(res.headers.get('retry-after'));
+          gate.cooldownUntil = Math.max(
+            gate.cooldownUntil,
+            Date.now() + cooldown,
+          );
+          console.warn(
+            `[emby] 上游 429，冷却 ${Math.round(cooldown / 1000)}s 后重试: ${url.pathname}`,
+          );
+          // 释放响应体，避免连接被闲置占用
+          try {
+            await res.arrayBuffer();
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
+        if (!res.ok) {
+          // 尽量取响应体片段：Emby 的 404 常带说明（路由不存在 / 找不到字幕流），
+          // 这是定位「字幕 404」最直接的线索
+          let detail = '';
+          try {
+            const text = await res.text();
+            detail = text.replace(/\s+/g, ' ').trim().slice(0, 200);
+          } catch {
+            /* ignore */
+          }
+          const throttledHint =
+            res.status === 429
+              ? '（该服务器按账号限流：已自动退避，请等 1~2 分钟再操作，或减少同时打开的面板）'
+              : '';
+          throw new EmbyError(
+            detail
+              ? `Emby 请求失败: ${res.status} ${detail}${throttledHint}`
+              : `Emby 请求失败: ${res.status}${throttledHint}`,
+            res.status,
+            'EMBY_REQUEST_FAILED',
+          );
+        }
+        if (res.status === 204) return undefined as T;
+        if (reqOpts.responseType === 'text') {
+          return (await res.text()) as unknown as T;
+        }
+        if (reqOpts.responseType === 'bytes') {
+          return (await res.arrayBuffer()) as unknown as T;
+        }
+        return (await res.json()) as T;
+      } catch (err) {
+        if (err instanceof EmbyError) throw err;
+        if (err instanceof Error && err.name === 'AbortError') {
+          throw new EmbyError(`Emby 请求超时（${this.timeoutMs}ms）`, undefined, 'TIMEOUT');
         }
         throw new EmbyError(
-          detail
-            ? `Emby 请求失败: ${res.status} ${detail}`
-            : `Emby 请求失败: ${res.status}`,
-          res.status,
-          'EMBY_REQUEST_FAILED',
+          err instanceof Error ? `Emby 连接失败: ${err.message}` : 'Emby 连接失败',
+          undefined,
+          'UNREACHABLE',
         );
+      } finally {
+        clearTimeout(timer);
+        gate.active = Math.max(0, gate.active - 1);
       }
-      if (res.status === 204) return undefined as T;
-      if (reqOpts.responseType === 'text') {
-        return (await res.text()) as unknown as T;
-      }
-      if (reqOpts.responseType === 'bytes') {
-        return (await res.arrayBuffer()) as unknown as T;
-      }
-      return (await res.json()) as T;
-    } catch (err) {
-      if (err instanceof EmbyError) throw err;
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw new EmbyError(`Emby 请求超时（${this.timeoutMs}ms）`, undefined, 'TIMEOUT');
-      }
-      throw new EmbyError(
-        err instanceof Error ? `Emby 连接失败: ${err.message}` : 'Emby 连接失败',
-        undefined,
-        'UNREACHABLE',
-      );
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -779,6 +892,14 @@ export class EmbyClient {
       subtitleProfile?: boolean;
     },
   ): Promise<EmbyPlaybackInfo> {
+    const subtitleProfile = opts?.subtitleProfile === true;
+    const cacheKey = subtitleProfile ? `${this.baseUrl}|${itemId}|${userId}` : '';
+    if (cacheKey) {
+      const cached = playbackInfoCache.get(cacheKey);
+      if (cached && Date.now() - cached.at < PLAYBACK_INFO_TTL_MS) {
+        return cached.value;
+      }
+    }
     const res = await this.request<EmbyPlaybackInfo>({
       method: 'POST',
       path: `/emby/Items/${encodeURIComponent(itemId)}/PlaybackInfo`,
@@ -800,6 +921,14 @@ export class EmbyClient {
     });
     if (!res.MediaSources?.length) {
       throw new EmbyError('Emby 未返回可用媒体源', undefined, 'NO_MEDIA_SOURCE');
+    }
+    if (cacheKey) {
+      playbackInfoCache.set(cacheKey, { at: Date.now(), value: res });
+      // 简单上限：进程长期运行也不无限增长
+      if (playbackInfoCache.size > 200) {
+        const oldest = playbackInfoCache.keys().next().value;
+        if (oldest) playbackInfoCache.delete(oldest);
+      }
     }
     return res;
   }
