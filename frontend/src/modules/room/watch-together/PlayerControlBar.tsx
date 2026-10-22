@@ -310,25 +310,7 @@ export function PlayerControlBar({
   const [dragging, setDragging] = useState(false)
 
   const volumeTrackRef = useRef<HTMLDivElement>(null)
-  const [volumeOpen, setVolumeOpen] = useState(false)
-  const volumeCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevVolumeRef = useRef(volume || 1)
-
-  const openVolume = useCallback(() => {
-    if (volumeCloseTimerRef.current) {
-      clearTimeout(volumeCloseTimerRef.current)
-      volumeCloseTimerRef.current = null
-    }
-    setVolumeOpen(true)
-  }, [])
-
-  const scheduleCloseVolume = useCallback(() => {
-    if (volumeCloseTimerRef.current) clearTimeout(volumeCloseTimerRef.current)
-    volumeCloseTimerRef.current = setTimeout(() => {
-      setVolumeOpen(false)
-      volumeCloseTimerRef.current = null
-    }, 200)
-  }, [])
 
   const [rateOpen, setRateOpen] = useState(false)
   const rateContainerRef = useRef<HTMLDivElement>(null)
@@ -459,20 +441,18 @@ export function PlayerControlBar({
     }
   }, [canControl, videoRef, isPlaying, onRequestPause, onRequestPlay])
 
+  // 横向音量条（参考常见播放器：音量图标右侧直接拖）
   const handleVolumePointer = useCallback(
-    (clientY: number) => {
+    (clientX: number) => {
       const video = videoRef.current
       if (!video) return
       const el = volumeTrackRef.current
       if (!el) return
       const rect = el.getBoundingClientRect()
-      const ratio = Math.min(
-        1,
-        Math.max(0, (rect.bottom - clientY) / rect.height)
-      )
-      const v = ratio
+      const v = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
       video.muted = v === 0
       video.volume = v
+      if (v > 0) prevVolumeRef.current = v
     },
     [videoRef]
   )
@@ -481,8 +461,8 @@ export function PlayerControlBar({
     (e: React.PointerEvent) => {
       e.preventDefault()
       e.stopPropagation()
-      handleVolumePointer(e.clientY)
-      const handleMove = (ev: PointerEvent) => handleVolumePointer(ev.clientY)
+      handleVolumePointer(e.clientX)
+      const handleMove = (ev: PointerEvent) => handleVolumePointer(ev.clientX)
       const handleUp = () => {
         window.removeEventListener('pointermove', handleMove)
         window.removeEventListener('pointerup', handleUp)
@@ -527,100 +507,97 @@ export function PlayerControlBar({
 
   return (
     <div
-      ref={rootRef}
       className={cn(
-        'absolute bottom-0 left-0 right-0 z-[80] p-2 md:p-3',
+        'absolute inset-x-0 bottom-0 z-[80]',
         !controlBarVisible && 'pointer-events-none'
       )}
     >
       <div
+        ref={rootRef}
         className={cn(
-          'glass-strong flex flex-col gap-1.5 md:gap-2 rounded-lg border border-[var(--glass-border)] p-1.5 md:p-2 shadow-lg',
+          'relative px-3 pb-2 md:px-5 md:pb-3',
           controlBarVisible ? 'zart-controlbar-enter' : 'zart-controlbar-exit'
         )}
       >
-        {/* 进度条：轨道 + 缓冲 + 已播放 + 服务器同步线 */}
-        <div
-          ref={progressRef}
-          role="slider"
-          aria-label={canControl ? '播放进度' : '播放进度（仅房主可拖动）'}
-          aria-valuemin={0}
-          aria-valuemax={duration}
-          aria-valuenow={currentTime}
-          aria-disabled={!canControl}
-          className={cn(
-            'group relative h-1.5 md:h-2 w-full cursor-pointer overflow-visible rounded-full transition-all',
-            canControl && 'hover:h-2 md:hover:h-2.5'
-          )}
-          style={{ backgroundColor: 'rgba(128, 128, 128, 0.4)' }}
-          onPointerDown={handleProgressPointerDown}
-        >
-          {/* 缓冲进度 */}
+        {/* 底部渐变压暗：白色控件压在亮画面上也清晰。
+            绝对定位 + 负 top，不参与 rootRef 的高度测量，字幕让位不会被它撑高。 */}
+        <div className="pointer-events-none absolute inset-x-0 -top-8 bottom-0 -z-10 bg-gradient-to-t from-black/80 via-black/35 to-transparent" />
+
+        {/* 进度行：时间放两端，中间细进度条 */}
+        <div className="flex items-center gap-2 md:gap-3">
+          <span className="w-11 shrink-0 text-right text-[10px] font-medium tabular-nums text-white/70 md:w-12 md:text-[11px]">
+            {formatDuration(currentTime)}
+          </span>
           <div
-            className="absolute top-0 h-full rounded-full transition-[width] duration-150"
-            style={{
-              width: `${bufferedProgress * 100}%`,
-              backgroundColor: 'rgba(255, 255, 255, 0.35)',
-            }}
-          />
-          {/* 已播放进度 */}
-          <div
-            className="absolute top-0 h-full rounded-full bg-[var(--md-sys-color-primary)] transition-[width] duration-100"
-            style={{ width: `${progress * 100}%` }}
-          />
-          {/* 服务器/房主进度同步线：始终显示，差异越大越明显，带平滑位移动画 */}
-          {serverProgress !== null && duration > 0 && (
-            <div
-              className="pointer-events-none absolute top-1/2 z-10 flex -translate-y-1/2 flex-col items-center transition-all duration-150 ease-linear"
-              style={{
-                left: `${serverProgress * 100}%`,
-                opacity: Math.min(1, Math.max(0.35, absDiffSeconds / 3)),
-              }}
-              title={`${canControl ? '服务器进度' : '房主进度'}: ${formatDuration(watchTogether.currentTime)}${
-                absDiffSeconds > 0.5
-                  ? ` (${serverTimeDiff > 0 ? '落后' : '超前'} ${formatDuration(absDiffSeconds)})`
-                  : ''
-              }`}
-            >
-              <div
-                className="h-3.5 w-[3px] rounded-full shadow-[0_0_6px_rgba(0,0,0,0.5)]"
-                style={{
-                  backgroundColor:
-                    absDiffSeconds > 3
-                      ? 'var(--md-sys-color-error)'
-                      : 'var(--md-sys-color-tertiary)',
-                }}
-              />
-              <div
-                className="absolute -top-0.5 h-1.5 w-1.5 rounded-full"
-                style={{
-                  backgroundColor:
-                    absDiffSeconds > 3
-                      ? 'var(--md-sys-color-error)'
-                      : 'var(--md-sys-color-tertiary)',
-                }}
-              />
-            </div>
-          )}
-          {/* 拖动/悬停指示器（缩小尺寸） */}
-          <div
+            ref={progressRef}
+            role="slider"
+            aria-label={canControl ? '播放进度' : '播放进度（仅房主可拖动）'}
+            aria-valuemin={0}
+            aria-valuemax={duration}
+            aria-valuenow={currentTime}
+            aria-disabled={!canControl}
             className={cn(
-              'absolute top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full border-2 border-[var(--md-sys-color-primary)] bg-[var(--md-sys-color-on-primary)] shadow transition-opacity duration-150',
-              dragging || canControl
-                ? 'opacity-100'
-                : 'opacity-0 group-hover:opacity-100'
+              'group relative h-1 flex-1 rounded-full bg-white/25 md:h-[3px]',
+              canControl ? 'cursor-pointer' : 'cursor-default'
             )}
-            style={{ left: `calc(${progress * 100}% - 5px)` }}
-          />
+            onPointerDown={handleProgressPointerDown}
+          >
+            {/* 缓冲进度 */}
+            <div
+              className="absolute top-0 h-full rounded-full bg-white/30 transition-[width] duration-150"
+              style={{ width: `${bufferedProgress * 100}%` }}
+            />
+            {/* 已播放进度：主题色，与参考图的紫色强调一致 */}
+            <div
+              className="absolute top-0 h-full rounded-full bg-[var(--md-sys-color-primary)] transition-[width] duration-100"
+              style={{ width: `${progress * 100}%` }}
+            />
+            {/* 服务器/房主进度同步线 */}
+            {serverProgress !== null && duration > 0 && (
+              <div
+                className="pointer-events-none absolute top-1/2 z-10 flex -translate-y-1/2 flex-col items-center transition-all duration-150 ease-linear"
+                style={{
+                  left: `${serverProgress * 100}%`,
+                  opacity: Math.min(1, Math.max(0.35, absDiffSeconds / 3)),
+                }}
+                title={`${canControl ? '服务器进度' : '房主进度'}: ${formatDuration(watchTogether.currentTime)}${
+                  absDiffSeconds > 0.5
+                    ? ` (${serverTimeDiff > 0 ? '落后' : '超前'} ${formatDuration(absDiffSeconds)})`
+                    : ''
+                }`}
+              >
+                <div
+                  className="h-3 w-[2px] rounded-full shadow-[0_0_6px_rgba(0,0,0,0.5)]"
+                  style={{
+                    backgroundColor:
+                      absDiffSeconds > 3
+                        ? 'var(--md-sys-color-error)'
+                        : 'var(--md-sys-color-tertiary)',
+                  }}
+                />
+              </div>
+            )}
+            {/* 播放头圆点：参考图里常驻 */}
+            <div
+              className={cn(
+                'absolute top-1/2 h-2.5 w-2.5 -translate-y-1/2 rounded-full bg-white shadow-[0_0_6px_rgba(0,0,0,0.55)] transition-transform',
+                dragging && 'scale-125'
+              )}
+              style={{ left: `calc(${progress * 100}% - 5px)` }}
+            />
+          </div>
+          <span className="w-11 shrink-0 text-[10px] font-medium tabular-nums text-white/70 md:w-12 md:text-[11px]">
+            {formatDuration(duration)}
+          </span>
         </div>
 
-        {/* 移动端弹幕输入行：放在进度条与按钮行之间，避免与按钮竞争空间 */}
-        <div className="flex items-center gap-1 md:hidden">
+        {/* 移动端弹幕输入行 */}
+        <div className="mt-1.5 flex items-center gap-1 md:hidden">
           <DanmakuInput onSend={onSendDanmaku} placeholder="发弹幕" />
         </div>
 
         {/* 控制按钮行 */}
-        <div className="flex items-center gap-1 md:gap-1.5">
+        <div className="mt-1 flex items-center gap-0.5 md:mt-1.5 md:gap-1">
           {/* 播放 / 暂停 */}
           <ControlButton
             label={
@@ -634,44 +611,68 @@ export function PlayerControlBar({
             }
             disabled={!canControl && (isPlaying ? pausePending : playPending)}
             onClick={handlePlayPauseClick}
+            emphasis
           >
-            {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+            {isPlaying ? <Pause size={22} /> : <Play size={22} />}
           </ControlButton>
 
-          {/* 时间 */}
-          <div className="select-none px-0.5 md:px-1 text-[10px] md:text-xs font-medium tabular-nums text-[var(--md-sys-color-on-surface)]">
-            <span>{formatDuration(currentTime)}</span>
-            <span className="mx-0.5 opacity-60">/</span>
-            <span className="opacity-80">{formatDuration(duration)}</span>
+          {/* 音量：图标 + 横向滑条（桌面端） */}
+          <div className="flex items-center">
+            <ControlButton
+              label={muted || volume === 0 ? '取消静音' : '静音'}
+              onClick={toggleMute}
+            >
+              <VolumeIcon size={20} />
+            </ControlButton>
+            <div className="ml-1 hidden h-8 w-20 items-center md:flex">
+              <div
+                ref={volumeTrackRef}
+                role="slider"
+                aria-label="音量"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round((muted ? 0 : volume) * 100)}
+                className="relative h-1 w-full cursor-pointer rounded-full bg-white/25"
+                onPointerDown={handleVolumePointerDown}
+              >
+                <div
+                  className="absolute inset-y-0 left-0 rounded-full bg-white/90"
+                  style={{ width: `${(muted ? 0 : volume) * 100}%` }}
+                />
+                <div
+                  className="absolute top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-white shadow"
+                  style={{
+                    left: `calc(${(muted ? 0 : volume) * 100}% - 4px)`,
+                  }}
+                />
+              </div>
+            </div>
           </div>
 
-          {/* 弹幕开关：开启时不显示底色，通过图标是否带斜线区分状态 */}
-          <ControlButton
-            label={danmakuEnabled ? '关闭弹幕' : '开启弹幕'}
-            onClick={onToggleDanmaku}
-          >
-            <DanmakuIcon off={!danmakuEnabled} />
-          </ControlButton>
-
-          {/* 弹幕输入框（桌面端显示） */}
-          <div className="hidden min-w-0 flex-1 items-center gap-1 md:flex">
+          {/* 桌面端弹幕输入 */}
+          <div className="mx-1.5 hidden min-w-0 flex-1 items-center gap-1 md:flex">
             <DanmakuInput onSend={onSendDanmaku} placeholder="发个友善的弹幕" />
           </div>
+          <div className="flex-1 md:hidden" />
 
           {/* 倍速 */}
           <div ref={rateContainerRef} className="relative">
-            <ControlButton
-              label="播放倍速"
+            <button
+              type="button"
+              title="播放倍速"
+              aria-label="播放倍速"
               disabled={!canControl}
-              active={rateOpen}
               onClick={() => canControl && setRateOpen((v) => !v)}
+              className={cn(
+                'flex h-8 min-w-10 items-center justify-center rounded-full px-2 text-[11px] font-semibold tabular-nums text-white/80 transition-colors',
+                'hover:bg-white/15 hover:text-white disabled:cursor-not-allowed disabled:opacity-40',
+                rateOpen && 'bg-white/15 text-white'
+              )}
             >
-              <span className="min-w-[2ch] text-xs font-semibold">
-                {playbackRate}x
-              </span>
-            </ControlButton>
+              {playbackRate}x
+            </button>
             {rateOpen && canControl && (
-              <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 overflow-hidden rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg)] p-1 shadow-lg">
+              <div className="absolute bottom-full right-0 z-30 mb-2 w-28 overflow-hidden rounded-xl border border-white/10 bg-[#17171a]/95 p-1 shadow-2xl backdrop-blur-xl">
                 {RATES.map((rate) => {
                   const active = Math.abs(playbackRate - rate) < 0.01
                   return (
@@ -682,8 +683,8 @@ export function PlayerControlBar({
                       className={cn(
                         'flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition-colors',
                         active
-                          ? 'bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)]'
-                          : 'text-[var(--md-sys-color-on-surface)] hover:bg-[var(--md-sys-color-surface-container-highest)]'
+                          ? 'text-[var(--md-sys-color-primary)]'
+                          : 'text-white/80 hover:bg-white/10 hover:text-white'
                       )}
                     >
                       <span>{rate}x</span>
@@ -695,64 +696,12 @@ export function PlayerControlBar({
             )}
           </div>
 
-          {/* 音量：容器包含按钮和弹窗，使用延迟关闭避免移动鼠标到弹窗时隐藏 */}
-          <div
-            className="relative flex items-center"
-            onMouseEnter={openVolume}
-            onMouseLeave={scheduleCloseVolume}
-          >
-            <ControlButton
-              label={muted || volume === 0 ? '取消静音' : '静音'}
-              onClick={toggleMute}
-            >
-              <VolumeIcon size={18} />
-            </ControlButton>
-            {volumeOpen && (
-              <div
-                className="absolute bottom-full left-1/2 z-30 flex -translate-x-1/2 flex-col items-center gap-2 rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg)] p-2 pb-3 pt-4 shadow-lg"
-                onMouseEnter={openVolume}
-                onMouseLeave={scheduleCloseVolume}
-              >
-                <span className="w-5 text-center text-[11px] font-medium text-[var(--md-sys-color-on-surface)]">
-                  {Math.round((muted ? 0 : volume) * 100)}
-                </span>
-                <div
-                  ref={volumeTrackRef}
-                  className="relative h-24 w-1.5 cursor-pointer rounded-full bg-[var(--md-sys-color-on-surface)]/20"
-                  onPointerDown={handleVolumePointerDown}
-                >
-                  <div
-                    className="absolute bottom-0 left-0 right-0 rounded-full bg-[var(--md-sys-color-primary)]"
-                    style={{ height: `${(muted ? 0 : volume) * 100}%` }}
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* 房主专属：同步进度（桌面端直接显示） */}
-          {isHost && (
-            <div className="hidden md:block">
-              <ControlButton label="同步进度" onClick={onSync}>
-                <RotateCcw size={18} />
-              </ControlButton>
-            </div>
-          )}
-
-          {/* 重载视频：桌面端直接显示 */}
-          <div className="hidden md:block">
-            <ControlButton label="重载视频" onClick={onReload}>
-              <RotateCw size={18} />
-            </ControlButton>
-          </div>
-
-          {/* 隐藏/显示控制栏 */}
+          {/* 弹幕开关 */}
           <ControlButton
-            label={controlBarHideMode ? '显示控制栏' : '隐藏控制栏'}
-            active={controlBarHideMode}
-            onClick={onToggleHideMode}
+            label={danmakuEnabled ? '关闭弹幕' : '开启弹幕'}
+            onClick={onToggleDanmaku}
           >
-            {controlBarHideMode ? <Eye size={18} /> : <EyeOff size={18} />}
+            <DanmakuIcon off={!danmakuEnabled} />
           </ControlButton>
 
           {/* 设置 */}
@@ -762,34 +711,20 @@ export function PlayerControlBar({
             active={settingsOpen}
             onClick={onToggleSettings}
           >
-            <Settings size={18} />
+            <Settings size={20} />
           </ControlButton>
 
-          {/* 网页全屏：桌面端直接显示 */}
-          <div className="hidden md:block">
-            <ControlButton
-              label={isWebFullscreen ? '退出网页全屏' : '网页全屏'}
-              onClick={onToggleWebFullscreen}
-            >
-              {isWebFullscreen ? (
-                <Minimize size={18} />
-              ) : (
-                <Maximize size={18} />
-              )}
-            </ControlButton>
-          </div>
-
-          {/* 移动端“更多”菜单：收纳同步/重载/网页全屏 */}
-          <div ref={moreContainerRef} className="relative md:hidden">
+          {/* 更多：同步 / 重载 / 网页全屏 / 隐藏控制栏 */}
+          <div ref={moreContainerRef} className="relative">
             <ControlButton
               label="更多"
               active={moreOpen}
               onClick={() => setMoreOpen((v) => !v)}
             >
-              <MoreHorizontal size={18} />
+              <MoreHorizontal size={20} />
             </ControlButton>
             {moreOpen && (
-              <div className="absolute right-0 bottom-full z-30 mb-2 w-36 overflow-hidden rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg)] p-1 shadow-lg">
+              <div className="absolute bottom-full right-0 z-30 mb-2 w-44 overflow-hidden rounded-xl border border-white/10 bg-[#17171a]/95 p-1 shadow-2xl backdrop-blur-xl">
                 {isHost && (
                   <button
                     type="button"
@@ -797,7 +732,7 @@ export function PlayerControlBar({
                       onSync()
                       setMoreOpen(false)
                     }}
-                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs text-[var(--md-sys-color-on-surface)] transition-colors hover:bg-[var(--md-sys-color-surface-container-highest)]"
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
                   >
                     <RotateCcw size={14} />
                     同步进度
@@ -809,7 +744,7 @@ export function PlayerControlBar({
                     onReload()
                     setMoreOpen(false)
                   }}
-                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs text-[var(--md-sys-color-on-surface)] transition-colors hover:bg-[var(--md-sys-color-surface-container-highest)]"
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
                 >
                   <RotateCw size={14} />
                   重载视频
@@ -820,7 +755,7 @@ export function PlayerControlBar({
                     onToggleWebFullscreen?.()
                     setMoreOpen(false)
                   }}
-                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs text-[var(--md-sys-color-on-surface)] transition-colors hover:bg-[var(--md-sys-color-surface-container-highest)]"
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
                 >
                   {isWebFullscreen ? (
                     <Minimize size={14} />
@@ -828,6 +763,17 @@ export function PlayerControlBar({
                     <Maximize size={14} />
                   )}
                   {isWebFullscreen ? '退出网页全屏' : '网页全屏'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onToggleHideMode?.()
+                    setMoreOpen(false)
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  {controlBarHideMode ? <Eye size={14} /> : <EyeOff size={14} />}
+                  {controlBarHideMode ? '显示控制栏' : '隐藏控制栏'}
                 </button>
               </div>
             )}
@@ -838,7 +784,7 @@ export function PlayerControlBar({
             label={isFullscreen ? '退出全屏' : '全屏'}
             onClick={onToggleFullscreen}
           >
-            {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+            {isFullscreen ? <Minimize2 size={20} /> : <Maximize2 size={20} />}
           </ControlButton>
         </div>
       </div>
@@ -846,16 +792,22 @@ export function PlayerControlBar({
   )
 }
 
+
 interface ControlButtonProps {
   label: string
   active?: boolean
   disabled?: boolean
   onClick?: () => void
+  /** 主操作（播放/暂停）用更大的点击区与图标 */
+  emphasis?: boolean
   children: React.ReactNode
 }
 
 const ControlButton = forwardRef<HTMLButtonElement, ControlButtonProps>(
-  function ControlButton({ label, active, disabled, onClick, children }, ref) {
+  function ControlButton(
+    { label, active, disabled, onClick, emphasis, children },
+    ref
+  ) {
     return (
       <button
         ref={ref}
@@ -869,13 +821,13 @@ const ControlButton = forwardRef<HTMLButtonElement, ControlButtonProps>(
           onClick?.()
         }}
         className={cn(
-          'flex h-7 w-7 md:h-8 md:w-8 shrink-0 items-center justify-center rounded-lg text-[var(--md-sys-color-on-surface)] outline-none',
-          'transition-all duration-200',
-          'hover:bg-[var(--md-sys-color-surface-container-highest)]',
-          'focus-visible:ring-2 focus-visible:ring-[var(--md-sys-color-primary)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--md-sys-color-surface)]',
+          'flex shrink-0 items-center justify-center rounded-full text-white/80 outline-none',
+          'transition-colors duration-150',
+          'hover:bg-white/15 hover:text-white',
+          'focus-visible:ring-2 focus-visible:ring-white/70',
           'disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent',
-          active &&
-            'bg-[var(--md-sys-color-primary-container)] text-[var(--md-sys-color-on-primary-container)]'
+          emphasis ? 'h-9 w-9 md:h-10 md:w-10' : 'h-8 w-8',
+          active && 'text-[var(--md-sys-color-primary)]'
         )}
       >
         {children}
