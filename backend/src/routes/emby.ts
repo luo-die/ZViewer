@@ -889,6 +889,56 @@ router.get('/proxy', async (req: AuthenticatedRequest, res: Response): Promise<v
 // 再通过 serverUrl + type='emby' 在 UserMount 表中查找挂载凭证，
 // 这样房间内任何成员（含观众）都能通过 movieId 访问影片流。
 // at=1：音频转码模式（片源音轨编码浏览器不支持时由 resolve 标记并写入 movie.url）
+/**
+ * 原始文件直推地址 - GET /static-url?movieId=
+ *
+ * 给前端 playsvideo / 原生直连用：后端用**最新会话 token** 拼好
+ * `/emby/Videos/{id}/stream?static=true&api_key=...`。
+ *
+ * 为什么不让前端复用 movie.url（main.m3u8）里的 api_key：那是 resolve 当时
+ * 写进去的 token，可能已过期；用它直连/代理会 401（实测播放直接失败）。
+ * 有账号密码时这里重新登录拿新 token，确保地址当场可用。
+ */
+router.get('/static-url', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const movieId = Number(req.query.movieId);
+    if (!Number.isFinite(movieId)) {
+      res.status(400).json({ success: false, message: '缺少或无效的 movieId 参数' });
+      return;
+    }
+    const { movie, mount } = await resolveMovieStream(movieId, 'emby');
+    if (!mount) {
+      res.status(404).json({ success: false, message: '未找到对应的 Emby 挂载配置' });
+      return;
+    }
+    const session = await resolveEmbySession(mount);
+    let token = session.token;
+    // 有账号密码就现登一次：mount.apiKey 可能是很久以前缓存下来的
+    if (mount.username && mount.password) {
+      try {
+        const loginClient = new EmbyClient({ serverUrl: mount.serverUrl! });
+        const login = await loginClient.login(mount.username, mount.password);
+        token = login.token;
+      } catch {
+        /* 登录失败就沿用现有 token */
+      }
+    }
+    const itemId = movie.path!;
+    const url =
+      `${session.client.baseUrl}/emby/Videos/${encodeURIComponent(itemId)}` +
+      `/stream?static=true&api_key=${encodeURIComponent(token)}`;
+    res.json({ success: true, url });
+  } catch (err) {
+    console.error('[emby] static-url error:', err);
+    const code = extractErrorCode(err);
+    res.status(code === 'AUTH_FAILED' ? 401 : 502).json({
+      success: false,
+      message: extractErrorMessage(err, '获取原始文件地址失败'),
+      code,
+    });
+  }
+});
+
 router.get('/stream', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const movieIdRaw = req.query.movieId;

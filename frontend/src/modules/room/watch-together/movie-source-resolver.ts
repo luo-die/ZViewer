@@ -17,9 +17,11 @@ import { useCliAgentStore } from '@/store/cliAgentStore'
 import { getBilibiliParseOptions } from '@/modules/bilibili/parseOptions'
 import { useSystemSettingsStore } from '@/store/systemSettingsStore'
 import { useRoomStore } from '@/store/roomStore'
+import { needsBrowserTranscode } from '@/lib/audioCodecs'
 import type { QualityOption } from './resolveSource'
 import { buildServerFileProxyUrl } from '@/modules/server-files/serverFilesApi'
 import { appendAuthToken } from '@/modules/player/services/url-proxy'
+import { apiFetch } from '@/lib/api'
 import {
   createTranscodeSession,
   fetchTranscodeCapability,
@@ -522,7 +524,13 @@ export async function resolveMovieSource({
   // 房间选「服务端」时尊重用户：继续走 Emby 转码 HLS。
   const roomTranscodeMode =
     useRoomStore.getState().roomSettings.transcodeMode ?? 'auto'
-  const useClientDemux = isEmbySource && roomTranscodeMode !== 'server'
+  // EAC3/DTS/TrueHD 这类音轨需要 playsvideo 在浏览器里实时转成 AAC，
+  // 实测 8.5GB/HEVC 片源 45s 内起不来（播放直接失败）。这类片源先保持
+  // 原路径（服务端 HLS → 静态直推兜底），只对浏览器原生音轨启用客户端解封装。
+  const audioNeedsTranscode =
+    !!movie.audioCodec && needsBrowserTranscode(movie.audioCodec)
+  const useClientDemux =
+    isEmbySource && roomTranscodeMode !== 'server' && !audioNeedsTranscode
   /**
    * 服务端 resolve 会无条件把「音轨不兼容」的影片标成 hls（movie.format='hls'），
    * 即使房间是「自动」模式。这里在播放前改回 static 直推（原始文件），
@@ -543,14 +551,27 @@ export async function resolveMovieSource({
       /^(https?:\/\/[^/]+)\/emby\/Videos\/([^/]+)\/main\.m3u8(\?.*)?$/i
     )
     if (directMainM3u8) {
-      const [, origin, itemId, query = ''] = directMainM3u8
-      const apiKey = new URLSearchParams(query.replace(/^\?/, '')).get('api_key')
-      sourceUrl = `${origin}/emby/Videos/${itemId}/stream?static=true${
-        apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : ''
-      }`
-      // 该域名 CORS 已实测放行（ACAO 回显站点源 + 支持 Range），
-      // 让播放器直连，用用户本地带宽读文件，不再经 VPS 中转。
-      allowDirectCrossOrigin = true
+      // main.m3u8 里的 api_key 是 resolve 当时写下的，可能已过期
+      // （直连/代理都会 401）。找后端要一个用最新会话 token 拼好的直链。
+      try {
+        const response = await apiFetch(
+          `/api/emby/static-url?movieId=${movie.id}`
+        )
+        const data = (await response.json()) as {
+          success?: boolean
+          url?: string
+        }
+        if (response.ok && data.success && data.url) {
+          sourceUrl = data.url
+          // 该域名 CORS 已实测放行（ACAO 回显站点源 + 支持 Range），
+          // 让播放器直连，用用户本地带宽读文件。
+          allowDirectCrossOrigin = true
+        } else {
+          sourceUrl = `/api/emby/stream?movieId=${movie.id}&static=1`
+        }
+      } catch {
+        sourceUrl = `/api/emby/stream?movieId=${movie.id}&static=1`
+      }
     } else {
       sourceUrl = `/api/emby/stream?movieId=${movie.id}&static=1`
     }
