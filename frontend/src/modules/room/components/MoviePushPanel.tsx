@@ -1933,7 +1933,9 @@ export function MoviePushPanel({ isHost }: MoviePushPanelProps) {
 
           {/* 浏览器转码引擎开关：仅挂载/文件类源显示。B站 源解析出的
               MP4/DASH 浏览器必定原生可播，无转码需求，隐藏开关避免困惑。 */}
-          {sourceType !== 'bilibili' && (
+          {sourceType !== 'bilibili' &&
+            sourceType !== 'emby' &&
+            sourceType !== 'jellyfin' && (
             <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-[var(--md-sys-shape-corner)] bg-[var(--md-sys-color-surface-container-high)]">
               <div className="min-w-0">
                 <Text className="block text-xs font-medium">

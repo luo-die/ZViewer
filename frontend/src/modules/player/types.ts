@@ -122,6 +122,11 @@ export interface PlayerSource {
    */
   mkvFastPath?: boolean
   /**
+   * 优先客户端解封装（playsvideo）：Emby/Jellyfin 源用它让浏览器直接
+   * demux 内嵌字幕，避免服务端扫整集文件。仅在浏览器支持 MSE 时生效。
+   */
+  preferClientDemux?: boolean
+  /**
    * 强制使用 playsvideo 管线（内部回退标记，不由业务代码设置）。
    * MKV 快速路径原生失败后，回退重挂载时置位以绕过快速路径判定。
    */

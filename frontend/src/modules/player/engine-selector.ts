@@ -78,6 +78,9 @@ export function shouldUsePlaysVideo(source: PlayerSource): boolean {
   // 本机偏好（播放列表的「浏览器转码引擎」开关，仅本机生效、不同步）：
   // 关闭时无条件强制原生直连（含 forcePlaysVideo 回退路径）；开启时
   // 忽略影片级开关，但仍受系统级开关与浏览器能力限制。
+  // Emby/Jellyfin：房间选「自动」时强制客户端解封装（优先于本机开关），
+  // 否则原生 MKV 快路径会让 playsvideo 根本不启动，字幕只能回退服务端。
+  if (source.preferClientDemux) return true
   const localOverride = getPlaysvideoLocalOverride()
   if (localOverride === 'off') return false
   // 两级开关：系统级（管理后台「基础设置」）与影片级（添加影片时设置）

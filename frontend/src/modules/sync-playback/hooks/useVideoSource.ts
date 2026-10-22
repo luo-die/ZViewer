@@ -210,6 +210,8 @@ function toPlayerSource(
     // MKV 快速路径：原生友好编码跳过重封装管线直接原生播放
     // （原生失败由 usePlayerSource 自动回退 playsvideo 管线）
     mkvFastPath: state.mkvFastPath ?? false,
+    // Emby/Jellyfin：交给 playsvideo 在浏览器里解封装（内嵌字幕随播放解出）
+    preferClientDemux: state.preferClientDemux ?? false,
     // 影片级浏览器播放引擎开关（添加影片时设置），与系统级开关一起
     // 在 shouldUsePlaysVideo 中决定是否启用 playsvideo 管线。
     // 影片记录是权威来源：服务器回放的初始状态可能缺少该字段（历史数据），

@@ -75,6 +75,8 @@ export interface WatchTogetherState {
    * 跳过 playsvideo 重封装管线直接原生播放（原生失败自动回退管线）。
    */
   mkvFastPath?: boolean
+  /** Emby/Jellyfin：优先客户端解封装（playsvideo），跳过原生 MKV 快路径 */
+  preferClientDemux?: boolean
   /**
    * 影片级浏览器播放引擎（playsvideo）开关（添加影片时设置并随状态广播）。
    * false 时强制原生直连播放；需与系统级开关（systemSettingsStore）

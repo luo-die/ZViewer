@@ -76,6 +76,11 @@ export interface ResolvedMovieSource {
    */
   mkvFastPath?: boolean
   /**
+   * 优先客户端解封装（Emby/Jellyfin）：跳过原生 MKV 快路径，由 playsvideo
+   * 在浏览器里 demux 文件，内嵌字幕随播放解出，不再依赖服务端扫整集。
+   */
+  preferClientDemux?: boolean
+  /**
    * 影片级浏览器播放引擎（playsvideo）开关（添加影片时设置）。
    * false 时强制原生直连播放，需与系统级开关同时开启才启用管线。
    */
@@ -511,11 +516,31 @@ export async function resolveMovieSource({
    * 代价：首帧要等 remux 分片，比原生直通慢；不支持 MSE 的浏览器由
    * usePlayerSource 自动回退原生直连（能力不损失）。
    */
-  const prefersClientDemux = sourceType === 'emby' || sourceType === 'jellyfin'
+  const isEmbySource = sourceType === 'emby' || sourceType === 'jellyfin'
+  // 房间选「服务端」时尊重用户：继续走 Emby 转码 HLS。
+  const roomTranscodeMode =
+    useRoomStore.getState().roomSettings.transcodeMode ?? 'auto'
+  const useClientDemux = isEmbySource && roomTranscodeMode !== 'server'
+  /**
+   * 服务端 resolve 会无条件把「音轨不兼容」的影片标成 hls（movie.format='hls'），
+   * 即使房间是「自动」模式。这里在播放前改回 static 直推（原始文件），
+   * 交给 playsvideo 在浏览器里解封装 + 转音频——否则永远走 hls-engine，
+   * 客户端拿不到字节流，内嵌字幕只能服务端扫整集。
+   */
+  let sourceUrl = movie.url
+  let format = inferredFormat
+  if (useClientDemux && inferredFormat === 'hls') {
+    const hasStatic = /[?&]static=1/.test(sourceUrl)
+    sourceUrl = hasStatic
+      ? sourceUrl
+      : `${sourceUrl}${sourceUrl.includes('?') ? '&' : '?'}static=1`
+    // 置空让引擎选择器跳过 hls 分支，由 playsvideo 自己嗅探容器
+    format = undefined
+  }
   return {
-    sourceUrl: movie.url,
+    sourceUrl,
     audioUrl: movie.audioUrl,
-    format: inferredFormat,
+    format,
     videoCodec: movie.videoCodec,
     audioCodec: movie.audioCodec,
     cid: movie.cid,
@@ -524,7 +549,8 @@ export async function resolveMovieSource({
     acceptQuality: movie.acceptQuality,
     headers: undefined,
     reusedRecoveryUrl: false,
-    mkvFastPath: prefersClientDemux
+    preferClientDemux: useClientDemux || undefined,
+    mkvFastPath: useClientDemux
       ? false
       : computeMkvFastPath(inferredFormat, movie.videoCodec, movie.audioCodec),
     playsvideoEnabled: movie.playsvideoEnabled !== false,
