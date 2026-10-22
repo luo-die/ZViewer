@@ -212,6 +212,7 @@ function toPlayerSource(
     mkvFastPath: state.mkvFastPath ?? false,
     // Emby/Jellyfin：交给 playsvideo 在浏览器里解封装（内嵌字幕随播放解出）
     preferClientDemux: state.preferClientDemux ?? false,
+    allowDirectCrossOrigin: state.allowDirectCrossOrigin ?? false,
     // 影片级浏览器播放引擎开关（添加影片时设置），与系统级开关一起
     // 在 shouldUsePlaysVideo 中决定是否启用 playsvideo 管线。
     // 影片记录是权威来源：服务器回放的初始状态可能缺少该字段（历史数据），

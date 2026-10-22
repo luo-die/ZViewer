@@ -65,7 +65,7 @@ import {
  * playsvideo attach 超时：引擎卡在探测/索引阶段时的兜底。
  * 超过该时长按失败处理，回退原生直连。
  */
-const PLAYSVIDEO_ATTACH_TIMEOUT_MS = 25_000
+const PLAYSVIDEO_ATTACH_TIMEOUT_MS = 45_000
 
 /** 与超时竞速：超时后返回 rejected Promise（原 Promise 的结果被忽略） */
 function raceWithTimeout<T>(

@@ -1011,6 +1011,7 @@ export function useWatchTogether({
         mkvFastPath: r.mkvFastPath ?? false,
         // Emby/Jellyfin：客户端解封装（字幕随播放解出）
         preferClientDemux: r.preferClientDemux ?? false,
+        allowDirectCrossOrigin: r.allowDirectCrossOrigin ?? false,
         // 影片级浏览器播放引擎开关（添加影片时设置），随状态广播给观众
         playsvideoEnabled: r.playsvideoEnabled !== false,
         // 挂载直链模式：直连失败不回退服务器代理，直接提示错误

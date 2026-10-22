@@ -157,7 +157,11 @@ function resolvePlaysVideoUrl(source: PlayerSource): string {
   // 同源 / 相对路径（如 /api/webdav/stream、/api/server-files/raw）：
   // 直接请求，仅需补 token（HTTP 环境下无 auth cookie）。
   if (isLocalUrl(url) || isRelativeUrl(url)) return appendAuthToken(url)
-  // 跨域：走后端代理，由后端注入防盗链头并透传 Range。
+  // 已确认对端 CORS 放行（Emby 直链，token 在 query 里）：让引擎直连，
+  // 用浏览器所在网络的带宽读文件——经服务器中转会把 8GB 级片子卡在
+  // VPS 出口带宽上（实测 1.2MB/s），demux/remux 必然超时。
+  if (source.allowDirectCrossOrigin && /^https?:\/\//i.test(url)) return url
+  // 其它跨域：走后端代理，由后端注入防盗链头并透传 Range。
   return buildProxyUrl(url)
 }
 
@@ -178,6 +182,8 @@ class PlaysVideoController implements PlayerController {
   private subtitleGen = 0
   /** 已处理过的 <track> 元素，避免重复提取（addtrack 可能重发） */
   private handledTrackEls = new WeakSet<HTMLTrackElement>()
+  /** 空轨道重试次数：大文件/慢源上轨道先挂上、blob 内容后填充 */
+  private subtitleRetryCounts = new WeakMap<HTMLTrackElement, number>()
   /** 本会话已发布字幕轨数量，用于推算轨道序号 */
   private publishedSubtitleCount = 0
   /** 撤销 addtrack 监听（cleanup 时调用） */
@@ -363,6 +369,7 @@ class PlaysVideoController implements PlayerController {
     element: HTMLTrackElement,
     gen: number
   ): Promise<void> {
+    if (gen !== this.subtitleGen) return
     if (this.handledTrackEls.has(element)) return
     this.handledTrackEls.add(element)
 
@@ -374,7 +381,19 @@ class PlaysVideoController implements PlayerController {
     console.info(
       `[playsvideo-subtitles] 轨道「${label}」取回 ${cues.length} 条 cue`
     )
-    if (cues.length === 0) return
+    if (cues.length === 0) {
+      // 轨道元素先挂上、blob 内容后填充（大文件 / 慢源上很常见）。
+      // 直接判空会把这条轨永久丢掉；这里有限次重试，真·空轨也不会死循环。
+      const retries = (this.subtitleRetryCounts.get(element) ?? 0) + 1
+      this.subtitleRetryCounts.set(element, retries)
+      this.handledTrackEls.delete(element)
+      if (retries <= 3) {
+        window.setTimeout(() => {
+          void this.extractSubtitleTrack(element, gen)
+        }, 2000)
+      }
+      return
+    }
 
     // 轨道序号按挂载顺序推算：playsvideo 依 subtitleTracks 顺序依次 append
     const ordinal = this.publishedSubtitleCount++

@@ -77,6 +77,8 @@ export interface WatchTogetherState {
   mkvFastPath?: boolean
   /** Emby/Jellyfin：优先客户端解封装（playsvideo），跳过原生 MKV 快路径 */
   preferClientDemux?: boolean
+  /** Emby 直链：允许播放器跳过 /api/stream/proxy 直连（CORS 已验证放行） */
+  allowDirectCrossOrigin?: boolean
   /**
    * 影片级浏览器播放引擎（playsvideo）开关（添加影片时设置并随状态广播）。
    * false 时强制原生直连播放；需与系统级开关（systemSettingsStore）

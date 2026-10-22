@@ -80,6 +80,8 @@ export interface ResolvedMovieSource {
    * 在浏览器里 demux 文件，内嵌字幕随播放解出，不再依赖服务端扫整集。
    */
   preferClientDemux?: boolean
+  /** Emby 直链：播放器可跳过代理直连（对端 CORS 已放行） */
+  allowDirectCrossOrigin?: boolean
   /**
    * 影片级浏览器播放引擎（playsvideo）开关（添加影片时设置）。
    * false 时强制原生直连播放，需与系统级开关同时开启才启用管线。
@@ -529,12 +531,29 @@ export async function resolveMovieSource({
    */
   let sourceUrl = movie.url
   let format = inferredFormat
+  let allowDirectCrossOrigin = false
   if (useClientDemux && inferredFormat === 'hls') {
-    const hasStatic = /[?&]static=1/.test(sourceUrl)
-    sourceUrl = hasStatic
-      ? sourceUrl
-      : `${sourceUrl}${sourceUrl.includes('?') ? '&' : '?'}static=1`
-    // 置空让引擎选择器跳过 hls 分支，由 playsvideo 自己嗅探容器
+    // 不能给 main.m3u8 追加 static=1——那还是 HLS 清单（UHD 对 main.m3u8 直接 400）。
+    // 必须改回原始文件直推入口：
+    // - 直链模式：movie.url 就是 Emby 的 main.m3u8，同一 URL 里带着 api_key，
+    //   把路径换成 stream?static=true 即得原始文件直链（实测 CORS 允许、支持 Range，
+    //   浏览器可用家里带宽直接 demux，不再经过本服务中转）。
+    // - 中转模式：走 /api/emby/stream?static=1，由后端带凭证透传。
+    const directMainM3u8 = movie.url.match(
+      /^(https?:\/\/[^/]+)\/emby\/Videos\/([^/]+)\/main\.m3u8(\?.*)?$/i
+    )
+    if (directMainM3u8) {
+      const [, origin, itemId, query = ''] = directMainM3u8
+      const apiKey = new URLSearchParams(query.replace(/^\?/, '')).get('api_key')
+      sourceUrl = `${origin}/emby/Videos/${itemId}/stream?static=true${
+        apiKey ? `&api_key=${encodeURIComponent(apiKey)}` : ''
+      }`
+      // 该域名 CORS 已实测放行（ACAO 回显站点源 + 支持 Range），
+      // 让播放器直连，用用户本地带宽读文件，不再经 VPS 中转。
+      allowDirectCrossOrigin = true
+    } else {
+      sourceUrl = `/api/emby/stream?movieId=${movie.id}&static=1`
+    }
     format = undefined
   }
   return {
@@ -550,6 +569,7 @@ export async function resolveMovieSource({
     headers: undefined,
     reusedRecoveryUrl: false,
     preferClientDemux: useClientDemux || undefined,
+    allowDirectCrossOrigin: allowDirectCrossOrigin || undefined,
     mkvFastPath: useClientDemux
       ? false
       : computeMkvFastPath(inferredFormat, movie.videoCodec, movie.audioCodec),

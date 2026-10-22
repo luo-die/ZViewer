@@ -400,16 +400,29 @@ export function useSubtitles({
     const unsubscribe = subscribePlaysVideoSubtitles((sub) => {
       if (!isHost || sub.cues.length === 0) return
       const label = sub.label || `轨道 ${sub.index + 1}`
+      const isChinese = (text: string, lang?: string | null): boolean =>
+        CHINESE_TEXT_RE.test(text) ||
+        (!!lang && (CHINESE_LANG_RE.test(lang) || CHINESE_TEXT_RE.test(lang)))
       setState((prev) => {
         if (prev.subtitleTracks.some((t) => t.label === label)) return prev
+        // playsvideo 按轨道挂载顺序发布，可能先出西语/英语；中文轨到达时切过去，
+        // 否则默认激活的是第一条（往往不是用户要的）。
+        const activeTrack = prev.subtitleTracks[prev.activeTrackIndex]
+        const activeIsChinese =
+          !!activeTrack &&
+          isChinese(activeTrack.label, activeTrack.lang ?? undefined)
+        const nextTracks = [
+          ...prev.subtitleTracks,
+          { cues: sub.cues, label, lang: sub.language ?? undefined },
+        ]
         const next: SubtitleState = {
           ...prev,
-          subtitleTracks: [
-            ...prev.subtitleTracks,
-            { cues: sub.cues, label, lang: sub.language ?? undefined },
-          ],
+          subtitleTracks: nextTracks,
           subtitleEnabled: true,
-          activeTrackIndex: prev.subtitleTracks.length,
+          activeTrackIndex:
+            isChinese(label, sub.language) && !activeIsChinese
+              ? nextTracks.length - 1
+              : prev.activeTrackIndex,
           subtitleMovieId: currentMovieIdRef.current,
         }
         broadcast(next)
