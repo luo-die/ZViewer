@@ -1070,6 +1070,14 @@ const MKV_FAILURE_TTL_MS = 2 * 60 * 1000;
 const EMBY_ENDPOINT_WAIT_MS = 6_000;
 /** 端点失败的记忆时长：这段时间内同影片同轨道直接走解容器，不再白等一轮 */
 const EMBY_ENDPOINT_FAILURE_TTL_MS = 10 * 60 * 1000;
+/**
+ * 「Emby 字幕流 Index → 容器 TrackNumber」的降级映射记忆。
+ *
+ * 媒体服务器没有字幕端点时，第一次请求会失败并降级到解容器；前端随后每
+ * 一次轮询都会带着同一个 Emby Index 回来。记住映射后，后续轮询直接命中解
+ * 容器缓存，不必每轮再打一次 PlaybackInfo、再把十来个字幕地址试一遍。
+ */
+const embyIndexFallbacks = new Map<string, { at: number; trackNumber: number }>();
 /** key = movieId:streamIndex → 失败时间戳 */
 const embyEndpointFailures = new Map<string, number>();
 
@@ -1356,8 +1364,139 @@ function mapEmbySubtitleFormat(
 }
 
 /**
+ * 服务端解容器取内嵌字幕的统一出口。
+ *
+ * - mkv=1 的显式请求
+ * - 「媒体服务器字幕端点不可用」后的自动降级
+ *
+ * 两者都要先看缓存/磁盘/部分结果，未命中才启动后台提取；提取要把整集顺序
+ * 读一遍，同步等会撞反向代理超时，因此先等首批 cue（1.5s），拿不到就回
+ * 202 + 真实进度，前端继续轮询。
+ */
+async function respondWithMkvExtraction(
+  movie: Movie,
+  trackNumber: number,
+  res: Response,
+  knownHint?: ServerMkvTracks | null,
+): Promise<void> {
+  const cacheKey = `${movie.id}:${trackNumber}`;
+  const cached = mkvExtractCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < MKV_CACHE_TTL_MS) {
+    res.json({
+      success: true,
+      content: cached.content,
+      format: cached.format,
+      label: cached.label,
+      language: cached.language,
+      cached: true,
+    });
+    return;
+  }
+  const fromDisk = readMkvCacheFromDisk(movie, trackNumber);
+  if (fromDisk) {
+    mkvExtractCache.set(cacheKey, fromDisk);
+    res.json({
+      success: true,
+      content: fromDisk.content,
+      format: fromDisk.format,
+      label: fromDisk.label,
+      language: fromDisk.language,
+      cached: true,
+    });
+    return;
+  }
+  const partial = mkvPartial.get(cacheKey);
+  if (partial && Date.now() - partial.at < MKV_PARTIAL_TTL_MS) {
+    res.json({
+      success: true,
+      partial: true,
+      content: partial.content,
+      format: partial.format,
+      label: partial.label,
+      language: partial.language,
+    });
+    return;
+  }
+  const failure = mkvFailures.get(cacheKey);
+  if (failure && Date.now() - failure.at < MKV_FAILURE_TTL_MS) {
+    res.status(400).json({
+      success: false,
+      message: /HTTP 429/.test(failure.message)
+        ? `${failure.message}（媒体服务器限流，稍等 1~2 分钟再试即可）`
+        : failure.message,
+    });
+    return;
+  }
+  const known = knownHint ?? (await listServerMkvTracks(movie));
+  if (!known) {
+    res.status(400).json({
+      success: false,
+      message: '未能从容器中读到内嵌字幕轨（可能不是 MKV，或探测被上游限流）',
+    });
+    return;
+  }
+  if (!known.tracks.some((t) => t.trackNumber === trackNumber)) {
+    res.status(400).json({
+      success: false,
+      message: `未找到字幕轨 ${trackNumber}（容器内文本字幕轨：${known.tracks
+        .map((t) => t.trackNumber)
+        .join('/')}）`,
+    });
+    return;
+  }
+  const started = startMkvExtractionInBackground(
+    movie,
+    trackNumber,
+    cacheKey,
+    known.fileSize,
+  );
+  const FIRST_PARTIAL_WAIT_MS = 1_500;
+  const waitUntil = Date.now() + FIRST_PARTIAL_WAIT_MS;
+  for (;;) {
+    const first = mkvPartial.get(cacheKey);
+    if (first) {
+      res.json({
+        success: true,
+        partial: true,
+        content: first.content,
+        format: first.format,
+        label: first.label,
+        language: first.language,
+      });
+      return;
+    }
+    const failureEarly = mkvFailures.get(cacheKey);
+    if (failureEarly) break;
+    if (Date.now() >= waitUntil) break;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  const pendingProgress = mkvProgress.get(cacheKey);
+  res.status(202).json({
+    success: false,
+    pending: true,
+    // 把真实进度带回去：前端据此显示「已等待 Ns / 已解析 X KB」，
+    // 出现「卡住不动」时也能一眼看出是上游没数据还是在慢慢读
+    progress: pendingProgress
+      ? {
+          bytes: pendingProgress.bytes,
+          batches: pendingProgress.chunks,
+          readBytes: pendingProgress.readBytes,
+          totalBytes: pendingProgress.totalBytes,
+          mode: pendingProgress.mode,
+          requests: pendingProgress.requests,
+        }
+      : null,
+    message: started
+      ? '首次提取内嵌字幕（需读完整集，约 1~2 分钟），完成后自动加载'
+      : pendingProgress && pendingProgress.chunks > 0
+        ? `字幕提取中：已解析 ${(pendingProgress.bytes / 1024).toFixed(0)}KB（第 ${pendingProgress.chunks} 批）`
+        : '字幕提取正在进行中，稍后自动加载',
+  });
+}
+
+/**
  * 列出视频的内嵌字幕轨道：
- * - emby：直接读 Emby PlaybackInfo 的 MediaStreams（Type===Subtitle）
+ * - emby：优先读 Emby PlaybackInfo 的 MediaStreams（Type===Subtitle）
  * - 其余来源：内嵌字幕提取已前端化（浏览器端 MKV demux），后端不再支持
  */
 router.get(
@@ -1406,7 +1545,49 @@ router.get(
           return;
         }
 
-        // 2) 服务端解容器：MKV 内嵌字幕（媒体服务器没有字幕端点时的可靠路径）
+        // 2) 媒体服务器自己的 PlaybackInfo：**优先于容器探测**。
+        //    emby-direct-web / jellyfin-web 就是这样取字幕的——MediaStreams 里
+        //    已经列好每条字幕流（内嵌 + 外挂），拿 Index 直接请求
+        //    `/Videos/{item}/{source}/Subtitles/{index}/Stream.{ext}` 即可，
+        //    不用下载/扫描任何媒体字节。容器探测只在服务器确实没有可用端点时兜底，
+        //    否则每个影片都要先花 1~2s 读文件头、还可能触发上游限流。
+        try {
+          const ctx = await resolveEmbyContext(movie);
+          // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
+          const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
+            subtitleProfile: true,
+          });
+          const mediaSource = playback.MediaSources[0];
+          const subtitleStreams = (mediaSource?.MediaStreams ?? []).filter(
+            (s) => s.Type === 'Subtitle',
+          );
+          // 位图字幕（PGS/VOBSUB）取回来也没法当文本渲染，不列给前端
+          const textStreams = subtitleStreams.filter((s) => isTextSubtitleCodec(s.Codec));
+          if (textStreams.length > 0) {
+            const tracks = textStreams.map((t) => ({
+              index: t.Index,
+              codecName: t.Codec || 'unknown',
+              language: t.Language || null,
+              title: t.DisplayTitle || null,
+              label: t.DisplayTitle || t.Language || `轨道 ${t.Index}`,
+              // 自动挑选字幕轨所需信息：文本轨优先、默认轨次之、强制轨最后。
+              // IsTextSubtitleStream 部分版本不返回（undefined）→ 前端按 Codec 兜底判断。
+              isDefault: t.IsDefault === true,
+              isForced: t.IsForced === true,
+              isText: t.IsTextSubtitleStream ?? true,
+              isExternal: t.IsExternal === true,
+            }));
+            respond({ success: true, tracks, emby: true });
+            return;
+          }
+        } catch (err) {
+          console.warn(
+            '[subtitles] PlaybackInfo 字幕轨探测失败，回退容器探测:',
+            err instanceof Error ? err.message : err,
+          );
+        }
+
+        // 3) 服务端解容器：MKV 内嵌字幕（媒体服务器没有字幕端点时的可靠路径）
         const mkvProbe = await listServerMkvTracks(movie);
         if (mkvProbe) {
           respond({
@@ -1429,30 +1610,8 @@ router.get(
           return;
         }
 
-        // 3) 回退 Emby 兼容层 PlaybackInfo
-        const ctx = await resolveEmbyContext(movie);
-        // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
-        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
-          subtitleProfile: true,
-        });
-        const mediaSource = playback.MediaSources[0];
-        const subtitleStreams = (mediaSource?.MediaStreams ?? []).filter(
-          (s) => s.Type === 'Subtitle',
-        );
-        const tracks = subtitleStreams.map((t) => ({
-          index: t.Index,
-          codecName: t.Codec || 'unknown',
-          language: t.Language || null,
-          title: t.DisplayTitle || null,
-          label: t.DisplayTitle || t.Language || `轨道 ${t.Index}`,
-          // 自动挑选字幕轨所需信息：文本轨优先、默认轨次之、强制轨最后。
-          // IsTextSubtitleStream 部分版本不返回（undefined）→ 前端按 Codec 兜底判断。
-          isDefault: t.IsDefault === true,
-          isForced: t.IsForced === true,
-          isText: t.IsTextSubtitleStream,
-          isExternal: t.IsExternal === true,
-        }));
-        res.json({ success: true, tracks });
+        // 4) 都没有：返回空列表（前端会按「无内嵌字幕」处理）
+        res.json({ success: true, tracks: [] });
         return;
       }
 
@@ -1921,58 +2080,9 @@ router.get(
             );
           }
 
-          // 未命中缓存 → 启动后台提取，并**先等一小会儿首批 cue**：
-          // 顺序读取下第一个 Cluster 的头几 MB 内就有字幕，通常 0.5~1.5s 可拿到，
-          // 直接带回去能省掉一轮轮询（前端原本要等下一个 4s 轮询才有字幕）。
-          // 超过等待窗口仍返回 202，长任务继续在后台跑（避免反向代理 504）。
-          const started = startMkvExtractionInBackground(
-            movie,
-            streamIndex,
-            cacheKey,
-            known.fileSize,
-          );
-          const FIRST_PARTIAL_WAIT_MS = 1_500;
-          const waitUntil = Date.now() + FIRST_PARTIAL_WAIT_MS;
-          for (;;) {
-            const first = mkvPartial.get(cacheKey);
-            if (first) {
-              res.json({
-                success: true,
-                partial: true,
-                content: first.content,
-                format: first.format,
-                label: first.label,
-                language: first.language,
-              });
-              return;
-            }
-            const failureEarly = mkvFailures.get(cacheKey);
-            if (failureEarly) break;
-            if (Date.now() >= waitUntil) break;
-            await new Promise((resolve) => setTimeout(resolve, 150));
-          }
-          const pendingProgress = mkvProgress.get(cacheKey);
-          res.status(202).json({
-            success: false,
-            pending: true,
-            // 把真实进度带回去：前端据此显示「已等待 Ns / 已解析 X KB」，
-            // 出现「卡住不动」时也能一眼看出是上游没数据还是在慢慢读
-            progress: pendingProgress
-              ? {
-                  bytes: pendingProgress.bytes,
-                  batches: pendingProgress.chunks,
-                  readBytes: pendingProgress.readBytes,
-                  totalBytes: pendingProgress.totalBytes,
-                  mode: pendingProgress.mode,
-                  requests: pendingProgress.requests,
-                }
-              : null,
-            message: started
-              ? '首次提取内嵌字幕（需读完整集，约 1~2 分钟），完成后自动加载'
-              : pendingProgress && pendingProgress.chunks > 0
-                ? `字幕提取中：已解析 ${(pendingProgress.bytes / 1024).toFixed(0)}KB（第 ${pendingProgress.chunks} 批）`
-                : '字幕提取正在进行中，稍后自动加载',
-          });
+          // 未命中缓存 → 走统一出口：启动后台提取，先等首批 cue，
+          // 拿不到就回 202 + 真实进度（前端继续轮询）
+          await respondWithMkvExtraction(movie, streamIndex, res, known);
           return;
         }
 
@@ -2019,6 +2129,15 @@ router.get(
           return;
         }
 
+        // 已确认该服务器的字幕端点不可用：直接走解容器，不再重复
+        // PlaybackInfo + 十来个字幕地址试探（每轮轮询都做一遍会很慢）
+        const fallbackKey = `embyidx:${movie.id}:${streamIndex}`;
+        const fallback = embyIndexFallbacks.get(fallbackKey);
+        if (fallback && Date.now() - fallback.at < EMBY_ENDPOINT_FAILURE_TTL_MS) {
+          await respondWithMkvExtraction(movie, fallback.trackNumber, res);
+          return;
+        }
+
         const ctx = await resolveEmbyContext(movie);
         console.info(
           `[subtitles] 提取请求 movie=${movie.id} index=${streamIndex} mode=emby（媒体服务器字幕端点）`,
@@ -2041,26 +2160,52 @@ router.get(
           (s) => s.Type === 'Subtitle',
         );
         const ordinal = subtitleStreams.findIndex((s) => s.Index === streamIndex);
+        // 文本字幕的类型内序号：容器里只有文本字幕轨，端点失败降级时按它对齐
+        const textSubtitleStreams = subtitleStreams.filter((s) =>
+          isTextSubtitleCodec(s.Codec),
+        );
+        const textOrdinal = textSubtitleStreams.findIndex((s) => s.Index === streamIndex);
         // 把整条字幕流的元信息传给客户端层：Emby 的取字幕地址随版本/投递方式变化，
         // DeliveryUrl / DeliveryMethod / 索引约定都是定位正确地址的关键
-        const content = await ctx.client.subtitleContent(
-          ctx.itemId,
-          mediaSource.Id,
-          streamIndex,
-          ext,
-          {
-            index: subStream.Index,
-            codec: subStream.Codec,
-            isExternal: subStream.IsExternal,
-            deliveryMethod: subStream.DeliveryMethod,
-            deliveryUrl: subStream.DeliveryUrl,
-          },
-          {
-            ordinal: ordinal >= 0 ? ordinal : undefined,
-            subtitleCount: subtitleStreams.length,
-            playSessionId: playback.PlaySessionId,
-          },
-        );
+        let content: string;
+        try {
+          content = await ctx.client.subtitleContent(
+            ctx.itemId,
+            mediaSource.Id,
+            streamIndex,
+            ext,
+            {
+              index: subStream.Index,
+              codec: subStream.Codec,
+              isExternal: subStream.IsExternal,
+              deliveryMethod: subStream.DeliveryMethod,
+              deliveryUrl: subStream.DeliveryUrl,
+            },
+            {
+              ordinal: ordinal >= 0 ? ordinal : undefined,
+              subtitleCount: subtitleStreams.length,
+              playSessionId: playback.PlaySessionId,
+            },
+          );
+        } catch (err) {
+          // 媒体服务器没有字幕端点（UHD 这类第三方兼容层）时，不能把错误直接
+          // 抛给用户：自动降级回服务端解容器，与旧行为保持一致。
+          const mkv = await listServerMkvTracks(movie);
+          const mkvTrack = textOrdinal >= 0 ? mkv?.tracks[textOrdinal] : undefined;
+          if (mkvTrack) {
+            embyIndexFallbacks.set(fallbackKey, {
+              at: Date.now(),
+              trackNumber: mkvTrack.trackNumber,
+            });
+            console.info(
+              `[subtitles] 媒体服务器字幕端点不可用，降级服务端解容器 ` +
+                `movie=${movie.id} embyIndex=${streamIndex} track=${mkvTrack.trackNumber}`,
+            );
+            await respondWithMkvExtraction(movie, mkvTrack.trackNumber, res, mkv);
+            return;
+          }
+          throw err;
+        }
         const label = subStream.DisplayTitle || subStream.Language || `轨道 ${streamIndex}`;
         res.json({
           success: true,

@@ -121,8 +121,12 @@ interface EmbyRequestOptions {
   body?: unknown;
   /** 使用 API Key 请求头（GET 用 query，POST 用 X-Emby-Token） */
   authHeader?: boolean;
-  /** 响应类型：默认 json；字幕等纯文本响应传 'text' */
-  responseType?: 'json' | 'text';
+  /**
+   * 响应类型：默认 json；字幕等纯文本响应传 'text'；
+   * 'bytes' 用于字幕文件——先拿原始字节再按 BOM/UTF-8/GB18030 解码，
+   * 避免非 UTF-8 字幕（GBK 老片源很常见）被当 UTF-8 解码成乱码。
+   */
+  responseType?: 'json' | 'text' | 'bytes';
   /**
    * 放宽 Accept 头为通配符（任意类型）。
    * 字幕端点返回 text 内容，固定 Accept: application/json 时部分 Emby 版本会
@@ -240,6 +244,48 @@ function looksLikeHtml(text: string): boolean {
 }
 
 /**
+ * 看起来像 JSON 错误体（部分反代/网关用 JSON 回 200）时判为失败。
+ * 注意不能把所有 '[' 开头都当 JSON——ASS/SSA 字幕正是以 `[Script Info]` 开头。
+ */
+function looksLikeJson(text: string): boolean {
+  const head = text.trim().slice(0, 200);
+  return head.startsWith('{') || /^\[\s*\{/.test(head);
+}
+
+/** 字幕接口返回体积上限（正常字幕几百 KB，超过这个量级基本是错误页/视频流） */
+const SUBTITLE_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * 把字幕文件的原始字节解码成文本。
+ *
+ * 参考 emby-direct-web 的做法：先看 BOM（UTF-8 / UTF-16LE / UTF-16BE），
+ * 再尝试严格 UTF-8；失败则按 GB18030 解码（国内老字幕大量是 GBK/GB18030），
+ * 最后才退回宽松 UTF-8。直接 res.text() 会把这些字幕解成 U+FFFD 乱码。
+ */
+function decodeSubtitleBytes(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  try {
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      return new TextDecoder('utf-8').decode(bytes.subarray(3));
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+      return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+    }
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    // 非法 UTF-8：优先按 GB18030（GBK 超集）解；旧环境没有该解码器时退回宽松 UTF-8
+    try {
+      return new TextDecoder('gb18030').decode(bytes);
+    } catch {
+      return new TextDecoder('utf-8').decode(bytes);
+    }
+  }
+}
+
+/**
  * 构造候选字幕地址（按命中概率排序，去重）。
  *
  * Emby 各版本/各投递方式对「定位字幕流」的约定不一致，已确认的失败形态是
@@ -270,6 +316,15 @@ export function buildSubtitleCandidates(ctx: EmbySubtitleContext): string[] {
     else if (delivery.startsWith('/emby/')) push(delivery);
     else if (delivery.startsWith('/')) push(`/emby${delivery}`);
     else push(`/emby/${delivery}`);
+  }
+
+  // 1.5) 标准三段式 + StartPositionTicks=0。
+  //      emby-direct-web 取字幕用的就是这条形态（source id + 全局 Index + 扩展名），
+  //      在原生 Emby / Jellyfin 上命中率最高，放在 DeliveryUrl 之后第一个试。
+  if (ms) {
+    push(
+      `/emby/Videos/${item}/${ms}/Subtitles/${ctx.index}/Stream.${format}?StartPositionTicks=0`,
+    );
   }
 
   // 2) 索引候选：全局 Index → 类型内序号 → 0/1/2（限定在字幕数附近）
@@ -437,6 +492,9 @@ export class EmbyClient {
       if (res.status === 204) return undefined as T;
       if (reqOpts.responseType === 'text') {
         return (await res.text()) as unknown as T;
+      }
+      if (reqOpts.responseType === 'bytes') {
+        return (await res.arrayBuffer()) as unknown as T;
       }
       return (await res.json()) as T;
     } catch (err) {
@@ -804,14 +862,28 @@ export class EmbyClient {
     const failures: string[] = [];
     for (const candidate of candidates) {
       try {
-        const text = await this.request<string>({
+        // 取原始字节再解码：Emby/Jellyfin 会把外挂字幕原样回传，
+        // 老片源的 GBK/GB18030、Windows 工具导出的 UTF-16LE 都很常见，
+        // 直接 res.text()（按 UTF-8）会得到整篇乱码。
+        const buf = await this.request<ArrayBuffer>({
           path: candidate,
           authHeader: true,
-          responseType: 'text',
+          responseType: 'bytes',
           acceptAny: true,
         });
-        if (text && text.trim() && !looksLikeHtml(text)) return text;
-        failures.push(`${candidate} → ${text && text.trim() ? 'HTML 错误页' : '空响应'}`);
+        if (buf.byteLength > SUBTITLE_MAX_BYTES) {
+          failures.push(
+            `${candidate} → 响应过大（${(buf.byteLength / 1048576).toFixed(1)}MB）`,
+          );
+          continue;
+        }
+        const text = decodeSubtitleBytes(buf);
+        if (text.trim() && !looksLikeHtml(text) && !looksLikeJson(text)) return text;
+        failures.push(
+          `${candidate} → ${
+            !text.trim() ? '空响应' : looksLikeHtml(text) ? 'HTML 错误页' : 'JSON 错误体'
+          }`,
+        );
       } catch (err) {
         const status = err instanceof EmbyError ? err.status : undefined;
         failures.push(

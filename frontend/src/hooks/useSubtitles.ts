@@ -1183,10 +1183,10 @@ export function useSubtitles({
         }
         const pick = pickPreferredEmbeddedTrack(tracks)
         if (!pick) return 0
-        // 服务端解容器要把整集文件顺序读一遍（首次约 1~3 分钟），
-        // 结果会落盘缓存，之后所有观看者与后续播放秒开
+        // 两条路径：媒体服务器字幕端点（通常 1~2 秒）；端点不可用时才回退
+        // 服务端解容器（首次要把整集读一遍，约 1~3 分钟，结果落盘缓存）
         console.info(
-          '[useSubtitles] 正在服务端提取内嵌字幕（首次可能需要 1~3 分钟，之后走缓存）：',
+          '[useSubtitles] 正在提取字幕（Emby 端点通常 1~2 秒；解容器首次可能 1~3 分钟）：',
           pick.label
         )
         return await extractEmbeddedTrack(source, pick)
