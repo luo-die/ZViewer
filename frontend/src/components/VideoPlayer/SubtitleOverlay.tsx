@@ -37,6 +37,12 @@ interface SubtitleOverlayProps {
 
 /** 副字幕相对主字幕上移的百分比（双语时两条不重叠） */
 const SECONDARY_LINE_OFFSET = 11
+/**
+ * 贴底字幕与控制栏之外的安全间距（px @720p，随字号比例缩放）。
+ * 字幕直接压在画面最底边会显得「掉出去了」，留一点呼吸空间，
+ * 控制栏升起时再叠加控制栏高度。
+ */
+const BOTTOM_SAFE_GAP_PX = 28
 /** 字号缩放基准高度：720p 下 1:1，1080p 自动 ×1.5（按比例而非固定 px） */
 const FONT_SIZE_REFERENCE_HEIGHT = 720
 
@@ -205,7 +211,10 @@ export function SubtitleOverlay({
               // 过渡时长与 zart-controlbar-enter/exit 基本对齐，看起来是「跟着控件走」。
               top:
                 line > 50
-                  ? `calc(${top}% - ${Math.max(0, bottomInset)}px)`
+                  ? `calc(${top}% - ${
+                      Math.max(0, bottomInset) +
+                      Math.round(BOTTOM_SAFE_GAP_PX * fontScale)
+                    }px)`
                   : `${top}%`,
               transition: 'top 0.28s cubic-bezier(0.16, 1, 0.3, 1)',
               transform: getTransform(line, align),

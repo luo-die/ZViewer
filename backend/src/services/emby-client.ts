@@ -81,6 +81,8 @@ export interface EmbyItem {
   IsFile?: boolean;
   /** 媒体源信息（PlaybackInfo 或带 Fields=MediaSources 时返回） */
   MediaSources?: EmbyMediaSource[];
+  /** 条目级流列表（带 Fields=MediaStreams 时返回；比 PlaybackInfo 更全） */
+  MediaStreams?: EmbyMediaStream[];
   /**
    * 图片 tag 集合：有 Primary 表示该条目有主图（电影海报 / 剧集海报 / 单集缩略图）。
    * 浏览器列表的缩略图据此显示，tag 变化即缓存失效（拼接在图片 URL 上）。
@@ -931,6 +933,20 @@ export class EmbyClient {
       }
     }
     return res;
+  }
+
+  /**
+   * 条目详情（带 MediaStreams）：GET /emby/Users/{userId}/Items/{itemId}
+   *
+   * 为什么不能只靠 PlaybackInfo：服务端决定「转码播放」时，返回的 MediaSource
+   * 只包含实际输出的轨道，字幕流经常整组消失；而条目详情接口无论是否转码都会
+   * 列出容器里的全部流。emby-direct-web / jellyfin-web 取字幕 Index 用的就是它。
+   */
+  async itemDetail(userId: string, itemId: string): Promise<EmbyItem> {
+    return this.request<EmbyItem>({
+      path: `/emby/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}`,
+      query: { Fields: 'MediaStreams,MediaSources' },
+    });
   }
 
   /** 停止转码 POST /emby/Videos/ActiveEncodings/Delete */

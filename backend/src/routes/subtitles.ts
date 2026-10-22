@@ -58,7 +58,11 @@ import {
 } from '../services/server-files/pathResolver';
 
 // Emby 字幕（直接调用 Emby 自带的字幕接口）
-import { EmbyClient, createEmbyClientFromMount } from '../services/emby-client';
+import {
+  EmbyClient,
+  createEmbyClientFromMount,
+  type EmbyMediaStream,
+} from '../services/emby-client';
 // 第三方 Emby 兼容服务的原生 API 字幕兜底（其兼容层常常没有字幕端点）
 import { createNativeApiFromMount } from '../services/emby-native';
 // 服务端 MKV 解容器取字幕（不依赖 ffmpeg / 浏览器 / Range）
@@ -795,6 +799,50 @@ async function resolveEmbyContext(movie: Movie): Promise<{
     userId = me.Id;
   }
   return { client, itemId: movie.path, userId };
+}
+
+/**
+ * 取影片在 Emby 侧的完整流列表，供字幕定位。
+ *
+ * 关键：PlaybackInfo 在「服务端决定转码」时返回的 MediaSource 往往不含字幕
+ * 流（只剩实际输出的轨道），这时列表会误判成「没有字幕」，被迫走容器解容器。
+ * 条目详情接口（Fields=MediaStreams）无论是否转码都会返回容器里的全部流，
+ * 因此把它作为 PlaybackInfo 的补充：没有字幕流时才多问这一次。
+ */
+async function getEmbyStreams(ctx: {
+  client: EmbyClient;
+  itemId: string;
+  userId: string;
+}): Promise<{
+  mediaSourceId: string;
+  streams: EmbyMediaStream[];
+  playSessionId?: string;
+}> {
+  const playback = await ctx.client
+    .playbackInfo(ctx.itemId, ctx.userId, { subtitleProfile: true })
+    .catch(() => null);
+  const source = playback?.MediaSources?.[0];
+  let mediaSourceId = source?.Id ?? '';
+  let streams: EmbyMediaStream[] = source?.MediaStreams ?? [];
+
+  if (!streams.some((s) => s.Type === 'Subtitle')) {
+    const detail = await ctx.client
+      .itemDetail(ctx.userId, ctx.itemId)
+      .catch(() => null);
+    const detailStreams = [
+      ...((detail?.MediaSources ?? []).flatMap((s) => s.MediaStreams ?? [])),
+      ...(detail?.MediaStreams ?? []),
+    ];
+    if (detailStreams.length > 0) {
+      console.info(
+        `[subtitles] PlaybackInfo 无字幕流，改用条目详情（${detailStreams.length} 条流）`,
+      );
+      streams = detailStreams;
+      mediaSourceId = detail?.MediaSources?.[0]?.Id ?? mediaSourceId;
+    }
+  }
+
+  return { mediaSourceId, streams, playSessionId: playback?.PlaySessionId };
 }
 
 /**
@@ -1553,16 +1601,12 @@ router.get(
         //    否则每个影片都要先花 1~2s 读文件头、还可能触发上游限流。
         try {
           const ctx = await resolveEmbyContext(movie);
-          // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
-          const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
-            subtitleProfile: true,
-          });
-          const mediaSource = playback.MediaSources[0];
-          const subtitleStreams = (mediaSource?.MediaStreams ?? []).filter(
-            (s) => s.Type === 'Subtitle',
-          );
+          // PlaybackInfo 拿不到字幕流时会自动补问条目详情（转码场景很常见）
+          const { streams } = await getEmbyStreams(ctx);
           // 位图字幕（PGS/VOBSUB）取回来也没法当文本渲染，不列给前端
-          const textStreams = subtitleStreams.filter((s) => isTextSubtitleCodec(s.Codec));
+          const textStreams = streams.filter(
+            (s) => s.Type === 'Subtitle' && isTextSubtitleCodec(s.Codec),
+          );
           if (textStreams.length > 0) {
             const tracks = textStreams.map((t) => ({
               index: t.Index,
@@ -2142,23 +2186,17 @@ router.get(
         console.info(
           `[subtitles] 提取请求 movie=${movie.id} index=${streamIndex} mode=emby（媒体服务器字幕端点）`,
         );
-        // subtitleProfile: 让 Emby 下发每条字幕流的 DeliveryUrl（取字幕文件的地址）
-        const playback = await ctx.client.playbackInfo(ctx.itemId, ctx.userId, {
-          subtitleProfile: true,
-        });
-        const mediaSource = playback.MediaSources[0];
-        const subStream = (mediaSource?.MediaStreams ?? []).find(
+        const { mediaSourceId, streams, playSessionId } = await getEmbyStreams(ctx);
+        const subStream = streams.find(
           (s) => s.Type === 'Subtitle' && s.Index === streamIndex,
         );
-        if (!subStream || !mediaSource) {
+        if (!subStream) {
           res.status(400).json({ success: false, message: '未找到指定的字幕轨道' });
           return;
         }
         const { ext, format } = mapEmbySubtitleFormat(subStream.Codec || '');
         // 字幕流的「类型内序号」：部分 Emby 版本按此定位字幕，而非容器全局 Index
-        const subtitleStreams = (mediaSource.MediaStreams ?? []).filter(
-          (s) => s.Type === 'Subtitle',
-        );
+        const subtitleStreams = streams.filter((s) => s.Type === 'Subtitle');
         const ordinal = subtitleStreams.findIndex((s) => s.Index === streamIndex);
         // 文本字幕的类型内序号：容器里只有文本字幕轨，端点失败降级时按它对齐
         const textSubtitleStreams = subtitleStreams.filter((s) =>
@@ -2179,7 +2217,7 @@ router.get(
             content = await Promise.race([
               ctx.client.subtitleContent(
                 ctx.itemId,
-                mediaSource.Id,
+                mediaSourceId,
                 streamIndex,
                 ext,
                 {
@@ -2192,7 +2230,7 @@ router.get(
                 {
                   ordinal: ordinal >= 0 ? ordinal : undefined,
                   subtitleCount: subtitleStreams.length,
-                  playSessionId: playback.PlaySessionId,
+                  playSessionId,
                 },
               ),
               new Promise<string>((_, reject) => {
