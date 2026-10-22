@@ -2169,24 +2169,48 @@ router.get(
         // DeliveryUrl / DeliveryMethod / 索引约定都是定位正确地址的关键
         let content: string;
         try {
-          content = await ctx.client.subtitleContent(
-            ctx.itemId,
-            mediaSource.Id,
-            streamIndex,
-            ext,
-            {
-              index: subStream.Index,
-              codec: subStream.Codec,
-              isExternal: subStream.IsExternal,
-              deliveryMethod: subStream.DeliveryMethod,
-              deliveryUrl: subStream.DeliveryUrl,
-            },
-            {
-              ordinal: ordinal >= 0 ? ordinal : undefined,
-              subtitleCount: subtitleStreams.length,
-              playSessionId: playback.PlaySessionId,
-            },
-          );
+          // 端点尝试必须有上限：subtitleContent 会按候选地址逐个试，每个请求都有
+          // 自己的超时；服务端若「接了请求却不返回」（部分第三方兼容层会这样），
+          // 不设上限就会在降级到解容器之前干等好几分钟。
+          // 10s 内拿不到就当作该服务不支持字幕端点，立刻走解容器兜底。
+          const ENDPOINT_TIMEOUT_MS = 10_000;
+          let endpointTimer: NodeJS.Timeout | undefined;
+          try {
+            content = await Promise.race([
+              ctx.client.subtitleContent(
+                ctx.itemId,
+                mediaSource.Id,
+                streamIndex,
+                ext,
+                {
+                  index: subStream.Index,
+                  codec: subStream.Codec,
+                  isExternal: subStream.IsExternal,
+                  deliveryMethod: subStream.DeliveryMethod,
+                  deliveryUrl: subStream.DeliveryUrl,
+                },
+                {
+                  ordinal: ordinal >= 0 ? ordinal : undefined,
+                  subtitleCount: subtitleStreams.length,
+                  playSessionId: playback.PlaySessionId,
+                },
+              ),
+              new Promise<string>((_, reject) => {
+                endpointTimer = setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        `媒体服务器字幕端点 ${ENDPOINT_TIMEOUT_MS / 1000}s 内未返回，按不支持处理`,
+                      ),
+                    ),
+                  ENDPOINT_TIMEOUT_MS,
+                );
+                endpointTimer.unref?.();
+              }),
+            ]);
+          } finally {
+            if (endpointTimer) clearTimeout(endpointTimer);
+          }
         } catch (err) {
           // 媒体服务器没有字幕端点（UHD 这类第三方兼容层）时，不能把错误直接
           // 抛给用户：自动降级回服务端解容器，与旧行为保持一致。
@@ -2207,10 +2231,20 @@ router.get(
           throw err;
         }
         const label = subStream.DisplayTitle || subStream.Language || `轨道 ${streamIndex}`;
+        // 端点按扩展名转封装时经常降级（请求 .ass 回 SRT、请求 .srt 回 WEBVTT），
+        // 还按声明格式解析就会一条 cue 都解不出来——表现是「提取成功但没字幕」。
+        // 这里按内容嗅探真实格式再返回（与解容器路径的处理保持一致）。
+        const sniffed = sniffSubtitleFormat(content, format);
+        if (sniffed !== format) {
+          console.info(
+            `[subtitles] 字幕实际格式与声明不一致 movie=${movie.id} index=${streamIndex} ` +
+              `declared=${format} sniffed=${sniffed}（按实际格式返回）`,
+          );
+        }
         res.json({
           success: true,
           content,
-          format,
+          format: sniffed,
           label,
           language: subStream.Language || null,
         });

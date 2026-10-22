@@ -234,6 +234,11 @@ interface PlayerControlBarProps {
   controlBarVisible?: boolean
   controlBarHideMode?: boolean
   onToggleHideMode?: () => void
+  /**
+   * 控制栏实际高度（px）变化时回调。
+   * 字幕层据此让位：控制栏升起时字幕整体上移，避免贴底字幕被控件遮住。
+   */
+  onHeightChange?: (height: number) => void
 }
 
 export function PlayerControlBar({
@@ -262,7 +267,21 @@ export function PlayerControlBar({
   controlBarVisible = true,
   controlBarHideMode = false,
   onToggleHideMode,
+  onHeightChange,
 }: PlayerControlBarProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
+  // 高度上报给字幕层做「让位」。控制栏本身高度随断点/字号变化，
+  // 用 ResizeObserver 而不是写死常量，换行/移动端也不会错位。
+  useEffect(() => {
+    const el = rootRef.current
+    if (!el || !onHeightChange) return
+    const report = (): void =>
+      onHeightChange(el.getBoundingClientRect().height)
+    report()
+    const ro = new ResizeObserver(report)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [onHeightChange])
   const currentTime = useVideoCurrentTime(videoRef)
   const duration = useVideoDuration(videoRef, watchTogether.duration)
   const progress =
@@ -508,6 +527,7 @@ export function PlayerControlBar({
 
   return (
     <div
+      ref={rootRef}
       className={cn(
         'absolute bottom-0 left-0 right-0 z-[80] p-2 md:p-3',
         !controlBarVisible && 'pointer-events-none'

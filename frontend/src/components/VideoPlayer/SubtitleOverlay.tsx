@@ -28,6 +28,11 @@ interface SubtitleOverlayProps {
   fontFamily?: string // CSS font-family，空串表示默认
   /** 副字幕轨（双语）：渲染在主字幕上方一行 */
   secondaryCues?: ParsedCue[]
+  /**
+   * 底部让位（px）：播放器控制栏升起时，把贴底的字幕整体上移，避免被控件遮住。
+   * 0 表示控制栏已收起（字幕回到最低位）。
+   */
+  bottomInset?: number
 }
 
 /** 副字幕相对主字幕上移的百分比（双语时两条不重叠） */
@@ -88,6 +93,7 @@ export function SubtitleOverlay({
   shadowBlur = 4,
   fontFamily = '',
   secondaryCues = [],
+  bottomInset = 0,
 }: SubtitleOverlayProps) {
   const [activeCues, setActiveCues] = useState<ParsedCue[]>([])
   const [activeSecondary, setActiveSecondary] = useState<ParsedCue[]>([])
@@ -195,7 +201,13 @@ export function SubtitleOverlay({
             style={{
               position: 'absolute',
               left: `${position}%`,
-              top: `${top}%`,
+              // 贴在底部（line > 50）的字幕需要给控制栏让位：控制栏升起时整体上移，
+              // 过渡时长与 zart-controlbar-enter/exit 基本对齐，看起来是「跟着控件走」。
+              top:
+                line > 50
+                  ? `calc(${top}% - ${Math.max(0, bottomInset)}px)`
+                  : `${top}%`,
+              transition: 'top 0.28s cubic-bezier(0.16, 1, 0.3, 1)',
               transform: getTransform(line, align),
               maxWidth: '90%',
               // 按比例：字号随播放器高度缩放（1080p 全屏自动 ×1.5）

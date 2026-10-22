@@ -526,6 +526,8 @@ export function WatchTogetherCore({
 
   // 控制栏可见性：移动端默认隐藏（触摸显示），桌面端默认显示
   const [controlBarVisible, setControlBarVisible] = useState(!isMobile)
+  // 控制栏实测高度：控制栏升起时字幕层按这个值上移让位
+  const [controlBarHeight, setControlBarHeight] = useState(0)
   const [controlBarHideMode, setControlBarHideMode] = useState(false)
   const controlBarCooldownRef = useRef<number>(0)
   const controlBarIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -1808,6 +1810,8 @@ export function WatchTogetherCore({
             shadowBlur={subtitles.subtitleShadowBlur}
             fontFamily={subtitles.subtitleFontFamily}
             secondaryCues={activeSecondaryCues}
+            // 控制栏升起时贴底字幕上移让位，收起时回到原位
+            bottomInset={controlBarVisible ? controlBarHeight : 0}
           />,
           slots.overlayRoot
         )}
@@ -2034,6 +2038,7 @@ export function WatchTogetherCore({
           controlBarVisible={controlBarVisible}
           controlBarHideMode={controlBarHideMode}
           onToggleHideMode={handleToggleHideMode}
+          onHeightChange={setControlBarHeight}
         />
       )}
 
