@@ -14,6 +14,7 @@ import {
   streamMkvSubtitleTrack,
 } from '@/modules/subtitles/mkv-embedded'
 import { appendAuthToken } from '@/modules/player/services/url-proxy'
+import { subscribePlaysVideoSubtitles } from '@/modules/player/engines/playsvideo-subtitle-bridge'
 import { message } from '@/components/ui/message'
 
 export interface SubtitleTrack {
@@ -386,6 +387,37 @@ export function useSubtitles({
     },
     [socket, roomId, isHost]
   )
+
+  /**
+   * playsvideo（浏览器端解封装）提取到的内嵌字幕：订阅桥接层，直接进字幕列表。
+   *
+   * 这条链路是「秒开字幕」的正路：播放器本来就在下载视频，字幕块是顺带解出来的，
+   * 不经过服务端解容器、不会触发 Emby 429。之前桥接层只有发布、全仓库没有一个
+   * 订阅者，等于白提取——这里补上消费端。
+   * 只在房主端生效，加入后随 subtitle-update 广播给观众。
+   */
+  useEffect(() => {
+    const unsubscribe = subscribePlaysVideoSubtitles((sub) => {
+      if (!isHost || sub.cues.length === 0) return
+      const label = sub.label || `轨道 ${sub.index + 1}`
+      setState((prev) => {
+        if (prev.subtitleTracks.some((t) => t.label === label)) return prev
+        const next: SubtitleState = {
+          ...prev,
+          subtitleTracks: [
+            ...prev.subtitleTracks,
+            { cues: sub.cues, label, lang: sub.language ?? undefined },
+          ],
+          subtitleEnabled: true,
+          activeTrackIndex: prev.subtitleTracks.length,
+          subtitleMovieId: currentMovieIdRef.current,
+        }
+        broadcast(next)
+        return next
+      })
+    })
+    return unsubscribe
+  }, [isHost, broadcast])
 
   const setEnabled = useCallback(
     (enabled: boolean) => {
