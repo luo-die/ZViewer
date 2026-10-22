@@ -319,7 +319,26 @@ do_stop() {
   [ -n "$fp" ] && kill "$fp" 2>/dev/null
   rm -f "$PIDS_FILE"
   resolve_ports
-  kill_port "$BACKEND_PORT"
+  # 先等后端处理完 SIGTERM（落盘 + 释放端口），最多 8 秒。
+  # 旧版发完 TERM 就立刻 kill_port / 启动新实例，端口常常还没释放，
+  # do_start 直接报「端口已被占用」退出——这正是「更新后重启很久/起不来」的来源。
+  local i=0
+  while [ "$i" -lt 16 ]; do
+    if ! port_in_use "$BACKEND_PORT"; then
+      break
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if port_in_use "$BACKEND_PORT"; then
+    echo "  [警告] 端口 $BACKEND_PORT 仍被占用，强制结束占用进程"
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -tiTCP:"$BACKEND_PORT" -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    elif command -v fuser >/dev/null 2>&1; then
+      fuser -k -9 "$BACKEND_PORT/tcp" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  fi
   echo "  已停止"
 }
 

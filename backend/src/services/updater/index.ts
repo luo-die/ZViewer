@@ -916,7 +916,7 @@ resolve_port() {
 # 「端口已被占用」直接拒绝启动 —— 表现就是「更新脚本跑完了，服务没起来」。
 wait_port_free() {
   local i=0
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 10 ]; do
     if ! port_in_use "$APP_PORT"; then
       return 0
     fi
@@ -953,8 +953,9 @@ echo "========================================"
 echo "[更新脚本] 开始执行 $(date)"
 echo "========================================"
 
+TOTAL_START=$(date +%s)
 echo "[更新脚本] 等待后端返回响应..."
-sleep 3
+sleep 2
 
 echo "[更新脚本] 停止现有服务..."
 # 使用 pgrep + 排除自身 PID，避免 pkill -f 匹配到执行本脚本的 bash 进程
@@ -973,13 +974,11 @@ echo "[更新脚本] 等待端口释放..."
 resolve_port
 wait_port_free
 
-# 备份 config 目录
-echo "[更新脚本] 备份 config 目录..."
-if [ -d "$CONFIG_DIR" ]; then
-  cp -r "$CONFIG_DIR" "$CONFIG_BACKUP"
-  rm -rf "$CONFIG_DIR"
-  echo "[更新脚本] 已备份 config 到 $CONFIG_BACKUP"
-fi
+# config 目录（数据库 / 上传 / 媒体）不再整体备份+恢复：
+# 旧流程是「cp -r 整个 config → rm -rf → 复制新包 → 再 cp 回来」，
+# 上传量大时等于把几百 MB~几 GB 搬两遍，而这段时间服务是停着的。
+# 新流程复制更新包时直接跳过 config/，用户数据原地不动。
+echo "[更新脚本] 保留现有 config 目录（不迁移，复制新文件时跳过）"
 
 # 备份 .env（用户配置：端口 / HTTPS / JWT 密钥等）。
 # 更新包里带的是模板 .env：直接覆盖会重置端口与密钥，改了端口的部署会
@@ -1002,8 +1001,16 @@ if [ ! -d "$EXTRACTED_DIR" ]; then
   echo "[错误] 未找到解压目录：$EXTRACTED_DIR"
   COPY_FAILED=1
 else
-  # 注意：通配符不会匹配隐藏文件（.env），用户 .env 不会被更新包覆盖
-  cp -rf "$EXTRACTED_DIR/"* "$ROOT/" 2>/dev/null || COPY_FAILED=1
+  # 逐个顶层条目复制，跳过 config/（用户数据原地保留）。
+  # 统计耗时写进 update.log，更新慢时能直接看出是复制还是启动慢。
+  COPY_START=$(date +%s)
+  for entry in "$EXTRACTED_DIR"/* "$EXTRACTED_DIR"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    entry_name=$(basename "$entry")
+    [ "$entry_name" = "config" ] && continue
+    cp -rf "$entry" "$ROOT/" 2>/dev/null || COPY_FAILED=1
+  done
+  echo "[更新脚本] 文件复制耗时 $(( $(date +%s) - COPY_START ))s"
   chmod +x "$ROOT/zviewer-backend" "$ROOT/zviewer-cert" 2>/dev/null || true
   if [ -f "$EXTRACTED_DIR/start.sh" ]; then
     chmod +x "$ROOT/start.sh" 2>/dev/null || true
@@ -1012,15 +1019,6 @@ else
     echo "[错误] 更新后未找到 zviewer-backend，更新包可能损坏"
     COPY_FAILED=1
   fi
-fi
-
-# 恢复 config 目录
-echo "[更新脚本] 恢复 config 目录..."
-if [ -d "$CONFIG_BACKUP" ]; then
-  mkdir -p "$CONFIG_DIR"
-  cp -rf "$CONFIG_BACKUP/"* "$CONFIG_DIR/" 2>/dev/null || true
-  rm -rf "$CONFIG_BACKUP"
-  echo "[更新脚本] 已恢复 config 目录（用户数据已保留）"
 fi
 
 # 恢复 .env
@@ -1080,6 +1078,7 @@ else
   echo "[更新脚本] 排查建议：看 $ROOT/log/backend.err.log 末尾 30 行；若端口被占用，先 ./start.sh stop 再 start"
 fi
 
+echo "[更新脚本] 总耗时 $(( $(date +%s) - TOTAL_START ))s"
 echo "[更新脚本] 更新完成 $(date)"
 rm -f "$0"
 exit 0
