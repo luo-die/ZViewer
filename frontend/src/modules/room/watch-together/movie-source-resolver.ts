@@ -499,6 +499,19 @@ export async function resolveMovieSource({
   // （直连失败回退服务器代理）兜底，原生失败再回退 playsvideo 管线。
   // 挂载直链模式（directLink）例外：直连失败不回退服务器代理，直接提示。
   const inferredFormat = movie.format || detectMediaFormat(movie.url)
+  /**
+   * Emby / Jellyfin 强制走 playsvideo 解封装（跳过 MKV 原生快路径）。
+   *
+   * 原因：这类媒体服务器的内嵌字幕只能从容器里解出来（UHD 一类第三方网关
+   * 根本没有字幕端点，PlaybackInfo 也不下发 DeliveryUrl）。原生 `<video>`
+   * 播放时浏览器拿不到字节流，字幕就只能回退到服务端扫整集文件（实测 8.7GB
+   * 要几分钟）。交给 playsvideo 后，文件由浏览器自己下载 + demux，内嵌字幕
+   * 顺带解出（与 mpv / UHD 官方 web 端同一思路），不再等服务端。
+   *
+   * 代价：首帧要等 remux 分片，比原生直通慢；不支持 MSE 的浏览器由
+   * usePlayerSource 自动回退原生直连（能力不损失）。
+   */
+  const prefersClientDemux = sourceType === 'emby' || sourceType === 'jellyfin'
   return {
     sourceUrl: movie.url,
     audioUrl: movie.audioUrl,
@@ -511,11 +524,9 @@ export async function resolveMovieSource({
     acceptQuality: movie.acceptQuality,
     headers: undefined,
     reusedRecoveryUrl: false,
-    mkvFastPath: computeMkvFastPath(
-      inferredFormat,
-      movie.videoCodec,
-      movie.audioCodec
-    ),
+    mkvFastPath: prefersClientDemux
+      ? false
+      : computeMkvFastPath(inferredFormat, movie.videoCodec, movie.audioCodec),
     playsvideoEnabled: movie.playsvideoEnabled !== false,
     noProxyFallback: movie.directLink === true,
   }
